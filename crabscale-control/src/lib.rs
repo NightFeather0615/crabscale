@@ -256,6 +256,11 @@ impl ControlPlane {
             .filter(|r| r.machine_key == machine_key)
             .ok_or(ControlError::NotFound)?;
 
+        // The disco key is only carried in MapRequest, not RegisterRequest, so
+        // apply it here so the first MapResponse advertises the client's real
+        // disco key (Spec-NetMap §3).
+        record.node.disco_key = request.disco_key;
+
         let streaming = request.stream;
         let lite_update = !streaming && request.omit_peers && !request.read_only;
 
@@ -440,6 +445,12 @@ mod tests {
         assert!(json.get("DERPMap").is_some());
         assert!(json.get("Peers").is_some());
         assert_eq!(json["Peers"], serde_json::json!([]));
+        assert_eq!(
+            json["Node"]["DiscoKey"],
+            serde_json::json!(
+                "discokey:3333333333333333333333333333333333333333333333333333333333333333"
+            )
+        );
     }
 
     #[test]

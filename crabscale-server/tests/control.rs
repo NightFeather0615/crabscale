@@ -187,6 +187,12 @@ async fn register_and_map_over_noise() {
     assert!(map_json.get("DERPMap").is_some());
     assert!(map_json.get("Peers").is_some());
     assert_eq!(map_json["Peers"], serde_json::json!([]));
+    assert_eq!(
+        map_json["Node"]["DiscoKey"],
+        serde_json::json!(
+            "discokey:3333333333333333333333333333333333333333333333333333333333333333"
+        )
+    );
 
     drop(server_task);
 }

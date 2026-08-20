@@ -150,6 +150,7 @@ dependencies = [
  "crabscale-transport",
  "h2",
  "http",
+ "rand",
  "serde_json",
  "tokio",
  "x25519-dalek",

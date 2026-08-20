@@ -11,6 +11,7 @@ crabscale-transport = { path = "../crabscale-transport" }
 bytes = "1"
 h2 = "0.4"
 http = "1"
+rand = "0.8"
 serde_json = "1"
 tokio = { version = "1", features = ["io-util", "rt", "macros", "sync", "time"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }

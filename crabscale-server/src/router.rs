@@ -246,7 +246,9 @@ impl ControlRouter {
             return;
         }
         loop {
-            tokio::time::sleep(KEEPALIVE_INTERVAL).await;
+            // Spec-NetMap §5: keepalive every 50s plus 0-9s random jitter.
+            let jitter = Duration::from_secs(rand::random::<u64>() % 10);
+            tokio::time::sleep(KEEPALIVE_INTERVAL + jitter).await;
             let frame = match self.control.keepalive_frame(compress) {
                 Ok(f) => f,
                 Err(_) => break,
@@ -288,7 +290,9 @@ fn send_plain(respond: &mut SendResponse<Bytes>, status: StatusCode, text: &'sta
         .header("Content-Type", "text/plain")
         .body(())
         .expect("static response is valid");
-    let mut send = respond.send_response(response, false).unwrap();
+    let Ok(mut send) = respond.send_response(response, false) else {
+        return;
+    };
     let _ = send.send_data(Bytes::from_static(text), true);
 }
 
@@ -298,7 +302,9 @@ fn send_json(respond: &mut SendResponse<Bytes>, status: StatusCode, body: Vec<u8
         .header("Content-Type", "application/json")
         .body(())
         .expect("static response is valid");
-    let mut send = respond.send_response(response, false).unwrap();
+    let Ok(mut send) = respond.send_response(response, false) else {
+        return;
+    };
     let _ = send.send_data(Bytes::from(body), true);
 }
 
@@ -308,7 +314,9 @@ fn send_bytes(respond: &mut SendResponse<Bytes>, status: StatusCode, body: Vec<u
         .header("Content-Type", "application/octet-stream")
         .body(())
         .expect("static response is valid");
-    let mut send = respond.send_response(response, false).unwrap();
+    let Ok(mut send) = respond.send_response(response, false) else {
+        return;
+    };
     let _ = send.send_data(Bytes::from(body), true);
 }
 
