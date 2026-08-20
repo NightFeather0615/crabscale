@@ -59,3 +59,19 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Run M0-05 smoke test
         run: ./scripts/smoke-test.sh
+
+  harness:
+    name: Client compatibility harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Run M1-07 end-to-end harness
+        run: ./scripts/harness.sh --report harness-report.md
+      - name: Upload harness report
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-report
+          path: harness-report.md
