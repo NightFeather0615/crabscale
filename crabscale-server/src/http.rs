@@ -118,12 +118,22 @@ async fn handle_request(
     }
 
     // `GET /register/{id}` serves the interactive-registration approval page
-    // (Spec-Registration section 4). Unknown or expired ids return 404.
+    // (Spec-Registration section 4). Unknown or expired ids return 404. When
+    // OIDC is configured it redirects to the provider instead.
     if let Some(auth_id) = register_auth_id(&path) {
         if method == http::Method::GET {
             let response = router.handle_register_page(auth_id);
             return Ok(response.map(Full::new));
         }
+    }
+
+    // `GET /oidc/callback` completes the OIDC authorization-code flow. It is
+    // always an outer (browser) endpoint: no Noise handshake is involved.
+    if method == http::Method::GET && path == "/oidc/callback" {
+        let response = router
+            .handle_oidc_callback(req.uri().query().unwrap_or(""))
+            .await;
+        return Ok(response.map(Full::new));
     }
 
     Ok(plain_response(StatusCode::NOT_FOUND, "not found"))

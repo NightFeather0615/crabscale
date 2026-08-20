@@ -5,9 +5,12 @@
 //! endpoints are served inside the HTTP/2-over-Noise connection and carry the
 //! Noise machine key recovered from the handshake.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::oidc::{
+    DEFAULT_OIDC_FLOW_LIMIT, DEFAULT_OIDC_FLOW_TTL_SECONDS, OidcClient, OidcFlowStore, now_unix,
+};
 use bytes::Bytes;
 use crabscale_control::{ControlConfig, ControlError, ControlPlane, MapOutcome};
 use crabscale_proto::{
@@ -33,6 +36,12 @@ const REAP_INTERVAL: Duration = Duration::from_secs(1);
 pub struct ControlRouter {
     machine_key: MachineKey,
     control: Arc<ControlPlane>,
+    /// Optional OIDC relying-party client; when present, `GET /register/{id}`
+    /// redirects to the provider and `/oidc/callback` completes the flow.
+    oidc: Option<Arc<OidcClient>>,
+    /// Outstanding OIDC authorization flows keyed by CSRF state, shared across
+    /// router clones so any connection can validate the callback.
+    oidc_flows: Arc<Mutex<OidcFlowStore>>,
 }
 
 impl ControlRouter {
@@ -47,7 +56,32 @@ impl ControlRouter {
         Self {
             machine_key,
             control: Arc::new(control),
+            oidc: None,
+            oidc_flows: Arc::new(Mutex::new(OidcFlowStore::new(
+                DEFAULT_OIDC_FLOW_LIMIT,
+                DEFAULT_OIDC_FLOW_TTL_SECONDS,
+            ))),
         }
+    }
+
+    /// Attach an OIDC relying-party client, enabling browser approval through
+    /// the provider.
+    pub fn with_oidc(mut self, oidc: OidcClient) -> Self {
+        self.oidc = Some(Arc::new(oidc));
+        self
+    }
+
+    /// Override the OIDC flow-store TTL (seconds).
+    ///
+    /// A negative value makes flows expire immediately, which the mock provider
+    /// integration test uses to exercise expired-state rejection without
+    /// waiting out the default ten minutes.
+    pub fn with_oidc_flow_ttl(mut self, ttl_seconds: i64) -> Self {
+        self.oidc_flows = Arc::new(Mutex::new(OidcFlowStore::new(
+            DEFAULT_OIDC_FLOW_LIMIT,
+            ttl_seconds,
+        )));
+        self
     }
 
     /// The machine key this router advertises and attaches to inner requests.
@@ -101,8 +135,10 @@ impl ControlRouter {
 
     /// Handle an outer `GET /register/{id}` approval page.
     ///
-    /// Returns a minimal HTML page describing the pending registration, or a
-    /// `404` when the auth id is unknown or has expired.
+    /// When OIDC is configured, this endpoint begins the provider flow and
+    /// redirects the browser to the provider's authorization endpoint
+    /// (Spec-Registration §7). Otherwise it returns a minimal HTML page
+    /// describing the pending registration. Unknown or expired ids return 404.
     pub fn handle_register_page(&self, auth_id: &str) -> Response<Bytes> {
         let pending = match self.control.pending_info(auth_id) {
             Ok(Some(pending)) => pending,
@@ -113,6 +149,19 @@ impl ControlRouter {
                 return plain_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
             }
         };
+        if let Some(oidc) = &self.oidc {
+            let (state, flow) = self.oidc_flows.lock().unwrap().begin(auth_id, now_unix());
+            match oidc.authorization_url(&state, &flow.nonce) {
+                Ok(location) => return redirect_response(&location),
+                Err(e) => {
+                    eprintln!("oidc: failed to build authorization URL for {auth_id}: {e}");
+                    return plain_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to start OIDC authorization",
+                    );
+                }
+            }
+        }
         let hostname = pending
             .hostinfo
             .as_ref()
@@ -131,6 +180,84 @@ impl ControlRouter {
             .header("Content-Type", "text/html; charset=utf-8")
             .body(Bytes::from(html))
             .expect("static response is valid")
+    }
+
+    /// Handle an outer `GET /oidc/callback` completing the OIDC flow.
+    ///
+    /// Validates the CSRF state and nonce, exchanges the authorization code,
+    /// verifies the ID token, upserts the user profile, and approves the
+    /// pending registration through the same auth cache as CLI approval.
+    /// Unknown, expired, or reused state is rejected with `400` so a stale or
+    /// replayed callback can never authorize a registration.
+    pub async fn handle_oidc_callback(&self, query: &str) -> Response<Bytes> {
+        let Some(oidc) = &self.oidc else {
+            return plain_response(StatusCode::NOT_FOUND, "oidc not configured");
+        };
+        let params = parse_query(query);
+        if let Some(error) = params.get("error") {
+            eprintln!("oidc: provider reported error: {error}");
+            return plain_response(StatusCode::BAD_REQUEST, "oidc provider reported an error");
+        }
+        let (Some(state), Some(code)) = (params.get("state"), params.get("code")) else {
+            return plain_response(StatusCode::BAD_REQUEST, "missing state or code");
+        };
+        let flow = match self.oidc_flows.lock().unwrap().take(state, now_unix()) {
+            Some(flow) => flow,
+            None => {
+                return plain_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid, expired, or reused OIDC state",
+                );
+            }
+        };
+        let pending_still_valid = matches!(self.control.pending_info(&flow.auth_id), Ok(Some(_)));
+        if !pending_still_valid {
+            return plain_response(StatusCode::BAD_REQUEST, "registration is no longer pending");
+        };
+        let oidc_client = oidc.clone();
+        let flow_clone = flow.clone();
+        let code = code.to_string();
+        let exchanged =
+            tokio::task::spawn_blocking(move || oidc_client.complete(&flow_clone, &code)).await;
+        let profile = match exchanged {
+            Ok(Ok(profile)) => profile,
+            Ok(Err(e)) => {
+                eprintln!("oidc: callback validation failed for {}: {e}", flow.auth_id);
+                return plain_response(StatusCode::BAD_REQUEST, "OIDC callback validation failed");
+            }
+            Err(_) => {
+                return plain_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "OIDC exchange task failed",
+                );
+            }
+        };
+        match self.control.upsert_oidc_user(&profile) {
+            Ok(_user_id) => match self.control.approve_pending(&flow.auth_id, &profile.email) {
+                Ok(()) => {
+                    let email_escaped = escape_html(&profile.email);
+                    let html = format!(
+                        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Registration approved</title></head><body><h1>Registration approved</h1><p>The node is now authorized to join the tailnet.</p><p>Login: <code>{email_escaped}</code></p></body></html>"
+                    );
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "text/html; charset=utf-8")
+                        .body(Bytes::from(html))
+                        .expect("static response is valid")
+                }
+                Err(e) => {
+                    eprintln!("oidc: approval failed for {}: {e}", flow.auth_id);
+                    plain_response(StatusCode::BAD_REQUEST, "registration is no longer pending")
+                }
+            },
+            Err(e) => {
+                eprintln!("oidc: user upsert failed for {}: {e}", flow.auth_id);
+                plain_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to record OIDC identity",
+                )
+            }
+        }
     }
 
     /// Handle an inner `/machine/*` request.
@@ -604,6 +731,21 @@ fn plain_response(status: StatusCode, text: &'static str) -> Response<Bytes> {
         .status(status)
         .header("Content-Type", "text/plain")
         .body(Bytes::from_static(text.as_bytes()))
+        .expect("static response is valid")
+}
+
+/// A `302 Found` redirect response, used to start the OIDC provider flow.
+fn redirect_response(location: &str) -> Response<Bytes> {
+    let location = match http::HeaderValue::from_str(location) {
+        Ok(value) => value,
+        Err(_) => {
+            return plain_response(StatusCode::INTERNAL_SERVER_ERROR, "invalid redirect target");
+        }
+    };
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header("Location", location)
+        .body(Bytes::new())
         .expect("static response is valid")
 }
 
