@@ -17,7 +17,7 @@ const SECRET_BYTES: usize = 32;
 pub fn generate_secret() -> String {
     let mut bytes = [0u8; SECRET_BYTES];
     rand::thread_rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    hex::encode(bytes)
 }
 
 /// Format a full pre-auth key from a prefix and secret.
@@ -47,9 +47,7 @@ pub fn hash_secret(secret: &str) -> String {
     hasher.update(salt);
     hasher.update(secret.as_bytes());
     let digest = hasher.finalize();
-    let salt_hex: String = salt.iter().map(|b| format!("{b:02x}")).collect();
-    let hash_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    format!("{salt_hex}${hash_hex}")
+    format!("{}${}", hex::encode(salt), hex::encode(digest))
 }
 
 /// Verify a plaintext secret against a stored `salt$hexhash` value.
@@ -60,38 +58,14 @@ pub fn verify_secret(secret: &str, stored: &str) -> bool {
     let Some((salt_hex, hash_hex)) = stored.split_once('$') else {
         return false;
     };
-    let Ok(salt) = decode_hex(salt_hex) else {
+    let Ok(salt) = hex::decode(salt_hex) else {
         return false;
     };
     let mut hasher = Blake2b512::new();
     hasher.update(&salt);
     hasher.update(secret.as_bytes());
     let digest = hasher.finalize();
-    let expected: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    expected == hash_hex
-}
-
-fn decode_hex(s: &str) -> Result<Vec<u8>, ()> {
-    if s.len() % 2 != 0 {
-        return Err(());
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let bytes = s.as_bytes();
-    for i in (0..bytes.len()).step_by(2) {
-        let hi = hex_nibble(bytes[i]).ok_or(())?;
-        let lo = hex_nibble(bytes[i + 1]).ok_or(())?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    hex::encode(digest) == hash_hex
 }
 
 #[cfg(test)]
