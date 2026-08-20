@@ -588,11 +588,7 @@ impl ControlRouter {
         }
     }
 
-    async fn send_stream(
-        &self,
-        respond: &mut SendResponse<Bytes>,
-        session: StreamSession,
-    ) {
+    async fn send_stream(&self, respond: &mut SendResponse<Bytes>, session: StreamSession) {
         let StreamSession {
             first_frame,
             keep_alive,

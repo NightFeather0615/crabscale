@@ -449,7 +449,10 @@ mod tests {
 
         match diff_peers(&prev, &next, None, None) {
             PeerDiff::Patch(patch) => {
-                assert_eq!(patch.key, Some(crabscale_proto::NodeKey::from_bytes([0xAB; 32])))
+                assert_eq!(
+                    patch.key,
+                    Some(crabscale_proto::NodeKey::from_bytes([0xAB; 32]))
+                )
             }
             other => panic!("a node key change must be a patch, got {other:?}"),
         }
@@ -472,10 +475,7 @@ mod tests {
     fn unchanged_peer_yields_no_delta() {
         let prev = node(5);
         let next = prev.clone();
-        assert_eq!(
-            diff_peers(&prev, &next, None, None),
-            PeerDiff::Unchanged
-        );
+        assert_eq!(diff_peers(&prev, &next, None, None), PeerDiff::Unchanged);
     }
 
     #[test]
@@ -495,10 +495,7 @@ mod tests {
         let next = prev.clone();
         match diff_peers(&prev, &next, None, Some("2027-01-01T00:00:00Z")) {
             PeerDiff::Patch(patch) => {
-                assert_eq!(
-                    patch.key_expiry,
-                    Some("2027-01-01T00:00:00Z".to_string())
-                );
+                assert_eq!(patch.key_expiry, Some("2027-01-01T00:00:00Z".to_string()));
             }
             other => panic!("expected a patch, got {other:?}"),
         }

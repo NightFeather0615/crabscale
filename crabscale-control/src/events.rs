@@ -38,10 +38,7 @@ pub enum ChangeEvent {
     /// The DERP map changed; sessions push a DERP map delta.
     DerpMapChanged,
     /// A node's online state changed.
-    OnlineChanged {
-        node_id: i64,
-        online: bool,
-    },
+    OnlineChanged { node_id: i64, online: bool },
     /// A peer was seen by the control plane (it sent a map request).
     PeerSeen(i64),
 }
@@ -341,7 +338,10 @@ mod tests {
         let bus = ChangeBus::new(Duration::from_secs(10), 1024);
         let mut rx = bus.subscribe();
 
-        bus.publish(ChangeEvent::OnlineChanged { node_id: 7, online: true });
+        bus.publish(ChangeEvent::OnlineChanged {
+            node_id: 7,
+            online: true,
+        });
         bus.publish(ChangeEvent::PeerSeen(7));
         bus.publish(ChangeEvent::NodeChanged(7));
         bus.publish(ChangeEvent::NodeRemoved(7));
@@ -415,7 +415,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(changed.len(), 200, "one NodeChanged per node, no duplicates");
+        assert_eq!(
+            changed.len(),
+            200,
+            "one NodeChanged per node, no duplicates"
+        );
         assert!(
             changed.windows(2).all(|w| w[0] < w[1]),
             "NodeChanged ids must be delivered in ascending order"

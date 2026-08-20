@@ -34,7 +34,7 @@ use crabscale_proto::{
 pub use delta::SessionPeers;
 pub use dns::{DnsError, DnsSettings};
 pub use events::{
-    ChangeBatch, ChangeEvent, ChangeBus, DEFAULT_CHANGE_BATCH_MAX, DEFAULT_CHANGE_BATCH_WINDOW,
+    ChangeBatch, ChangeBus, ChangeEvent, DEFAULT_CHANGE_BATCH_MAX, DEFAULT_CHANGE_BATCH_WINDOW,
 };
 pub use ip_allocator::{IpAllocator, IpAllocatorError};
 pub use model::{Login, Node as DomainNode, Policy, PreAuthKey, Session, User};
@@ -4181,9 +4181,7 @@ mod tests {
     fn empty_batch_produces_no_delta_frame() {
         let (plane, node_id, mut last_sent) = open_stream_with_peer();
         let empty = ChangeBatch::default();
-        let delta = plane
-            .build_delta(node_id, &empty, &mut last_sent)
-            .unwrap();
+        let delta = plane.build_delta(node_id, &empty, &mut last_sent).unwrap();
         assert!(delta.is_none(), "no changes means no delta frame");
     }
 }
