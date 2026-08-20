@@ -19,7 +19,7 @@ use crabscale_transport::{
     validate_native_upgrade,
 };
 use http::{HeaderValue, Request, Response, StatusCode};
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -28,7 +28,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::key::ServerKey;
-use crate::router::{ControlRouter, serve_control};
+use crate::router::{ControlRouter, VERIFY_MAX_BODY_LEN, serve_control};
 
 /// A handle to a running outer control server, used to request shutdown.
 #[derive(Clone)]
@@ -115,6 +115,55 @@ async fn handle_request(
 
     if method == http::Method::POST && path == "/ts2021" {
         return Ok(handle_ts2021(req, router, server_key).await);
+    }
+
+    // `POST /verify` is the embedded relay's admission check. The body is
+    // capped at 4 KiB (Spec-Control-API `POST /verify`); a larger request is
+    // rejected before the JSON is parsed, and any non-POST method is rejected
+    // with `405`.
+    if path == "/verify" {
+        if method != http::Method::POST {
+            return Ok(plain_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
+        }
+        let limited = Limited::new(req.into_body(), VERIFY_MAX_BODY_LEN);
+        let collected = match limited.collect().await {
+            Ok(collected) => collected,
+            Err(e)
+                if e.downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some() =>
+            {
+                return Ok(plain_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "body too large",
+                ));
+            }
+            Err(_) => {
+                return Ok(plain_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid request body",
+                ));
+            }
+        };
+        let response = router.handle_verify(&collected.to_bytes());
+        return Ok(response.map(Full::new));
+    }
+
+    // `GET /bootstrap-dns` serves the relay's bootstrap DNS snapshot. When no
+    // snapshot is configured the router returns 404, and any non-GET method
+    // is rejected with 405 (Spec-Control-API, Bootstrap DNS).
+    if path == "/bootstrap-dns" {
+        if method != http::Method::GET {
+            return Ok(plain_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
+        }
+        let q = query_param(req.uri().query(), "q");
+        let response = router.handle_bootstrap_dns(q);
+        return Ok(response.map(Full::new));
     }
 
     // `GET /register/{id}` serves the interactive-registration approval page

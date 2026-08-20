@@ -7,7 +7,10 @@
 //! writer task drains an outbound channel. Duplicate connections for the same
 //! node key are allowed; the registry keeps a set of ids per key.
 //!
-//! Multi-node mesh and STUN are deliberately out of scope for this milestone.
+//! An optional admission-control callback may be attached with
+//! [`Relay::with_verify`] so the relay only admits known, authorized node
+//! keys (Spec-DERP-STUN §8 / Spec-Control-API `POST /verify`). Multi-node mesh
+//! remains out of scope for this milestone.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -32,6 +35,14 @@ pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Default outbound channel capacity per connection.
 pub const OUTBOUND_CAPACITY: usize = 256;
+
+/// Admission control callback used by the relay during the login handshake.
+///
+/// The callback receives the node key declared in `ClientInfo` (the clear
+/// prefix of the message) and returns `true` when the node is allowed to use
+/// the relay. When the callback denies a key, the connection is closed after
+/// `ServerKey` without sending `ServerInfo`.
+pub type VerifyFn = Arc<dyn Fn(NodeKey) -> bool + Send + Sync + 'static>;
 
 /// A unique id for one accepted relay connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -58,6 +69,8 @@ pub struct Relay {
     next_id: AtomicU64,
     /// Per-connection keepalive interval; `None` disables periodic keepalives.
     keepalive: Option<Duration>,
+    /// Optional admission check; `None` admits every decrypted client.
+    verify: Option<VerifyFn>,
 }
 
 impl Relay {
@@ -70,6 +83,7 @@ impl Relay {
             registry: Mutex::new(Registry::default()),
             next_id: AtomicU64::new(1),
             keepalive: None,
+            verify: None,
         }
     }
 
@@ -81,6 +95,15 @@ impl Relay {
     /// Enable per-connection keepalive broadcasts at `interval`.
     pub fn with_keepalive_interval(mut self, interval: Duration) -> Self {
         self.keepalive = Some(interval);
+        self
+    }
+
+    /// Attach an admission-control callback used during the login handshake.
+    ///
+    /// When set, a client whose node key the callback rejects is disconnected
+    /// after `ServerKey` instead of receiving `ServerInfo`.
+    pub fn with_verify(mut self, verify: VerifyFn) -> Self {
+        self.verify = Some(verify);
         self
     }
 
@@ -237,6 +260,13 @@ impl Relay {
         let encrypted = &body[ClientInfoBody::PREFIX_LEN..];
         let _payload =
             open_client_info(&prefix.key, &self.server_secret, &prefix.nonce, encrypted).ok()?;
+        // Admission control: an attached verify callback may deny a known
+        // node key, closing the connection before ServerInfo.
+        if let Some(verify) = &self.verify {
+            if !verify(prefix.key) {
+                return None;
+            }
+        }
         Some(prefix.key)
     }
 
@@ -475,6 +505,65 @@ mod tests {
         let _a = connect_client(&relay, SecretKey::random()).await;
         let _b = connect_client(&relay, SecretKey::random()).await;
         assert_eq!(relay.registered_nodes().await, 2);
+    }
+
+    #[tokio::test]
+    async fn verify_callback_denies_unknown_node_key() {
+        use crate::codec::{read_frame, write_frame};
+        use crate::handshake::{ClientInfoPayload, make_client_info};
+
+        let allowed = SecretKey::random();
+        let denied = SecretKey::random();
+        let allowed_key = allowed.public();
+        let relay =
+            Arc::new(Relay::random().with_verify(Arc::new(move |key: NodeKey| key == allowed_key)));
+
+        // A denied client receives ServerKey but never ServerInfo: the relay
+        // closes the connection after admission control rejects it.
+        let (mut client_side, server_side) = duplex(128 * 1024);
+        let relay2 = Arc::clone(&relay);
+        tokio::spawn(async move {
+            relay2.run_conn(server_side).await;
+        });
+
+        let Ok(Some(server_key)) = read_frame(&mut client_side).await else {
+            panic!("server did not send ServerKey");
+        };
+        assert_eq!(server_key.ty, FrameType::ServerKey);
+        let server_public = ServerKeyBody::decode(&server_key.payload).unwrap().key;
+        let (_, nonce, ciphertext) = make_client_info(
+            &denied,
+            &server_public,
+            &ClientInfoPayload {
+                version: PROTOCOL_VERSION,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut info = ClientInfoBody {
+            key: denied.public(),
+            nonce,
+        }
+        .encode_prefix()
+        .to_vec();
+        info.extend_from_slice(&ciphertext);
+        write_frame(
+            &mut client_side,
+            Frame::new(FrameType::ClientInfo, Bytes::from(info)),
+        )
+        .await
+        .unwrap();
+
+        // The next frame is EOF: the server never sent ServerInfo.
+        let after = read_frame(&mut client_side).await;
+        assert!(
+            matches!(after, Ok(None)),
+            "denied client must be disconnected with no ServerInfo: {after:?}"
+        );
+
+        // An allowed client completes the handshake normally.
+        let client = connect_client(&relay, allowed).await;
+        assert_eq!(client.node_key(), allowed_key);
     }
 
     #[tokio::test]

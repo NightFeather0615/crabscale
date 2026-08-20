@@ -8,9 +8,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use crabscale_control::{ControlConfig, ControlPlane, DnsSettings};
+use crabscale_proto::{DerpMap, DerpNode, DerpRegion};
 use crabscale_server::{
-    ControlRouter, DEFAULT_KEY_FILE, OidcClient, OidcConfig, load_or_create_machine_key,
-    serve_on_addr,
+    BootstrapDns, ControlRouter, DEFAULT_KEY_FILE, OidcClient, OidcConfig,
+    load_or_create_machine_key, serve_on_addr, serve_stun,
 };
 
 /// Default address the outer HTTP server listens on.
@@ -81,6 +82,43 @@ struct Args {
     /// OIDC scopes to request, space-separated.
     #[arg(long, default_value = "openid profile email")]
     oidc_scope: String,
+
+    /// DERP region ID for the embedded relay (stable across restarts).
+    #[arg(long, default_value = "1")]
+    derp_region_id: u64,
+
+    /// Short DERP region code advertised to clients.
+    #[arg(long, default_value = "crab")]
+    derp_region_code: String,
+
+    /// Long DERP region name advertised to clients.
+    #[arg(long, default_value = "Crabscale")]
+    derp_region_name: String,
+
+    /// Node name of the embedded relay inside the advertised region.
+    #[arg(long, default_value = "crab-1")]
+    derp_node_name: String,
+
+    /// Public hostname of the embedded relay.
+    #[arg(long, default_value = "derp.example.com")]
+    derp_hostname: String,
+
+    /// DERP HTTPS port of the embedded relay.
+    #[arg(long, default_value = "443")]
+    derp_port: i32,
+
+    /// STUN UDP port of the embedded relay; 0 disables the STUN listener and
+    /// advertises `-1` in the DERP map so clients skip STUN.
+    #[arg(long, default_value = "3478")]
+    stun_port: i32,
+
+    /// Address the STUN UDP listener binds to (combined with `--stun-port`).
+    #[arg(long, default_value = "0.0.0.0")]
+    stun_bind: std::net::IpAddr,
+
+    /// Comma-separated hostnames to resolve and publish at `/bootstrap-dns`.
+    #[arg(long)]
+    bootstrap_dns_names: Option<String>,
 }
 
 #[tokio::main]
@@ -116,6 +154,7 @@ fn control_config(args: &Args) -> ControlConfig {
         ..Default::default()
     };
     ControlConfig {
+        derp_map: build_derp_map(args),
         auth_key: args
             .auth_key
             .clone()
@@ -131,6 +170,39 @@ fn control_config(args: &Args) -> ControlConfig {
         dns,
         ..defaults
     }
+}
+
+/// Build the DERP map advertising the embedded relay region.
+///
+/// The region and node IDs come from the CLI so they stay stable across
+/// restarts (Spec-DERP-STUN section 7). A STUN port of 0 is advertised as
+/// `-1` (STUN disabled) so clients do not attempt binding requests.
+fn build_derp_map(args: &Args) -> DerpMap {
+    let node = DerpNode {
+        name: args.derp_node_name.clone(),
+        region_id: args.derp_region_id,
+        host_name: args.derp_hostname.clone(),
+        derp_port: args.derp_port,
+        stun_port: if args.stun_port == 0 {
+            -1
+        } else {
+            args.stun_port
+        },
+        ..Default::default()
+    };
+    let region = DerpRegion {
+        region_id: args.derp_region_id,
+        region_code: args.derp_region_code.clone(),
+        region_name: args.derp_region_name.clone(),
+        nodes: vec![node],
+        ..Default::default()
+    };
+    let mut map = DerpMap {
+        omit_default_regions: true,
+        ..Default::default()
+    };
+    map.regions.insert(args.derp_region_id.to_string(), region);
+    map
 }
 
 /// Build an OIDC client from CLI arguments, if OIDC is configured.
@@ -184,6 +256,31 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(oidc) = build_oidc(&args)? {
         router = router.with_oidc(oidc);
     }
+
+    // Serve the embedded relay's STUN port (Spec-DERP-STUN section 6) unless
+    // the operator disabled it with `--stun-port 0`.
+    let stun_handle = if args.stun_port != 0 {
+        let stun_addr = std::net::SocketAddr::new(args.stun_bind, args.stun_port as u16);
+        let (stun_local, handle) = serve_stun(stun_addr).await?;
+        println!("STUN listening on udp://{stun_local}");
+        Some(handle)
+    } else {
+        println!("STUN disabled (--stun-port 0)");
+        None
+    };
+
+    // Publish the bootstrap DNS snapshot at `/bootstrap-dns`.
+    if let Some(names) = args.bootstrap_dns_names.as_deref() {
+        let names: Vec<String> = names
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let dns = BootstrapDns::resolve(&names).await;
+        println!("bootstrap DNS: {}", names.join(", "));
+        router = router.with_bootstrap_dns(dns);
+    }
+
     router.spawn_reaper();
 
     let (addr, handle) = serve_on_addr(args.listen, router, server_key.clone()).await?;
@@ -194,6 +291,9 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::signal::ctrl_c().await?;
     handle.shutdown();
+    if let Some(stun) = stun_handle {
+        stun.shutdown();
+    }
     println!("shutdown complete");
     Ok(())
 }
@@ -273,6 +373,62 @@ mod tests {
             config.dns.extra_records_path,
             Some(std::path::PathBuf::from("records.json"))
         );
+    }
+
+    #[test]
+    fn parses_derp_options() {
+        let args = Args::try_parse_from([
+            "crabscale-server",
+            "--derp-region-id",
+            "900",
+            "--derp-region-code",
+            "sfo",
+            "--derp-region-name",
+            "San Francisco",
+            "--derp-node-name",
+            "sfo-1",
+            "--derp-hostname",
+            "derp.example.net",
+            "--derp-port",
+            "8443",
+            "--stun-port",
+            "4444",
+            "--stun-bind",
+            "0.0.0.0",
+        ])
+        .unwrap();
+        let config = control_config(&args);
+        let region = &config.derp_map.regions["900"];
+        assert_eq!(region.region_id, 900);
+        assert_eq!(region.region_code, "sfo");
+        assert_eq!(region.region_name, "San Francisco");
+        let node = &region.nodes[0];
+        assert_eq!(node.name, "sfo-1");
+        assert_eq!(node.host_name, "derp.example.net");
+        assert_eq!(node.derp_port, 8443);
+        assert_eq!(node.stun_port, 4444);
+        assert!(config.derp_map.omit_default_regions);
+    }
+
+    #[test]
+    fn derp_map_disables_stun_with_zero_port() {
+        let args = Args::try_parse_from(["crabscale-server", "--stun-port", "0"]).unwrap();
+        let config = control_config(&args);
+        let node = &config.derp_map.regions["1"].nodes[0];
+        assert_eq!(
+            node.stun_port, -1,
+            "port 0 must be advertised as -1 (STUN off)"
+        );
+        let config2 = control_config(&Args::try_parse_from(["crabscale-server"]).unwrap());
+        assert_eq!(config2.derp_map.regions["1"].nodes[0].stun_port, 3478);
+    }
+
+    #[test]
+    fn parses_bootstrap_dns_names() {
+        let args =
+            Args::try_parse_from(["crabscale-server", "--bootstrap-dns-names", "a.com,b.com"])
+                .unwrap();
+        assert_eq!(args.bootstrap_dns_names.as_deref(), Some("a.com,b.com"));
     }
 
     #[test]

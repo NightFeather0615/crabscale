@@ -4,11 +4,14 @@
 //! the inner `/machine/*` router served over HTTP/2-over-Noise, and the
 //! persisted server machine key.
 
+pub mod bootstrap_dns;
 pub mod http;
 pub mod key;
 pub mod oidc;
 pub mod router;
+pub mod stun;
 
+pub use bootstrap_dns::BootstrapDns;
 pub use http::{ServerHandle, serve, serve_on_addr};
 pub use key::{DEFAULT_KEY_FILE, ServerKey, load_or_create_machine_key, persist_machine_key};
 pub use oidc::{
@@ -16,3 +19,4 @@ pub use oidc::{
     OidcFlow, OidcFlowStore,
 };
 pub use router::{ControlRouter, serve_control};
+pub use stun::{StunServerHandle, serve_stun};

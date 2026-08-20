@@ -8,13 +8,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::bootstrap_dns::BootstrapDns;
 use crate::oidc::{
     DEFAULT_OIDC_FLOW_LIMIT, DEFAULT_OIDC_FLOW_TTL_SECONDS, OidcClient, OidcFlowStore, now_unix,
 };
 use bytes::Bytes;
 use crabscale_control::{ControlConfig, ControlError, ControlPlane, MapOutcome};
 use crabscale_proto::{
-    LogoutRequest, MIN_SUPPORTED_CAPVER, MachineKey, MapRequest, RegisterRequest,
+    LogoutRequest, MIN_SUPPORTED_CAPVER, MachineKey, MapRequest, RegisterRequest, VerifyRequest,
+    VerifyResponse,
 };
 use crabscale_transport::{
     MAX_INNER_BODY_LEN, NoiseStream, TransportError, random_challenge, read_body_limited,
@@ -24,6 +26,12 @@ use h2::RecvStream;
 use h2::server::SendResponse;
 use http::{Request, Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+/// Maximum body accepted by `POST /verify` (Spec-Control-API `POST /verify`).
+///
+/// The limit is 4 KiB; the HTTP layer enforces it before the body reaches the
+/// router, which re-checks it as defense in depth.
+pub const VERIFY_MAX_BODY_LEN: usize = 4096;
 
 /// Default keepalive interval for streaming map sessions.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(50);
@@ -42,6 +50,8 @@ pub struct ControlRouter {
     /// Outstanding OIDC authorization flows keyed by CSRF state, shared across
     /// router clones so any connection can validate the callback.
     oidc_flows: Arc<Mutex<OidcFlowStore>>,
+    /// Optional `/bootstrap-dns` snapshot served over the outer HTTP server.
+    bootstrap_dns: Option<Arc<BootstrapDns>>,
 }
 
 impl ControlRouter {
@@ -61,6 +71,7 @@ impl ControlRouter {
                 DEFAULT_OIDC_FLOW_LIMIT,
                 DEFAULT_OIDC_FLOW_TTL_SECONDS,
             ))),
+            bootstrap_dns: None,
         }
     }
 
@@ -81,6 +92,12 @@ impl ControlRouter {
             DEFAULT_OIDC_FLOW_LIMIT,
             ttl_seconds,
         )));
+        self
+    }
+
+    /// Attach a `/bootstrap-dns` snapshot served by the outer HTTP server.
+    pub fn with_bootstrap_dns(mut self, bootstrap_dns: BootstrapDns) -> Self {
+        self.bootstrap_dns = Some(Arc::new(bootstrap_dns));
         self
     }
 
@@ -131,6 +148,48 @@ impl ControlRouter {
             .header("Content-Type", "application/json")
             .body(Bytes::from(body.to_string()))
             .expect("static response is valid")
+    }
+
+    /// Handle an outer `POST /verify` admission request.
+    ///
+    /// The body is limited to [`VERIFY_MAX_BODY_LEN`] bytes (enforced by the
+    /// HTTP layer; re-checked here as defense in depth). An unknown or
+    /// logged-out node key returns `{"Allow": false}` with `200`, never an
+    /// error page (Spec-Control-API `POST /verify`).
+    pub fn handle_verify(&self, body: &[u8]) -> Response<Bytes> {
+        if body.len() > VERIFY_MAX_BODY_LEN {
+            return plain_response(StatusCode::PAYLOAD_TOO_LARGE, "body too large");
+        }
+        let request: VerifyRequest = match serde_json::from_slice(body) {
+            Ok(request) => request,
+            Err(_) => {
+                return plain_response(StatusCode::BAD_REQUEST, "invalid verify request");
+            }
+        };
+        let response = VerifyResponse {
+            allow: self.control.node_is_authorized(&request.node_public),
+        };
+        let body = serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"Allow\":false}".to_vec());
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Bytes::from(body))
+            .expect("static response is valid")
+    }
+
+    /// Handle an outer `GET /bootstrap-dns` request.
+    ///
+    /// Serves the configured bootstrap DNS snapshot; when `q` names a known
+    /// host only that entry is returned, otherwise the full map is returned
+    /// so clients can discover names (Spec-Control-API, Bootstrap DNS).
+    /// Returns `404` when no bootstrap DNS snapshot is configured.
+    pub fn handle_bootstrap_dns(&self, q: Option<&str>) -> Response<Bytes> {
+        let Some(dns) = &self.bootstrap_dns else {
+            return plain_response(StatusCode::NOT_FOUND, "bootstrap DNS not configured");
+        };
+        let response = dns.handle(q);
+        let (parts, body) = response.into_parts();
+        Response::from_parts(parts, body.into_inner().unwrap_or_default())
     }
 
     /// Handle an outer `GET /register/{id}` approval page.
@@ -533,13 +592,16 @@ impl ControlRouter {
             return;
         }
 
-        // Subscribe to DNS changes so a hot reload pushes a DNS delta frame
-        // to every live map session (Spec-NetMap section 7).
+        // Subscribe to DNS and DERP map changes so a hot reload pushes a
+        // delta frame to every live map session (Spec-NetMap section 7 and
+        // Spec-DERP-STUN section 7).
         let mut dns_changes = self.control.subscribe_dns_changes();
+        let mut derp_changes = self.control.subscribe_derp_map_changes();
 
         loop {
             // Spec-NetMap section 5: keepalive every 50s plus 0-9s random
-            // jitter; a DNS change interrupts the wait and pushes a delta.
+            // jitter; a DNS or DERP map change interrupts the wait and
+            // pushes a delta.
             let jitter = Duration::from_secs(rand::random::<u64>() % 10);
             let sleep = std::pin::pin!(tokio::time::sleep(KEEPALIVE_INTERVAL + jitter));
             tokio::select! {
@@ -561,6 +623,25 @@ impl ControlRouter {
                                 // disabled with no other DNS settings).
                                 Err(_) => continue,
                             };
+                            if send.send_data(Bytes::from(frame), false).is_err() {
+                                break;
+                            }
+                        }
+                        // Lagged: missed revisions; the next map picks up the
+                        // latest config anyway.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        // The control plane is gone; stop streaming.
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                derp_change = derp_changes.recv() => {
+                    match derp_change {
+                        Ok(_revision) => {
+                            let frame =
+                                match self.control.build_derp_map_delta_frame(compress) {
+                                    Ok(f) => f,
+                                    Err(_) => continue,
+                                };
                             if send.send_data(Bytes::from(frame), false).is_err() {
                                 break;
                             }
@@ -805,6 +886,94 @@ mod tests {
         assert_eq!(
             router.handle_key(Some("abc")).status(),
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn verify_allows_registered_node_and_denies_unknown() {
+        let plane = ControlPlane::new(ControlConfig::default());
+        let router = ControlRouter::with_control(test_key(), plane.clone());
+        let request = RegisterRequest {
+            version: 130,
+            node_key: NodeKey::from_bytes([0x22; 32]),
+            auth: Some(RegisterAuth {
+                auth_key: "hskey-auth-test-secret".to_string(),
+            }),
+            hostinfo: Some(Hostinfo {
+                hostname: "node1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(plane.register(test_key(), request).machine_authorized);
+
+        let allowed = router.handle_verify(
+            &serde_json::to_vec(&VerifyRequest {
+                node_public: NodeKey::from_bytes([0x22; 32]),
+            })
+            .unwrap(),
+        );
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(allowed.body()).unwrap();
+        assert_eq!(
+            json["Allow"],
+            serde_json::json!(true),
+            "known node is allowed"
+        );
+
+        let denied = router.handle_verify(
+            &serde_json::to_vec(&VerifyRequest {
+                node_public: NodeKey::from_bytes([0x99; 32]),
+            })
+            .unwrap(),
+        );
+        assert_eq!(denied.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(denied.body()).unwrap();
+        assert_eq!(
+            json["Allow"],
+            serde_json::json!(false),
+            "unknown node key is denied, not an error"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_malformed_and_oversized_body() {
+        let router = ControlRouter::new(test_key());
+        assert_eq!(
+            router.handle_verify(b"not json").status(),
+            StatusCode::BAD_REQUEST
+        );
+        let oversized = vec![b'x'; VERIFY_MAX_BODY_LEN + 1];
+        assert_eq!(
+            router.handle_verify(&oversized).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn bootstrap_dns_serves_configured_snapshot() {
+        use crate::bootstrap_dns::BootstrapDns;
+        use std::collections::BTreeMap;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let router = ControlRouter::new(test_key()).with_bootstrap_dns(BootstrapDns::from_entries(
+            BTreeMap::from([(
+                "derp.example.com".to_string(),
+                vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))],
+            )]),
+        ));
+        let response = router.handle_bootstrap_dns(Some("derp.example.com"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(json["derp.example.com"][0], serde_json::json!("192.0.2.1"));
+    }
+
+    #[test]
+    fn bootstrap_dns_unconfigured_returns_404() {
+        let router = ControlRouter::new(test_key());
+        assert_eq!(
+            router.handle_bootstrap_dns(None).status(),
+            StatusCode::NOT_FOUND
         );
     }
 

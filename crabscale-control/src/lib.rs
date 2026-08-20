@@ -7,6 +7,7 @@
 //! trait, assigns tailnet IPs with a random allocator, and builds the first
 //! complete MapResponse frame.
 
+mod derp;
 mod dns;
 mod ip_allocator;
 mod model;
@@ -255,6 +256,7 @@ pub struct ControlPlane {
     sessions: Mutex<SessionRegistry>,
     reaper_started: AtomicBool,
     dns_state: Arc<dns::DnsState>,
+    derp_state: Arc<derp::DerpMapState>,
     /// Broadcast channel that wakes SSH followup waiters when an auth id
     /// resolves. Clones of a plane share the channel so an approval on any
     /// clone notifies waiters on every clone.
@@ -273,6 +275,7 @@ impl Clone for ControlPlane {
             sessions: Mutex::new(SessionRegistry::new(self.config.reconnect_grace_seconds)),
             reaper_started: AtomicBool::new(false),
             dns_state: self.dns_state.clone(),
+            derp_state: self.derp_state.clone(),
             ssh_waiters: self.ssh_waiters.clone(),
         }
     }
@@ -302,6 +305,7 @@ impl ControlPlane {
 
     /// Create a control plane with an explicit store.
     pub fn with_store(config: ControlConfig, store: Arc<dyn Store>) -> Self {
+        let derp_map = config.derp_map.clone();
         let pending = Mutex::new(pending::PendingCache::new(config.pending_cache_limit));
         let sessions = Mutex::new(SessionRegistry::new(config.reconnect_grace_seconds));
         let plane = Self {
@@ -311,6 +315,7 @@ impl ControlPlane {
             sessions,
             reaper_started: AtomicBool::new(false),
             dns_state: Arc::new(dns::DnsState::new(Vec::new())),
+            derp_state: Arc::new(derp::DerpMapState::new(derp_map)),
             ssh_waiters: tokio::sync::broadcast::channel(128).0,
         };
         if plane.config.dns.extra_records_path.is_some() {
@@ -1507,7 +1512,7 @@ impl ControlPlane {
 
         Ok(MapResponse {
             node: Some(proto_node),
-            derp_map: Some(self.config.derp_map.clone()),
+            derp_map: Some(self.derp_state.map()),
             domain: self.config.tailnet_domain.clone(),
             peers: Some(peers),
             packet_filters: Some(packet_filters),
@@ -1707,6 +1712,61 @@ impl ControlPlane {
         self.encode_frame(&response, compress)
     }
 
+    /// The current DERP map advertised to clients.
+    ///
+    /// This is the runtime snapshot, so a `set_derp_map` replacement is
+    /// visible to any later map response.
+    pub fn derp_map(&self) -> DerpMap {
+        self.derp_state.map()
+    }
+
+    /// Atomically replace the DERP map advertised to clients.
+    ///
+    /// The replacement bumps the DERP map revision and notifies every live
+    /// streaming map session, which pushes a `DERPMap` delta frame
+    /// (Spec-DERP-STUN §7). Returns the new revision number.
+    pub fn set_derp_map(&self, map: DerpMap) -> u64 {
+        self.derp_state.set_map(map)
+    }
+
+    /// Subscribe to DERP map changes. The receiver yields a new revision for
+    /// every `set_derp_map` replacement.
+    pub fn subscribe_derp_map_changes(&self) -> tokio::sync::broadcast::Receiver<u64> {
+        self.derp_state.subscribe()
+    }
+
+    /// The current DERP map revision (0 = startup config, no replacements).
+    pub fn derp_map_revision(&self) -> u64 {
+        self.derp_state.revision()
+    }
+
+    /// Build a MapResponse delta frame carrying only the DERP map, used to
+    /// push a map change to live map sessions.
+    pub fn build_derp_map_delta_frame(&self, compress: bool) -> Result<Vec<u8>, ControlError> {
+        let response = MapResponse {
+            derp_map: Some(self.derp_state.map()),
+            ..Default::default()
+        };
+        self.encode_frame(&response, compress)
+    }
+
+    /// Whether a node key is authorized to use the tailnet and its relay.
+    ///
+    /// This is the decision the `/verify` endpoint and the DERP relay's
+    /// admission callback rely on: a node is only allowed when it has
+    /// registered and is `machine_authorized`. Unknown or logged-out nodes
+    /// return `false` (Spec-Control-API `POST /verify`).
+    pub fn node_is_authorized(&self, node_key: &NodeKey) -> bool {
+        match self
+            .store
+            .get_node_by_node_key(node_key)
+            .map_err(|e| ControlError::Store(e.to_string()))
+        {
+            Ok(Some(node)) => node.machine_authorized,
+            _ => false,
+        }
+    }
+
     fn authorized_response(&self) -> RegisterResponse {
         RegisterResponse {
             user: self.config.user_id,
@@ -1894,6 +1954,114 @@ mod tests {
             json["Node"]["StableID"],
             serde_json::json!("n00000000000000000000001")
         );
+    }
+
+    #[test]
+    fn configured_derp_region_reaches_client_map() {
+        let mut input = crabscale_proto::DerpMap {
+            omit_default_regions: true,
+            ..Default::default()
+        };
+        input.regions.insert(
+            "900".to_string(),
+            crabscale_proto::DerpRegion {
+                region_id: 900,
+                region_code: "crab".to_string(),
+                region_name: "Crabscale".to_string(),
+                nodes: vec![crabscale_proto::DerpNode {
+                    name: "crab-1".to_string(),
+                    region_id: 900,
+                    host_name: "derp.example.com".to_string(),
+                    derp_port: 443,
+                    stun_port: 3478,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let plane = ControlPlane::new(ControlConfig {
+            derp_map: input,
+            policy: allow_all_policy(),
+            ..ControlConfig::default()
+        });
+        plane.register(test_machine_key(), test_register_request());
+
+        let json = map_json(&plane, 1);
+        let regions = &json["DERPMap"]["Regions"];
+        assert_eq!(
+            regions["900"]["RegionID"],
+            serde_json::json!(900),
+            "the configured region id must be delivered"
+        );
+        assert_eq!(regions["900"]["RegionCode"], serde_json::json!("crab"));
+        assert_eq!(
+            regions["900"]["Nodes"][0]["HostName"],
+            serde_json::json!("derp.example.com")
+        );
+        assert_eq!(
+            regions["900"]["Nodes"][0]["STUNPort"],
+            serde_json::json!(3478)
+        );
+    }
+
+    #[test]
+    fn node_is_authorized_after_registration_denies_unknown() {
+        let plane = test_plane();
+        // Unknown key is denied before registration.
+        assert!(!plane.node_is_authorized(&test_node_key()));
+
+        plane.register(test_machine_key(), test_register_request());
+        assert!(plane.node_is_authorized(&test_node_key()));
+
+        // A random unrelated key stays denied.
+        assert!(!plane.node_is_authorized(&NodeKey::from_bytes([0x77; 32])));
+
+        // After logout the same key is denied again.
+        plane.logout(test_machine_key(), &test_node_key()).unwrap();
+        assert!(!plane.node_is_authorized(&test_node_key()));
+    }
+
+    #[test]
+    fn derp_map_change_broadcasts_and_builds_delta() {
+        let plane = test_plane();
+        let mut rx = plane.subscribe_derp_map_changes();
+        assert_eq!(plane.derp_map_revision(), 0);
+
+        let mut updated = plane.derp_map();
+        updated.regions.insert(
+            "999".to_string(),
+            crabscale_proto::DerpRegion {
+                region_id: 999,
+                region_code: "new".to_string(),
+                region_name: "New region".to_string(),
+                ..Default::default()
+            },
+        );
+        let revision = plane.set_derp_map(updated);
+        assert_eq!(revision, 1);
+        assert_eq!(plane.derp_map_revision(), 1);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            1,
+            "subscriber must see the revision"
+        );
+        assert!(plane.derp_map().regions.contains_key("999"));
+
+        // A delta frame carries only the DERP map.
+        let frame = plane.build_derp_map_delta_frame(false).unwrap();
+        let (payload, consumed) = crabscale_proto::decode_map_response_frame(&frame).unwrap();
+        assert_eq!(consumed, frame.len());
+        let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert!(json.get("DERPMap").is_some());
+        assert!(
+            json.get("KeepAlive").is_none(),
+            "delta must not be a keepalive"
+        );
+        assert!(
+            json.get("Node").is_none(),
+            "delta must omit unchanged fields"
+        );
+        assert!(json["DERPMap"]["Regions"].get("999").is_some());
     }
 
     #[test]
