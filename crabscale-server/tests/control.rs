@@ -101,3 +101,92 @@ async fn stub_route_returns_501() {
 
     drop(server_task);
 }
+
+#[tokio::test]
+async fn register_and_map_over_noise() {
+    let server = NoiseResponder::random();
+    let machine_key = MachineKey::from_bytes(server.public_key().to_bytes());
+    let router = ControlRouter::new(machine_key);
+    let (mut client_stream, server_stream) =
+        loopback_handshake(&server, StaticSecret::random(), 113)
+            .await
+            .unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let _ = serve_control(server_stream, router).await;
+    });
+
+    read_early_payload(&mut client_stream).await;
+
+    let (mut client, conn) = client::handshake(client_stream).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let node_key = crabscale_proto::NodeKey::from_bytes([0x22; 32]);
+    let disco_key = crabscale_proto::DiscoKey::from_bytes([0x33; 32]);
+
+    // Register with the default test auth key.
+    let register = crabscale_proto::RegisterRequest {
+        version: 130,
+        node_key,
+        auth: Some(crabscale_proto::RegisterAuth {
+            auth_key: "hskey-auth-test-secret".to_string(),
+        }),
+        hostinfo: Some(crabscale_proto::Hostinfo {
+            hostname: "node1".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let register_body = serde_json::to_vec(&register).unwrap();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/machine/register")
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream.send_data(register_body.into(), true).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body();
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    let reg_json: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+    assert_eq!(reg_json["MachineAuthorized"], true);
+
+    // Request a non-streaming full map.
+    let map = crabscale_proto::MapRequest {
+        version: 130,
+        node_key,
+        disco_key,
+        stream: false,
+        ..Default::default()
+    };
+    let map_body = serde_json::to_vec(&map).unwrap();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/machine/map")
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream.send_data(map_body.into(), true).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body();
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    let (payload, consumed) = crabscale_proto::decode_map_response_frame(&buf).unwrap();
+    assert_eq!(consumed, buf.len());
+    let map_json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    assert!(map_json.get("Node").is_some());
+    assert!(map_json.get("DERPMap").is_some());
+    assert!(map_json.get("Peers").is_some());
+    assert_eq!(map_json["Peers"], serde_json::json!([]));
+
+    drop(server_task);
+}
