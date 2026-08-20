@@ -7,6 +7,7 @@
 //! trait, assigns tailnet IPs with a random allocator, and builds the first
 //! complete MapResponse frame.
 
+mod dns;
 mod ip_allocator;
 mod model;
 mod pending;
@@ -26,6 +27,7 @@ use crabscale_proto::{
     RegisterRequest, RegisterResponse, UserProfile, encode_map_response_frame,
 };
 
+pub use dns::{DnsError, DnsSettings};
 pub use ip_allocator::{IpAllocator, IpAllocatorError};
 pub use model::{Login, Node as DomainNode, Policy, PreAuthKey, Session, User};
 pub use pending::{
@@ -88,6 +90,9 @@ pub struct ControlConfig {
     /// Reconnect grace in seconds before a node is marked offline after its
     /// last live map session closes.
     pub reconnect_grace_seconds: i64,
+    /// DNS configuration (MagicDNS, split DNS, search domains, extra records)
+    /// delivered to clients in the MapResponse `DNS` field.
+    pub dns: DnsSettings,
 }
 
 impl Default for ControlConfig {
@@ -129,6 +134,7 @@ impl Default for ControlConfig {
             pending_ttl_seconds: DEFAULT_PENDING_TTL_SECONDS,
             pending_cache_limit: DEFAULT_PENDING_CACHE_LIMIT,
             reconnect_grace_seconds: DEFAULT_RECONNECT_GRACE_SECONDS,
+            dns: DnsSettings::default(),
         }
     }
 }
@@ -161,6 +167,8 @@ pub enum ControlError {
     UnauthorizedTags(Vec<String>),
     /// A route string is not a valid IP or CIDR.
     InvalidRoute(String),
+    /// DNS extra records could not be read, parsed, or pushed.
+    ExtraRecords(String),
 }
 
 impl std::fmt::Display for ControlError {
@@ -184,6 +192,7 @@ impl std::fmt::Display for ControlError {
             Self::InvalidRoute(route) => {
                 write!(f, "invalid route `{route}`: expected an IP or CIDR")
             }
+            Self::ExtraRecords(e) => write!(f, "DNS extra records: {e}"),
         }
     }
 }
@@ -217,13 +226,22 @@ pub struct ControlPlane {
     pending: Mutex<pending::PendingCache>,
     sessions: Mutex<SessionRegistry>,
     reaper_started: AtomicBool,
+    dns_state: Arc<dns::DnsState>,
 }
 
 impl Clone for ControlPlane {
     fn clone(&self) -> Self {
-        // The store is shared via `Arc`; the pending cache is a read-through
-        // cache backed by the store, so a fresh cache is created on clone.
-        Self::with_store(self.config.clone(), self.store.clone())
+        // The store and DNS state are shared via `Arc`; the pending cache is
+        // a read-through cache backed by the store, so a fresh cache is
+        // created on clone. Sessions are per-clone.
+        Self {
+            config: self.config.clone(),
+            store: self.store.clone(),
+            pending: Mutex::new(pending::PendingCache::new(self.config.pending_cache_limit)),
+            sessions: Mutex::new(SessionRegistry::new(self.config.reconnect_grace_seconds)),
+            reaper_started: AtomicBool::new(false),
+            dns_state: self.dns_state.clone(),
+        }
     }
 }
 
@@ -253,13 +271,20 @@ impl ControlPlane {
     pub fn with_store(config: ControlConfig, store: Arc<dyn Store>) -> Self {
         let pending = Mutex::new(pending::PendingCache::new(config.pending_cache_limit));
         let sessions = Mutex::new(SessionRegistry::new(config.reconnect_grace_seconds));
-        Self {
+        let plane = Self {
             config,
             store,
             pending,
             sessions,
             reaper_started: AtomicBool::new(false),
+            dns_state: Arc::new(dns::DnsState::new(Vec::new())),
+        };
+        if plane.config.dns.extra_records_path.is_some() {
+            if let Err(e) = plane.reload_dns_extra_records() {
+                eprintln!("warning: {e}; starting with no DNS extra records");
+            }
         }
+        plane
     }
 
     /// Open a live map session for a node.
@@ -1388,6 +1413,7 @@ impl ControlPlane {
             packet_filters: Some(packet_filters),
             user_profiles,
             control_time: CONTROL_TIME.to_string(),
+            dns: self.build_dns_config()?,
             ..Default::default()
         })
     }
@@ -1485,6 +1511,95 @@ impl ControlPlane {
     pub fn keepalive_frame(&self, compress: bool) -> Result<Vec<u8>, ControlError> {
         let response = MapResponse {
             keep_alive: true,
+            ..Default::default()
+        };
+        self.encode_frame(&response, compress)
+    }
+
+    /// Hot-reload the DNS extra-records file and push the new revision to
+    /// every subscribed map session.
+    ///
+    /// Returns the number of records loaded. Errors if no path is configured
+    /// or the file is unreadable/invalid; on error the previous records stay
+    /// in effect.
+    pub fn reload_dns_extra_records(&self) -> Result<usize, ControlError> {
+        let Some(path) = &self.config.dns.extra_records_path else {
+            return Err(ControlError::ExtraRecords(
+                "no DNS extra records path configured".to_string(),
+            ));
+        };
+        let records =
+            dns::load_extra_records(path).map_err(|e| ControlError::ExtraRecords(e.to_string()))?;
+        let count = records.len();
+        self.dns_state.set_extra_records(records);
+        Ok(count)
+    }
+
+    /// Snapshot of the current DNS extra records.
+    pub fn dns_extra_records(&self) -> Vec<crabscale_proto::DnsRecord> {
+        self.dns_state.extra_records()
+    }
+
+    /// Subscribe to DNS configuration changes. The receiver yields a new
+    /// revision number for every successful hot reload.
+    pub fn subscribe_dns_changes(&self) -> tokio::sync::broadcast::Receiver<u64> {
+        self.dns_state.subscribe()
+    }
+
+    /// The current DNS revision; increments on every hot reload.
+    pub fn dns_revision(&self) -> u64 {
+        self.dns_state.revision()
+    }
+
+    /// Build the tailnet-wide DNS config delivered in the `DNS` field.
+    ///
+    /// Returns `None` when there is nothing meaningful to send (MagicDNS off
+    /// and no split DNS, search domains, or extra records configured).
+    pub fn build_dns_config(&self) -> Result<Option<crabscale_proto::DnsConfig>, ControlError> {
+        let dns = &self.config.dns;
+        let extra_records = self.dns_state.extra_records();
+        if !dns.magic_dns
+            && dns.split_dns.is_empty()
+            && dns.search_domains.is_empty()
+            && extra_records.is_empty()
+        {
+            return Ok(None);
+        }
+        let magic_dns_ipv4 = dns.magic_dns_ipv4.unwrap_or_else(|| {
+            dns::derive_magic_dns_ipv4(self.config.ipv4_prefix, self.config.ipv4_prefix_len)
+        });
+        let magic_dns_ipv6 = dns.magic_dns_ipv6.unwrap_or_else(|| {
+            dns::derive_magic_dns_ipv6(self.config.ipv6_prefix, self.config.ipv6_prefix_len)
+        });
+
+        let mut nodes = Vec::new();
+        for stored in self
+            .store
+            .list_nodes()
+            .map_err(|e| ControlError::Store(e.to_string()))?
+        {
+            nodes.push(stored.to_proto());
+        }
+
+        Ok(Some(dns.build(
+            &self.config.tailnet_domain,
+            magic_dns_ipv4,
+            magic_dns_ipv6,
+            &nodes,
+            &extra_records,
+        )))
+    }
+
+    /// Build a MapResponse delta frame carrying only the DNS config, used to
+    /// push DNS changes to live map sessions.
+    pub fn build_dns_delta_frame(&self, compress: bool) -> Result<Vec<u8>, ControlError> {
+        let Some(dns) = self.build_dns_config()? else {
+            return Err(ControlError::ExtraRecords(
+                "no DNS config to push".to_string(),
+            ));
+        };
+        let response = MapResponse {
+            dns: Some(dns),
             ..Default::default()
         };
         self.encode_frame(&response, compress)
@@ -3157,6 +3272,215 @@ mod tests {
                 "approved routes must survive restart"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn initial_map_includes_magic_dns_config() {
+        let plane = test_plane();
+        plane.register(test_machine_key(), test_register_request());
+        let json = map_json(&plane, 1);
+        let dns = &json["DNS"];
+        assert_eq!(
+            dns["MagicDNSSuffix"],
+            serde_json::json!("tailnet.example."),
+            "the tailnet suffix must be advertised"
+        );
+        assert_eq!(dns["Proxied"], serde_json::json!(true));
+        assert!(
+            dns["Domains"]
+                .as_array()
+                .expect("search domains")
+                .contains(&serde_json::json!("tailnet.example")),
+            "the tailnet search domain must be delivered in Domains"
+        );
+        assert!(
+            dns["Resolvers"]
+                .as_array()
+                .expect("resolvers")
+                .iter()
+                .any(|r| r["Addr"] == serde_json::json!("100.100.100.100")),
+            "the MagicDNS resolver must be advertised"
+        );
+        // The node profile yields an A/AAAA record for the requesting node,
+        // so its own MagicDNS name resolves.
+        let names: Vec<&str> = dns["ExtraRecords"]
+            .as_array()
+            .expect("extra records")
+            .iter()
+            .map(|r| r["Name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"node1.tailnet.example."),
+            "self node MagicDNS record must be present: {names:?}"
+        );
+    }
+
+    #[test]
+    fn peer_is_resolvable_by_magic_dns_name() {
+        let plane = test_plane();
+        plane.register(test_machine_key(), test_register_request());
+        register_extra_node(&plane, [0x13; 32], [0x24; 32]);
+        // Register a third peer with a distinct hostname so its record name
+        // is clearly attributable to the peer.
+        let mut request = test_register_request();
+        request.node_key = NodeKey::from_bytes([0x26; 32]);
+        request.hostinfo = Some(Hostinfo {
+            hostname: "peer".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            plane
+                .register(MachineKey::from_bytes([0x15; 32]), request)
+                .machine_authorized
+        );
+
+        let json = map_json(&plane, 1);
+        let records = json["DNS"]["ExtraRecords"]
+            .as_array()
+            .expect("extra records")
+            .clone();
+        let peer_record = records
+            .iter()
+            .find(|r| r["Name"] == serde_json::json!("peer.tailnet.example."))
+            .expect("peer MagicDNS record must be present");
+        assert_eq!(
+            peer_record["Type"],
+            serde_json::json!("A"),
+            "peer A record resolves through MagicDNS"
+        );
+        let peer_value = peer_record["Value"].as_str().expect("value");
+        assert!(
+            peer_value.starts_with("100."),
+            "peer record value must be the peer's tailnet IPv4 address: {peer_value}"
+        );
+        assert!(
+            peer_value.parse::<std::net::Ipv4Addr>().is_ok(),
+            "peer A record value must be an IPv4 literal: {peer_value}"
+        );
+    }
+
+    #[test]
+    fn split_dns_and_search_domains_reach_client() {
+        let mut config = ControlConfig {
+            policy: allow_all_policy(),
+            ..ControlConfig::default()
+        };
+        config
+            .dns
+            .split_dns
+            .insert("corp.example.".to_string(), vec!["10.0.0.53".to_string()]);
+        config.dns.search_domains.push("corp.example".to_string());
+        let plane = ControlPlane::new(config);
+        plane.register(test_machine_key(), test_register_request());
+
+        let json = map_json(&plane, 1);
+        let dns = &json["DNS"];
+        assert_eq!(
+            dns["Routes"]["corp.example."][0]["Addr"],
+            serde_json::json!("10.0.0.53"),
+            "split DNS must route the suffix to the configured resolver"
+        );
+        assert!(
+            dns["Domains"]
+                .as_array()
+                .expect("search domains")
+                .contains(&serde_json::json!("corp.example")),
+            "configured search domains must reach the client in Domains"
+        );
+    }
+
+    #[test]
+    fn disabling_magic_dns_omits_dns_field() {
+        let config = ControlConfig {
+            policy: allow_all_policy(),
+            dns: DnsSettings {
+                magic_dns: false,
+                ..Default::default()
+            },
+            ..ControlConfig::default()
+        };
+        let plane = ControlPlane::new(config);
+        plane.register(test_machine_key(), test_register_request());
+
+        let json = map_json(&plane, 1);
+        assert!(
+            json.get("DNS").is_none(),
+            "with MagicDNS and split/search disabled there is no DNS config to send"
+        );
+    }
+
+    #[test]
+    fn extra_records_hot_reload_updates_map_and_notifies_sessions() {
+        let dir =
+            std::env::temp_dir().join(format!("crabscale-dns-records-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("records.json");
+        std::fs::write(
+            &path,
+            br#"[{ "name": "db.tailnet.example.", "type": "A", "value": "100.64.0.9" }]"#,
+        )
+        .unwrap();
+
+        let mut config = ControlConfig {
+            policy: allow_all_policy(),
+            ..ControlConfig::default()
+        };
+        config.dns.extra_records_path = Some(path.clone());
+        let plane = ControlPlane::new(config);
+        plane.register(test_machine_key(), test_register_request());
+        assert_eq!(plane.dns_revision(), 1, "startup load bumps to revision 1");
+        assert_eq!(plane.dns_extra_records().len(), 1);
+
+        let before = map_json(&plane, 1);
+        let before_names: Vec<&str> = before["DNS"]["ExtraRecords"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["Name"].as_str().unwrap())
+            .collect();
+        assert!(before_names.contains(&"db.tailnet.example."));
+
+        // A subscriber representing a live map session must be notified.
+        let mut rx = plane.subscribe_dns_changes();
+
+        // Hot reload with an updated file.
+        std::fs::write(
+            &path,
+            br#"[
+                { "name": "db.tailnet.example.", "type": "A", "value": "100.64.0.9" },
+                { "name": "wiki.tailnet.example.", "type": "AAAA", "value": "fd7a:115c:a1e0::9" }
+            ]"#,
+        )
+        .unwrap();
+        let count = plane.reload_dns_extra_records().unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(plane.dns_revision(), 2);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            2,
+            "the subscriber must observe the new revision"
+        );
+
+        let after = map_json(&plane, 1);
+        let after_names: Vec<&str> = after["DNS"]["ExtraRecords"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["Name"].as_str().unwrap())
+            .collect();
+        assert!(
+            after_names.contains(&"wiki.tailnet.example."),
+            "reloaded records must appear in the next map: {after_names:?}"
+        );
+
+        // A failed reload leaves the previous snapshot in place.
+        std::fs::write(&path, b"not-json").unwrap();
+        assert!(plane.reload_dns_extra_records().is_err());
+        assert_eq!(plane.dns_revision(), 2);
+        assert_eq!(plane.dns_extra_records().len(), 2);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

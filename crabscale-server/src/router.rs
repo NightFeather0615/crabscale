@@ -341,16 +341,46 @@ impl ControlRouter {
             self.control.close_session(session_id);
             return;
         }
+
+        // Subscribe to DNS changes so a hot reload pushes a DNS delta frame
+        // to every live map session (Spec-NetMap section 7).
+        let mut dns_changes = self.control.subscribe_dns_changes();
+
         loop {
-            // Spec-NetMap section 5: keepalive every 50s plus 0-9s random jitter.
+            // Spec-NetMap section 5: keepalive every 50s plus 0-9s random
+            // jitter; a DNS change interrupts the wait and pushes a delta.
             let jitter = Duration::from_secs(rand::random::<u64>() % 10);
-            tokio::time::sleep(KEEPALIVE_INTERVAL + jitter).await;
-            let frame = match self.control.keepalive_frame(compress) {
-                Ok(f) => f,
-                Err(_) => break,
-            };
-            if send.send_data(Bytes::from(frame), false).is_err() {
-                break;
+            let sleep = std::pin::pin!(tokio::time::sleep(KEEPALIVE_INTERVAL + jitter));
+            tokio::select! {
+                _ = sleep => {
+                    let frame = match self.control.keepalive_frame(compress) {
+                        Ok(f) => f,
+                        Err(_) => break,
+                    };
+                    if send.send_data(Bytes::from(frame), false).is_err() {
+                        break;
+                    }
+                }
+                dns_change = dns_changes.recv() => {
+                    match dns_change {
+                        Ok(_revision) => {
+                            let frame = match self.control.build_dns_delta_frame(compress) {
+                                Ok(f) => f,
+                                // Nothing meaningful to push (e.g. MagicDNS was
+                                // disabled with no other DNS settings).
+                                Err(_) => continue,
+                            };
+                            if send.send_data(Bytes::from(frame), false).is_err() {
+                                break;
+                            }
+                        }
+                        // Lagged: missed revisions; the next map picks up the
+                        // latest config anyway.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        // The control plane is gone; stop streaming.
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
             }
         }
         self.control.close_session(session_id);

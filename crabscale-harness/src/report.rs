@@ -53,6 +53,30 @@ pub fn render_report(report: &HarnessReport) -> String {
             let _ = writeln!(out, "- Registered: {}", yes_no(peer.registered));
             let _ = writeln!(out, "- Assigned IPs: {}", peer.assigned_ips.join(", "));
             let _ = writeln!(out, "- Saw peer list: {}", yes_no(peer.saw_peers));
+            let _ = writeln!(
+                out,
+                "- MagicDNS suffix: {}",
+                empty_dash(&peer.magic_dns_suffix)
+            );
+            let _ = writeln!(out, "- MagicDNS proxied: {}", yes_no(peer.dns_proxied));
+            let _ = writeln!(
+                out,
+                "- Split-DNS suffixes: {}",
+                if peer.split_dns_suffixes.is_empty() {
+                    "-".to_string()
+                } else {
+                    peer.split_dns_suffixes.join(", ")
+                }
+            );
+            let _ = writeln!(
+                out,
+                "- Search domains: {}",
+                if peer.search_domains.is_empty() {
+                    "-".to_string()
+                } else {
+                    peer.search_domains.join(", ")
+                }
+            );
             let _ = writeln!(out, "- Logged out: {}", yes_no(peer.logged_out));
             if !peer.notes.is_empty() {
                 let _ = writeln!(out);
@@ -109,4 +133,8 @@ pub fn emit_report(report: &HarnessReport, path: Option<&str>) -> Result<(), Str
 
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+
+fn empty_dash(value: &str) -> &str {
+    if value.is_empty() { "-" } else { value }
 }

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::key::{DiscoKey, MachineKey, NodeKey};
-use crate::{DerpMap, Hostinfo, PingRequest};
+use crate::{DerpMap, DnsConfig, Hostinfo, PingRequest};
 
 /// A request to update node state or start a long-poll of network map updates.
 ///
@@ -87,6 +87,11 @@ pub struct MapResponse {
     /// Tailnet domain string.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub domain: String,
+    /// DNS configuration (MagicDNS, split DNS, search domains, records).
+    /// Delivered under the conventional `DNS` field name. Absent means the
+    /// client should keep its current DNS settings (Spec-NetMap section 7).
+    #[serde(rename = "DNS", skip_serializing_if = "Option::is_none")]
+    pub dns: Option<DnsConfig>,
     /// Complete peer list. `Some([])` is an authoritative empty peer list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peers: Option<Vec<Node>>,
@@ -370,6 +375,37 @@ mod tests {
             empty_json.get("CapMap").is_none(),
             "empty CapMap must be omitted"
         );
+    }
+
+    #[test]
+    fn dns_config_serializes_under_dns_field() {
+        let response = MapResponse {
+            dns: Some(DnsConfig {
+                proxied: true,
+                magic_dns_suffix: "tailnet.example.".to_string(),
+                search_domains: vec!["tailnet.example".to_string()],
+                ..Default::default()
+            }),
+            ..MapResponse::default()
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json["DNS"]["MagicDNSSuffix"],
+            serde_json::json!("tailnet.example.")
+        );
+        assert_eq!(json["DNS"]["Proxied"], serde_json::json!(true));
+        assert!(
+            json.get("Dns").is_none(),
+            "the field must be named DNS, not Dns"
+        );
+        assert!(json.get("DNS").is_some(), "DNS must be present");
+    }
+
+    #[test]
+    fn absent_dns_is_omitted() {
+        let response = MapResponse::default();
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(json.get("DNS").is_none(), "absent DNS must be omitted");
     }
 
     #[test]

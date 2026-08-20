@@ -1,7 +1,8 @@
 //! Integration tests for the control router over HTTP/2-over-Noise.
 
 use bytes::Bytes;
-use crabscale_proto::MachineKey;
+use crabscale_control::{ControlConfig, ControlPlane};
+use crabscale_proto::{DiscoKey, Hostinfo, MachineKey, NodeKey, RegisterAuth, RegisterRequest};
 use crabscale_server::{ControlRouter, serve_control};
 use crabscale_transport::{
     EARLY_PAYLOAD_MAGIC, NoiseResponder, NoiseStream, decode_early_payload, loopback_handshake,
@@ -454,4 +455,152 @@ async fn peer_ping_across_subnet_router() {
 
     drop(router_task);
     drop(peer_task);
+}
+
+#[tokio::test]
+async fn dns_reload_pushes_delta_to_live_map_session() {
+    let dir = std::env::temp_dir().join(format!("crabscale-dns-push-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let records_path = dir.join("records.json");
+    std::fs::write(
+        &records_path,
+        br#"[{ "name": "db.tailnet.example.", "type": "A", "value": "100.64.0.9" }]"#,
+    )
+    .unwrap();
+
+    let mut config = ControlConfig::default();
+    config.dns.extra_records_path = Some(records_path.clone());
+    let plane = ControlPlane::new(config);
+
+    let server = NoiseResponder::random();
+    let machine_key = MachineKey::from_bytes(server.public_key().to_bytes());
+    let router = ControlRouter::with_control(machine_key, plane.clone());
+    let (mut client_stream, server_stream) =
+        loopback_handshake(&server, StaticSecret::random(), 113)
+            .await
+            .unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let _ = serve_control(server_stream, router).await;
+    });
+
+    read_early_payload(&mut client_stream).await;
+
+    let (mut client, conn) = client::handshake(client_stream).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let node_key = NodeKey::from_bytes([0x22; 32]);
+    let disco_key = DiscoKey::from_bytes([0x33; 32]);
+
+    // Register with the default test auth key.
+    let register = RegisterRequest {
+        version: 130,
+        node_key,
+        auth: Some(RegisterAuth {
+            auth_key: "hskey-auth-test-secret".to_string(),
+        }),
+        hostinfo: Some(Hostinfo {
+            hostname: "node1".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let register_body = serde_json::to_vec(&register).unwrap();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/machine/register")
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream.send_data(register_body.into(), true).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body();
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    let reg_json: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+    assert_eq!(reg_json["MachineAuthorized"], true);
+
+    // Open a streaming map session (keepalive requested so the server enters
+    // the select loop and can observe DNS changes).
+    let map = crabscale_proto::MapRequest {
+        version: 130,
+        node_key,
+        disco_key,
+        stream: true,
+        keep_alive: true,
+        ..Default::default()
+    };
+    let map_body = serde_json::to_vec(&map).unwrap();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/machine/map")
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream.send_data(map_body.into(), true).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body();
+
+    // First frame is the complete initial map.
+    let chunk = body
+        .data()
+        .await
+        .expect("initial map frame")
+        .expect("data chunk");
+    let (payload, consumed) = crabscale_proto::decode_map_response_frame(&chunk).unwrap();
+    assert_eq!(consumed, chunk.len());
+    let first: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    assert!(first.get("Node").is_some());
+    assert!(first.get("DNS").is_some());
+
+    // Hot-reload the extra records through the shared control plane clone.
+    std::fs::write(
+        &records_path,
+        br#"[
+            { "name": "db.tailnet.example.", "type": "A", "value": "100.64.0.9" },
+            { "name": "wiki.tailnet.example.", "type": "AAAA", "value": "fd7a:115c:a1e0::9" }
+        ]"#,
+    )
+    .unwrap();
+    let count = plane.reload_dns_extra_records().unwrap();
+    assert_eq!(count, 2);
+
+    // The live session must receive a DNS delta frame.
+    let chunk = body
+        .data()
+        .await
+        .expect("dns delta frame")
+        .expect("data chunk");
+    let (payload, consumed) = crabscale_proto::decode_map_response_frame(&chunk).unwrap();
+    assert_eq!(consumed, chunk.len());
+    let delta: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    assert_eq!(
+        delta["DNS"]["MagicDNSSuffix"],
+        serde_json::json!("tailnet.example."),
+        "the DNS delta must carry the MagicDNS suffix"
+    );
+    assert!(
+        delta.get("Peers").is_none(),
+        "a DNS delta must not repeat the peer list"
+    );
+    let names: Vec<&str> = delta["DNS"]["ExtraRecords"]
+        .as_array()
+        .expect("extra records")
+        .iter()
+        .map(|r| r["Name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"wiki.tailnet.example."),
+        "reloaded records must be pushed to the live session: {names:?}"
+    );
+
+    drop(server_task);
+    let _ = std::fs::remove_dir_all(&dir);
 }
