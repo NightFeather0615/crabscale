@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use crabscale_control::{ControlConfig, ControlError, ControlPlane, MapOutcome};
-use crabscale_proto::{MachineKey, MapRequest, RegisterRequest};
+use crabscale_proto::{LogoutRequest, MachineKey, MapRequest, RegisterRequest};
 use crabscale_transport::{
     MAX_INNER_BODY_LEN, NoiseStream, TransportError, random_challenge, read_body_limited,
     serve_http2,
@@ -177,6 +177,9 @@ impl ControlRouter {
                 self.handle_map(&mut respond, machine_key, &body_bytes)
                     .await;
             }
+            ("POST", "/machine/logout") => {
+                self.handle_logout(&mut respond, &body_bytes).await;
+            }
             ("POST", "/machine/set-dns")
             | ("PATCH", "/machine/set-device-attr")
             | ("POST", "/machine/audit-log")
@@ -214,6 +217,29 @@ impl ControlRouter {
             }
         };
         match self.control.register(machine_key, request) {
+            Ok(response) => {
+                let body = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
+                send_json(respond, StatusCode::OK, body);
+            }
+            Err(_) => {
+                send_plain(
+                    respond,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"internal error",
+                );
+            }
+        }
+    }
+
+    async fn handle_logout(&self, respond: &mut SendResponse<Bytes>, body: &[u8]) {
+        let request: LogoutRequest = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(_) => {
+                send_plain(respond, StatusCode::BAD_REQUEST, b"invalid logout request");
+                return;
+            }
+        };
+        match self.control.logout(&request.node_key) {
             Ok(response) => {
                 let body = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
                 send_json(respond, StatusCode::OK, body);
