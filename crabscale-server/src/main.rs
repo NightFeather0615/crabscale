@@ -7,7 +7,7 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use crabscale_control::{ControlConfig, ControlPlane};
+use crabscale_control::{ControlConfig, ControlPlane, DnsSettings};
 use crabscale_server::{
     ControlRouter, DEFAULT_KEY_FILE, load_or_create_machine_key, serve_on_addr,
 };
@@ -42,6 +42,24 @@ struct Args {
     /// Base URL used to build interactive registration AuthURLs.
     #[arg(long)]
     server_url: Option<String>,
+
+    /// Disable MagicDNS. Split DNS and search domains are still delivered.
+    #[arg(long)]
+    no_magic_dns: bool,
+
+    /// Additional DNS search domain (no trailing dot). Repeatable.
+    #[arg(long)]
+    dns_search_domain: Vec<String>,
+
+    /// Split-DNS rule as `suffix=resolver-address` (suffix includes the
+    /// trailing dot). Repeatable.
+    #[arg(long)]
+    dns_split: Vec<String>,
+
+    /// JSON file of extra DNS records to inject into the MagicDNS zone;
+    /// re-read at runtime for hot reload.
+    #[arg(long)]
+    dns_extra_records: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -59,6 +77,23 @@ async fn main() -> ExitCode {
 /// Build the control plane configuration from CLI arguments.
 fn control_config(args: &Args) -> ControlConfig {
     let defaults = ControlConfig::default();
+    let mut split_dns = std::collections::BTreeMap::new();
+    for rule in &args.dns_split {
+        let Some((suffix, addr)) = rule.split_once('=') else {
+            continue;
+        };
+        split_dns
+            .entry(suffix.to_string())
+            .or_insert_with(Vec::new)
+            .push(addr.to_string());
+    }
+    let dns = DnsSettings {
+        magic_dns: !args.no_magic_dns,
+        search_domains: args.dns_search_domain.clone(),
+        split_dns,
+        extra_records_path: args.dns_extra_records.clone(),
+        ..Default::default()
+    };
     ControlConfig {
         auth_key: args
             .auth_key
@@ -72,6 +107,7 @@ fn control_config(args: &Args) -> ControlConfig {
             .server_url
             .clone()
             .unwrap_or_else(|| defaults.server_url.clone()),
+        dns,
         ..defaults
     }
 }
@@ -142,6 +178,39 @@ mod tests {
         assert_eq!(
             args.server_url.as_deref(),
             Some("https://control.example.com")
+        );
+    }
+
+    #[test]
+    fn parses_dns_options() {
+        let args = Args::try_parse_from([
+            "crabscale-server",
+            "--no-magic-dns",
+            "--dns-search-domain",
+            "corp.example",
+            "--dns-split",
+            "corp.example.=10.0.0.53",
+            "--dns-extra-records",
+            "records.json",
+        ])
+        .unwrap();
+        assert!(args.no_magic_dns);
+        assert_eq!(args.dns_search_domain, vec!["corp.example".to_string()]);
+        assert_eq!(args.dns_split, vec!["corp.example.=10.0.0.53".to_string()]);
+        assert_eq!(
+            args.dns_extra_records,
+            Some(std::path::PathBuf::from("records.json"))
+        );
+        let config = control_config(&args);
+        assert!(!config.dns.magic_dns);
+        assert_eq!(config.dns.search_domains, vec!["corp.example".to_string()]);
+        assert_eq!(
+            config.dns.split_dns.get("corp.example.").unwrap(),
+            &vec!["10.0.0.53".to_string()]
+        );
+        assert_eq!(
+            config.dns.extra_records_path,
+            Some(std::path::PathBuf::from("records.json"))
         );
     }
 
