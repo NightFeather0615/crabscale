@@ -107,14 +107,14 @@ async fn handle_request(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
-    if method == http::Method::GET && (path == "/key" || path.starts_with("/key?")) {
+    if method == http::Method::GET && path == "/key" {
         let capver = query_param(req.uri().query(), "v");
         let response = router.handle_key(capver);
         return Ok(response.map(Full::new));
     }
 
     if method == http::Method::POST && path == "/ts2021" {
-        return handle_ts2021(req, router, server_key).await;
+        return Ok(handle_ts2021(req, router, server_key).await);
     }
 
     Ok(plain_response(StatusCode::NOT_FOUND, "not found"))
@@ -124,7 +124,7 @@ async fn handle_ts2021(
     req: Request<Incoming>,
     router: ControlRouter,
     server_key: ServerKey,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Response<Full<Bytes>> {
     let headers = req.headers();
     let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
 
@@ -136,17 +136,14 @@ async fn handle_ts2021(
     ) {
         Ok(init) => init,
         Err(_) => {
-            return Ok(plain_response(
-                StatusCode::BAD_REQUEST,
-                "invalid upgrade request",
-            ));
+            return plain_response(StatusCode::BAD_REQUEST, "invalid upgrade request");
         }
     };
 
     let init = match parse_init_message(&init) {
         Ok(init) => init,
         Err(_) => {
-            return Ok(plain_response(StatusCode::BAD_REQUEST, "invalid handshake"));
+            return plain_response(StatusCode::BAD_REQUEST, "invalid handshake");
         }
     };
 
@@ -154,10 +151,7 @@ async fn handle_ts2021(
     let output = match server_key.responder().respond(&init, prologue.as_bytes()) {
         Ok(output) => output,
         Err(_) => {
-            return Ok(plain_response(
-                StatusCode::BAD_REQUEST,
-                "handshake rejected",
-            ));
+            return plain_response(StatusCode::BAD_REQUEST, "handshake rejected");
         }
     };
 
@@ -197,7 +191,7 @@ async fn handle_ts2021(
         }
     });
 
-    Ok(res)
+    res
 }
 
 /// Extract a query parameter from a URI query like `v=130`.
