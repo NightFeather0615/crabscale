@@ -35,6 +35,14 @@ pub struct PeerReport {
     pub assigned_ips: Vec<String>,
     /// Whether the map response contained a peer list.
     pub saw_peers: bool,
+    /// MagicDNS suffix advertised in the map, e.g. `tailnet.example.`.
+    pub magic_dns_suffix: String,
+    /// Whether the client's local MagicDNS proxy is enabled (`Proxied`).
+    pub dns_proxied: bool,
+    /// Split-DNS suffixes advertised in the map's `Routes`.
+    pub split_dns_suffixes: Vec<String>,
+    /// Search domains advertised in the map's `SearchDomains`.
+    pub search_domains: Vec<String>,
     /// Whether logout returned the node to needs-login.
     pub logged_out: bool,
     /// Human-readable notes.
@@ -128,6 +136,34 @@ pub async fn run_rust_peer(config: &HarnessConfig) -> Result<PeerReport, String>
         "received map with {} assigned IPs",
         report.assigned_ips.len()
     ));
+
+    // 6b. Record the DNS status the server advertised (MagicDNS, split DNS,
+    // and search domains) so the harness report shows client-received state.
+    if let Some(dns) = map_json.get("DNS") {
+        report.magic_dns_suffix = dns
+            .get("MagicDNSSuffix")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        report.dns_proxied = dns
+            .get("Proxied")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if let Some(domains) = dns.get("SearchDomains").and_then(|v| v.as_array()) {
+            for domain in domains {
+                if let Some(domain) = domain.as_str() {
+                    report.search_domains.push(domain.to_string());
+                }
+            }
+        }
+        if let Some(routes) = dns.get("Routes").and_then(|v| v.as_object()) {
+            report.split_dns_suffixes.extend(routes.keys().cloned());
+        }
+        report.notes.push(format!(
+            "received MagicDNS suffix {:?}",
+            report.magic_dns_suffix
+        ));
+    }
 
     // 7. Log out and verify the node returns to needs-login.
     let logout = LogoutRequest { node_key };
