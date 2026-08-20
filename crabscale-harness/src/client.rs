@@ -6,8 +6,6 @@
 //! non-streaming map request, and logout. It is used both as a standalone
 //! binary (`crabscale-peer`) and by the harness orchestrator.
 
-use std::net::TcpStream;
-
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
@@ -16,8 +14,7 @@ use crabscale_proto::{
     RegisterRequest, RegisterResponse, decode_map_response_frame,
 };
 use crabscale_transport::{
-    BlockingTcpStream, EARLY_PAYLOAD_MAGIC, NoiseInitiator, NoiseStream, RESPONSE_MESSAGE_LEN,
-    decode_early_payload,
+    EARLY_PAYLOAD_MAGIC, NoiseInitiator, NoiseStream, RESPONSE_MESSAGE_LEN, decode_early_payload,
 };
 use h2::client;
 use http::Request;
@@ -151,8 +148,9 @@ pub async fn run_rust_peer(config: &HarnessConfig) -> Result<PeerReport, String>
 
 /// Fetch the server machine key from `GET /key`.
 async fn fetch_server_key(addr: std::net::SocketAddr) -> Result<MachineKey, String> {
-    let tcp = TcpStream::connect(addr).map_err(|e| format!("connect failed: {e}"))?;
-    let mut stream = BlockingTcpStream::new(tcp);
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
     let request = format!(
         "GET /key?v={CAPABILITY_VERSION} HTTP/1.1\r\n\
          Host: {addr}\r\n\
@@ -188,9 +186,10 @@ async fn open_ts2021(
     addr: std::net::SocketAddr,
     client_static: &StaticSecret,
     server_public: MachineKey,
-) -> Result<NoiseStream<BlockingTcpStream>, String> {
-    let tcp = TcpStream::connect(addr).map_err(|e| format!("connect failed: {e}"))?;
-    let mut stream = BlockingTcpStream::new(tcp);
+) -> Result<NoiseStream<tokio::net::TcpStream>, String> {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
 
     let prologue = format!("Tailscale Control Protocol v{CAPABILITY_VERSION}");
     let (initiator, init_bytes) = NoiseInitiator::initialize(
@@ -321,17 +320,17 @@ where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut buf = Vec::new();
-    let mut chunk = [0u8; 1024];
+    let mut byte = [0u8; 1];
     loop {
         let n = stream
-            .read(&mut chunk)
+            .read(&mut byte)
             .await
             .map_err(|e| format!("read head failed: {e}"))?;
         if n == 0 {
             return Err("connection closed while reading head".to_string());
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
             return Ok(String::from_utf8_lossy(&buf).to_string());
         }
     }
