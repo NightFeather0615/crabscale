@@ -11,73 +11,43 @@
 
 use std::process::ExitCode;
 
+use clap::{Parser, Subcommand};
 use crabscale_control::{ControlConfig, ControlError, ControlPlane};
 
-/// A parsed `crabscale auth` subcommand.
-#[derive(Debug, PartialEq, Eq)]
-enum AuthCommand {
-    Approve { auth_id: String, user: String },
-    Reject { auth_id: String },
+/// Admin command-line client for crabscale.
+#[derive(Parser)]
+#[command(name = "crabscale", about = "crabscale admin CLI")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
-/// Parse the `crabscale auth ...` argument vector.
-fn parse_auth_command(args: &[String]) -> Result<AuthCommand, String> {
-    if args.is_empty() {
-        return Err("missing auth subcommand (expected `approve` or `reject`)".to_string());
-    }
-    match args[0].as_str() {
-        "approve" => {
-            let mut auth_id = None;
-            let mut user = None;
-            let mut i = 1;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--auth-id" => {
-                        i += 1;
-                        auth_id = Some(
-                            args.get(i)
-                                .ok_or_else(|| "--auth-id requires a value".to_string())?
-                                .clone(),
-                        );
-                    }
-                    "--user" => {
-                        i += 1;
-                        user = Some(
-                            args.get(i)
-                                .ok_or_else(|| "--user requires a value".to_string())?
-                                .clone(),
-                        );
-                    }
-                    other => return Err(format!("unknown approve argument: {other}")),
-                }
-                i += 1;
-            }
-            let auth_id = auth_id.ok_or_else(|| "approve requires --auth-id".to_string())?;
-            let user = user.ok_or_else(|| "approve requires --user".to_string())?;
-            Ok(AuthCommand::Approve { auth_id, user })
-        }
-        "reject" => {
-            let mut auth_id = None;
-            let mut i = 1;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--auth-id" => {
-                        i += 1;
-                        auth_id = Some(
-                            args.get(i)
-                                .ok_or_else(|| "--auth-id requires a value".to_string())?
-                                .clone(),
-                        );
-                    }
-                    other => return Err(format!("unknown reject argument: {other}")),
-                }
-                i += 1;
-            }
-            let auth_id = auth_id.ok_or_else(|| "reject requires --auth-id".to_string())?;
-            Ok(AuthCommand::Reject { auth_id })
-        }
-        other => Err(format!("unknown auth subcommand: {other}")),
-    }
+#[derive(Subcommand)]
+enum Command {
+    /// Approve or reject a pending interactive registration.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// Approve a pending interactive registration.
+    Approve {
+        /// The auth id from the registration AuthURL.
+        #[arg(long)]
+        auth_id: String,
+        /// The login name of the user that owns the node.
+        #[arg(long)]
+        user: String,
+    },
+    /// Reject a pending interactive registration.
+    Reject {
+        /// The auth id from the registration AuthURL.
+        #[arg(long)]
+        auth_id: String,
+    },
 }
 
 /// Run an auth command against the given control plane.
@@ -97,20 +67,8 @@ fn run_auth_command(plane: &ControlPlane, command: AuthCommand) -> Result<String
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) != Some("auth") {
-        eprintln!(
-            "usage: crabscale auth approve --auth-id <id> --user <name> | crabscale auth reject --auth-id <id>"
-        );
-        return ExitCode::FAILURE;
-    }
-    let command = match parse_auth_command(&args[1..]) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let cli = Cli::parse();
+    let Command::Auth { command } = cli.command;
     let plane = ControlPlane::new(ControlConfig::default());
     match run_auth_command(&plane, command) {
         Ok(message) => {
@@ -157,35 +115,34 @@ mod tests {
 
     #[test]
     fn parses_approve_command() {
-        let args = vec![
-            "approve".to_string(),
-            "--auth-id".to_string(),
-            "abc123".to_string(),
-            "--user".to_string(),
-            "alice".to_string(),
-        ];
-        assert_eq!(
-            parse_auth_command(&args).unwrap(),
+        let cli = Cli::try_parse_from([
+            "crabscale",
+            "auth",
+            "approve",
+            "--auth-id",
+            "abc123",
+            "--user",
+            "alice",
+        ])
+        .unwrap();
+        let Command::Auth { command } = cli.command;
+        assert!(matches!(
+            command,
             AuthCommand::Approve {
-                auth_id: "abc123".to_string(),
-                user: "alice".to_string(),
-            }
-        );
+                auth_id,
+                user
+            } if auth_id == "abc123" && user == "alice"
+        ));
     }
 
     #[test]
     fn parses_reject_command() {
-        let args = vec![
-            "reject".to_string(),
-            "--auth-id".to_string(),
-            "abc".to_string(),
-        ];
-        assert_eq!(
-            parse_auth_command(&args).unwrap(),
-            AuthCommand::Reject {
-                auth_id: "abc".to_string()
-            }
-        );
+        let cli = Cli::try_parse_from(["crabscale", "auth", "reject", "--auth-id", "abc"]).unwrap();
+        let Command::Auth { command } = cli.command;
+        assert!(matches!(
+            command,
+            AuthCommand::Reject { auth_id } if auth_id == "abc"
+        ));
     }
 
     #[test]
