@@ -119,9 +119,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let response = plane
-            .register(MachineKey::from_bytes([0x11; 32]), request)
-            .unwrap();
+        let response = plane.register(MachineKey::from_bytes([0x11; 32]), request);
         assert!(!response.machine_authorized);
         assert!(!response.auth_url.is_empty());
         crabscale_control::auth_id_from_followup(&response.auth_url).unwrap()
@@ -180,9 +178,7 @@ mod tests {
             followup: format!("https://tailnet.example/register/{auth_id}"),
             ..Default::default()
         };
-        let response = plane
-            .register(MachineKey::from_bytes([0x11; 32]), followup)
-            .unwrap();
+        let response = plane.register(MachineKey::from_bytes([0x11; 32]), followup);
         assert!(response.machine_authorized);
     }
 
@@ -204,9 +200,7 @@ mod tests {
             followup: format!("https://tailnet.example/register/{auth_id}"),
             ..Default::default()
         };
-        let response = plane
-            .register(MachineKey::from_bytes([0x11; 32]), followup)
-            .unwrap();
+        let response = plane.register(MachineKey::from_bytes([0x11; 32]), followup);
         assert!(!response.machine_authorized);
         assert!(!response.error.is_empty());
     }
@@ -254,9 +248,7 @@ mod tests {
             followup: format!("https://tailnet.example/register/{auth_id}"),
             ..Default::default()
         };
-        let response = server
-            .register(MachineKey::from_bytes([0x11; 32]), followup)
-            .unwrap();
+        let response = server.register(MachineKey::from_bytes([0x11; 32]), followup);
         assert!(response.machine_authorized);
 
         let _ = std::fs::remove_file(&db_path);

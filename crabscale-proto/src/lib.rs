@@ -11,6 +11,12 @@
 //! - [Spec-Registration](https://github.com/NightFeather0615/crabscale/wiki/Spec-Registration.md)
 //! - [Spec-Transport](https://github.com/NightFeather0615/crabscale/wiki/Spec-Transport.md)
 
+/// Minimum capability version accepted by the control plane.
+///
+/// This is the single source of truth shared by the control and transport
+/// crates so the supported client floor is defined in exactly one place.
+pub const MIN_SUPPORTED_CAPVER: u32 = 113;
+
 mod derp;
 mod early;
 mod frame;

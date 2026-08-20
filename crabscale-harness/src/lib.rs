@@ -11,6 +11,6 @@ pub mod report;
 pub mod server;
 
 pub use client::{PeerReport, run_rust_peer};
-pub use config::{DEFAULT_AUTH_KEY, DEFAULT_TAILNET, HarnessConfig};
+pub use config::{DEFAULT_TAILNET, HarnessConfig};
 pub use report::{HarnessReport, TailscaleReport, emit_report};
 pub use server::start_server;

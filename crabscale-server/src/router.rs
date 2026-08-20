@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use crabscale_control::{ControlConfig, ControlError, ControlPlane, MapOutcome};
-use crabscale_proto::{LogoutRequest, MachineKey, MapRequest, RegisterRequest};
+use crabscale_proto::{
+    LogoutRequest, MIN_SUPPORTED_CAPVER, MachineKey, MapRequest, RegisterRequest,
+};
 use crabscale_transport::{
     MAX_INNER_BODY_LEN, NoiseStream, TransportError, random_challenge, read_body_limited,
     serve_http2,
@@ -19,9 +21,6 @@ use h2::RecvStream;
 use h2::server::SendResponse;
 use http::{Request, Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite};
-
-/// The protocol version reported by `/machine/whoami`.
-pub const PROTOCOL_VERSION: u16 = 130;
 
 /// Default keepalive interval for streaming map sessions.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(50);
@@ -83,8 +82,8 @@ impl ControlRouter {
     /// capability version, or `400` with a plain-text body otherwise.
     pub fn handle_key(&self, capver: Option<&str>) -> Response<Bytes> {
         let supported = capver
-            .and_then(|v| v.parse::<u16>().ok())
-            .map(|v| v >= crabscale_transport::MIN_SUPPORTED_CAPVER)
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|v| v >= MIN_SUPPORTED_CAPVER)
             .unwrap_or(false);
         if !supported {
             return key_bad_request();
@@ -105,8 +104,14 @@ impl ControlRouter {
     /// Returns a minimal HTML page describing the pending registration, or a
     /// `404` when the auth id is unknown or has expired.
     pub fn handle_register_page(&self, auth_id: &str) -> Response<Bytes> {
-        let Some(pending) = self.control.pending_info(auth_id) else {
-            return plain_response(StatusCode::NOT_FOUND, "pending registration not found");
+        let pending = match self.control.pending_info(auth_id) {
+            Ok(Some(pending)) => pending,
+            Ok(None) => {
+                return plain_response(StatusCode::NOT_FOUND, "pending registration not found");
+            }
+            Err(_) => {
+                return plain_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+            }
         };
         let hostname = pending
             .hostinfo
@@ -165,7 +170,7 @@ impl ControlRouter {
             ("GET", "/machine/whoami") => {
                 let body = serde_json::json!({
                     "machineKey": machine_key.to_string(),
-                    "protocolVersion": PROTOCOL_VERSION,
+                    "protocolVersion": self.control.protocol_version(),
                 });
                 send_json(&mut respond, StatusCode::OK, body.to_string().into_bytes());
             }
@@ -217,19 +222,9 @@ impl ControlRouter {
                 return;
             }
         };
-        match self.control.register(machine_key, request) {
-            Ok(response) => {
-                let body = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
-                send_json(respond, StatusCode::OK, body);
-            }
-            Err(_) => {
-                send_plain(
-                    respond,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    b"internal error",
-                );
-            }
-        }
+        let response = self.control.register(machine_key, request);
+        let body = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
+        send_json(respond, StatusCode::OK, body);
     }
 
     async fn handle_logout(
@@ -302,6 +297,13 @@ impl ControlRouter {
                     b"unsupported capability version",
                 );
             }
+            Err(ControlError::InvalidEndpointTypes) => {
+                send_plain(
+                    respond,
+                    StatusCode::BAD_REQUEST,
+                    b"endpoint_types length does not match endpoints length",
+                );
+            }
             Err(_) => {
                 send_plain(
                     respond,
@@ -328,17 +330,17 @@ impl ControlRouter {
         let mut send = match respond.send_response(response, false) {
             Ok(s) => s,
             Err(_) => {
-                let _ = self.control.close_session(session_id);
+                self.control.close_session(session_id);
                 return;
             }
         };
         if send.send_data(Bytes::from(first_frame), false).is_err() {
-            let _ = self.control.close_session(session_id);
+            self.control.close_session(session_id);
             return;
         }
         if !keep_alive {
             let _ = send.send_data(Bytes::new(), true);
-            let _ = self.control.close_session(session_id);
+            self.control.close_session(session_id);
             return;
         }
         loop {
@@ -353,7 +355,7 @@ impl ControlRouter {
                 break;
             }
         }
-        let _ = self.control.close_session(session_id);
+        self.control.close_session(session_id);
     }
 }
 

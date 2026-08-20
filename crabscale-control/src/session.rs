@@ -102,18 +102,16 @@ impl SessionRegistry {
     ///
     /// Closing the last session schedules an offline transition after the
     /// reconnect grace period; no offline event is emitted yet.
-    pub fn close(&mut self, session_id: i64, now: i64) -> Vec<SessionEvent> {
+    pub fn close(&mut self, session_id: i64, now: i64) {
         let Some(node_id) = self.session_to_node.remove(&session_id) else {
-            return Vec::new();
+            return;
         };
-        let events = Vec::new();
         if let Some(entry) = self.nodes.get_mut(&node_id) {
             entry.live = entry.live.saturating_sub(1);
             if entry.live == 0 {
                 entry.offline_at = Some(now + self.grace_seconds);
             }
         }
-        events
     }
 
     /// Advance the registry to `now`, emitting offline transitions and
@@ -176,8 +174,7 @@ mod tests {
         assert!(registry.is_online(1));
         assert_eq!(registry.live_sessions(1), 2);
 
-        let events = registry.close(s1, 102);
-        assert!(events.is_empty());
+        registry.close(s1, 102);
         assert!(registry.is_online(1));
         assert_eq!(registry.live_sessions(1), 1);
 

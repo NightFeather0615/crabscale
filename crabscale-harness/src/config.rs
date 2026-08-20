@@ -2,9 +2,6 @@
 
 use std::net::SocketAddr;
 
-/// Default pre-auth key seeded by the in-memory control plane.
-pub const DEFAULT_AUTH_KEY: &str = "hskey-auth-test-secret";
-
 /// Default tailnet domain advertised by the control plane.
 pub const DEFAULT_TAILNET: &str = "tailnet.example";
 
@@ -30,7 +27,7 @@ impl HarnessConfig {
     pub fn ephemeral() -> Self {
         Self {
             control_url: "http://127.0.0.1:0".to_string(),
-            auth_key: DEFAULT_AUTH_KEY.to_string(),
+            auth_key: crabscale_control::ControlConfig::default().auth_key,
             tailnet: DEFAULT_TAILNET.to_string(),
             rust_peer_hostname: "rust-peer".to_string(),
             tailscale_binary: None,
