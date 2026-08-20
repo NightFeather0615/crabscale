@@ -41,14 +41,17 @@ pub const PING_BODY_LEN: usize = 8;
 /// Fixed length of a `Restarting` body: two big-endian u32 durations.
 pub const RESTARTING_BODY_LEN: usize = 8;
 
-/// Fixed length of the short `PeerPresent` body: peer key + flags byte.
-pub const PEER_PRESENT_SHORT_LEN: usize = KEY_LEN + 1;
+/// Length of the `PeerPresent` key prefix.
+pub const PEER_PRESENT_KEY_LEN: usize = KEY_LEN;
 
-/// Fixed length of the extended `PeerPresent` body:
+/// Length of the optional `PeerPresent` IP + BE port suffix.
+pub const PEER_PRESENT_IP_PORT_LEN: usize = 16 + 2;
+
+/// Length of the full `PeerPresent` body:
 /// peer key + 16-byte IP + 2-byte port + flags byte.
 pub const PEER_PRESENT_FULL_LEN: usize = KEY_LEN + 16 + 2 + 1;
 
-/// `PeerPresent` flag bits (Spec-DERP-STUN §3 steady state).
+/// `PeerPresent` flag bits (Spec-DERP-STUN §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PeerPresentFlags {
@@ -58,6 +61,8 @@ pub enum PeerPresentFlags {
     MeshPeer = 0x02,
     /// A connectivity prober.
     Prober = 0x04,
+    /// The node declared this relay is not its ideal node.
+    NotIdeal = 0x08,
 }
 
 /// `PeerGone` reason codes (Spec-DERP-STUN §4).
@@ -365,9 +370,11 @@ impl PeerGoneBody {
 
 /// Body of a `PeerPresent` frame.
 ///
-/// The short form carries the peer key and a flags byte; the extended form
-/// also carries the peer's IP address and port. The IP and port are advisory
-/// and only emitted by meshed relays, so the decoder accepts both forms.
+/// The body is a 32-byte peer key followed by an optional 16-byte IP and
+/// 2-byte big-endian port, then an optional trailing flags byte. The relay
+/// always emits the full 51-byte form (key + IP + port + flags); the decoder
+/// additionally accepts the 32-byte key-only and 50-byte key+IP+port forms
+/// used by other implementations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerPresentBody {
     /// The peer that became present.
@@ -381,7 +388,8 @@ pub struct PeerPresentBody {
 }
 
 impl PeerPresentBody {
-    /// Build a short-form body carrying only a peer key and flags.
+    /// Build a body with only a peer key and flags; IP and port are left unset
+    /// and encoded as zeros.
     pub fn new(key: NodeKey, flags: u8) -> Self {
         Self {
             key,
@@ -391,50 +399,73 @@ impl PeerPresentBody {
         }
     }
 
-    /// Encode the body, choosing the short or extended form automatically.
+    /// Encode the body in the full 51-byte form (key + IP + port + flags).
+    ///
+    /// The IP and port are advisory; unknown values are emitted as zeros so
+    /// the layout always matches the wire format.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(PEER_PRESENT_SHORT_LEN);
+        let mut out = Vec::with_capacity(PEER_PRESENT_FULL_LEN);
         out.extend_from_slice(&self.key.to_bytes());
-        if let (Some(ip), Some(port)) = (self.ip, self.port) {
-            out.extend_from_slice(&ip);
-            out.extend_from_slice(&port.to_be_bytes());
-        }
+        out.extend_from_slice(&self.ip.unwrap_or([0; 16]));
+        out.extend_from_slice(&self.port.unwrap_or(0).to_be_bytes());
         out.push(self.flags);
         out
     }
 
-    /// Decode the body, accepting both the short and extended forms.
+    /// Decode a `PeerPresent` body.
+    ///
+    /// Accepts the 32-byte key-only, 50-byte key+IP+port and full 51-byte
+    /// forms; anything longer is tolerated by reading the first 51 bytes.
     pub fn decode(body: &[u8]) -> Result<Self, FrameError> {
-        match body.len() {
-            PEER_PRESENT_SHORT_LEN => {
-                let mut key = [0u8; KEY_LEN];
-                key.copy_from_slice(&body[..KEY_LEN]);
-                Ok(Self {
-                    key: NodeKey::from_bytes(key),
-                    ip: None,
-                    port: None,
-                    flags: body[KEY_LEN],
-                })
+        let read_full = |body: &[u8]| {
+            let mut key = [0u8; KEY_LEN];
+            key.copy_from_slice(&body[..KEY_LEN]);
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&body[KEY_LEN..KEY_LEN + 16]);
+            let mut addr = [0u8; 2];
+            addr.copy_from_slice(&body[KEY_LEN + 16..KEY_LEN + 16 + 2]);
+            Self {
+                key: NodeKey::from_bytes(key),
+                ip: Some(ip),
+                port: Some(u16::from_be_bytes(addr)),
+                flags: body[KEY_LEN + 16 + 2],
             }
-            PEER_PRESENT_FULL_LEN => {
-                let mut key = [0u8; KEY_LEN];
-                key.copy_from_slice(&body[..KEY_LEN]);
-                let mut ip = [0u8; 16];
-                ip.copy_from_slice(&body[KEY_LEN..KEY_LEN + 16]);
-                let mut addr = [0u8; 2];
-                addr.copy_from_slice(&body[KEY_LEN + 16..KEY_LEN + 16 + 2]);
-                Ok(Self {
-                    key: NodeKey::from_bytes(key),
-                    ip: Some(ip),
-                    port: Some(u16::from_be_bytes(addr)),
-                    flags: body[KEY_LEN + 16 + 2],
-                })
-            }
-            other => Err(FrameError::InvalidBodyLength {
-                expected: PEER_PRESENT_SHORT_LEN,
-                actual: other,
-            }),
+        };
+        let len = body.len();
+        if len < PEER_PRESENT_KEY_LEN {
+            return Err(FrameError::Truncated);
         }
+        if len == PEER_PRESENT_KEY_LEN {
+            let mut key = [0u8; KEY_LEN];
+            key.copy_from_slice(&body[..KEY_LEN]);
+            return Ok(Self {
+                key: NodeKey::from_bytes(key),
+                ip: None,
+                port: None,
+                flags: 0,
+            });
+        }
+        if len == PEER_PRESENT_KEY_LEN + PEER_PRESENT_IP_PORT_LEN {
+            let mut key = [0u8; KEY_LEN];
+            key.copy_from_slice(&body[..KEY_LEN]);
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&body[KEY_LEN..KEY_LEN + 16]);
+            let mut addr = [0u8; 2];
+            addr.copy_from_slice(&body[KEY_LEN + 16..KEY_LEN + 16 + 2]);
+            return Ok(Self {
+                key: NodeKey::from_bytes(key),
+                ip: Some(ip),
+                port: Some(u16::from_be_bytes(addr)),
+                flags: 0,
+            });
+        }
+        if len >= PEER_PRESENT_FULL_LEN {
+            return Ok(read_full(body));
+        }
+        Err(FrameError::InvalidBodyLength {
+            expected: PEER_PRESENT_FULL_LEN,
+            actual: len,
+        })
     }
 }
 
@@ -512,10 +543,7 @@ impl HealthBody {
     pub fn decode(body: &[u8]) -> Result<Self, FrameError> {
         String::from_utf8(body.to_vec())
             .map(Self)
-            .map_err(|_| FrameError::InvalidBodyLength {
-                expected: 0,
-                actual: body.len(),
-            })
+            .map_err(|_| FrameError::InvalidUtf8)
     }
 }
 
@@ -645,22 +673,42 @@ mod tests {
     }
 
     #[test]
-    fn peer_present_encodes_short_and_full_forms() {
+    fn peer_present_uses_full_wire_form() {
         let key = NodeKey::from_bytes([8; KEY_LEN]);
-        let short = PeerPresentBody::new(key, PeerPresentFlags::Regular as u8);
-        let short_bytes = short.encode();
-        assert_eq!(short_bytes.len(), PEER_PRESENT_SHORT_LEN);
-        assert_eq!(PeerPresentBody::decode(&short_bytes).unwrap(), short);
 
+        // Encoding always emits the full 51-byte form (key + IP + port + flags).
+        let body = PeerPresentBody::new(key, PeerPresentFlags::Regular as u8);
+        let encoded = body.encode();
+        assert_eq!(encoded.len(), PEER_PRESENT_FULL_LEN);
+        let decoded = PeerPresentBody::decode(&encoded).unwrap();
+        assert_eq!(decoded.key, key);
+        assert_eq!(decoded.ip, Some([0; 16]));
+        assert_eq!(decoded.port, Some(0));
+        assert_eq!(decoded.flags, PeerPresentFlags::Regular as u8);
+
+        // The key-only 32-byte form decodes without IP/port.
+        let key_only = PeerPresentBody::decode(&encoded[..PEER_PRESENT_KEY_LEN]).unwrap();
+        assert_eq!(key_only.key, key);
+        assert_eq!(key_only.ip, None);
+        assert_eq!(key_only.port, None);
+
+        // Explicit IP/port round-trips through the full form.
         let full = PeerPresentBody {
             key,
-            ip: Some([0; 16]),
+            ip: Some([1; 16]),
             port: Some(443),
             flags: PeerPresentFlags::MeshPeer as u8,
         };
         let full_bytes = full.encode();
         assert_eq!(full_bytes.len(), PEER_PRESENT_FULL_LEN);
         assert_eq!(PeerPresentBody::decode(&full_bytes).unwrap(), full);
+
+        // Longer bodies are tolerated for forward compatibility.
+        let mut longer = full_bytes.clone();
+        longer.push(0xEE);
+        let decoded = PeerPresentBody::decode(&longer).unwrap();
+        assert_eq!(decoded.key, key);
+        assert_eq!(decoded.port, Some(443));
     }
 
     #[test]

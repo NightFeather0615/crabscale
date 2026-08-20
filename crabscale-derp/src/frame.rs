@@ -53,6 +53,10 @@ pub enum FrameError {
     InvalidMagic,
     /// A `PeerGone` body carries an unknown reason code.
     InvalidPeerGoneReason(u8),
+    /// A NaCl `crypto_box` seal or open operation failed.
+    CryptoFailed,
+    /// A known UTF-8 body contained invalid UTF-8.
+    InvalidUtf8,
 }
 
 impl fmt::Display for FrameError {
@@ -70,6 +74,8 @@ impl fmt::Display for FrameError {
             Self::InvalidPeerGoneReason(r) => {
                 write!(f, "unknown DERP PeerGone reason code {r}")
             }
+            Self::CryptoFailed => write!(f, "DERP crypto_box operation failed"),
+            Self::InvalidUtf8 => write!(f, "DERP frame body is not valid UTF-8"),
         }
     }
 }

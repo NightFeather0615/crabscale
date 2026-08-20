@@ -76,6 +76,8 @@ enum WsErrorKind {
     ControlFrameTooLong,
     /// The declared length or accumulated message exceeds the limit.
     Oversized,
+    /// The RSV bits were set without a negotiated extension.
+    RsvNotZero,
 }
 
 impl std::fmt::Display for WsError {
@@ -92,6 +94,9 @@ impl std::fmt::Display for WsError {
                 write!(f, "WebSocket control frame exceeds 125 bytes")
             }
             WsErrorKind::Oversized => write!(f, "WebSocket message exceeds the size limit"),
+            WsErrorKind::RsvNotZero => {
+                write!(f, "WebSocket RSV bits set without a negotiated extension")
+            }
         }
     }
 }
@@ -163,6 +168,11 @@ impl Decoder for WebSocketCodec {
         let masked = second & 0x80 != 0;
         let payload_len = (second & 0x7F) as usize;
 
+        // RSV bits must be clear unless a per-message extension is negotiated.
+        if first & 0x70 != 0 {
+            return Err(ws_err(WsErrorKind::RsvNotZero));
+        }
+
         // Enforce the RFC 6455 masking direction for this endpoint's role.
         match (self.role, masked) {
             (WebSocketRole::Server, false) => {
@@ -178,26 +188,34 @@ impl Decoder for WebSocketCodec {
             _ => {}
         }
 
-        // Parse the extended length field.
+        // Parse the extended length field. The length is bounded against the
+        // message ceiling before any arithmetic or buffering, so a crafted
+        // 64-bit length cannot overflow or drive a huge allocation.
         let (length, header_len) = match payload_len {
-            0..=125 => (payload_len, 2),
+            0..=125 => (payload_len as u64, 2),
             126 => {
                 if src.len() < 4 {
                     return Ok(None);
                 }
-                (u16::from_be_bytes([src[2], src[3]]) as usize, 4)
+                (u16::from_be_bytes([src[2], src[3]]) as u64, 4)
             }
             127 => {
                 if src.len() < 10 {
                     return Ok(None);
                 }
-                let len = u64::from_be_bytes([
-                    src[2], src[3], src[4], src[5], src[6], src[7], src[8], src[9],
-                ]);
-                (usize::try_from(len).unwrap_or(usize::MAX), 10)
+                (
+                    u64::from_be_bytes([
+                        src[2], src[3], src[4], src[5], src[6], src[7], src[8], src[9],
+                    ]),
+                    10,
+                )
             }
             _ => unreachable!(),
         };
+        if length > MAX_WEBSOCKET_MESSAGE_LEN as u64 {
+            return Err(ws_err(WsErrorKind::Oversized));
+        }
+        let length = length as usize;
         let mask_offset = header_len;
         let total = header_len + if masked { 4 } else { 0 } + length;
         if src.len() < total {
@@ -485,6 +503,25 @@ mod tests {
         chunk.extend_from_slice(&[0x80, 0x82, 0, 0, 0, 0, b'!', b'?']);
         let frame = codec.decode(&mut chunk).unwrap().expect("complete message");
         assert_eq!(frame, WsFrame::Binary(Bytes::from_static(b"hi!?")));
+    }
+
+    #[test]
+    fn rejects_rsv_bits() {
+        let mut codec = WebSocketCodec::server();
+        // FIN | RSV1 | binary, masked, length 0.
+        let mut raw = BytesMut::from(&[0xC2u8, 0x80, 0, 0, 0, 0][..]);
+        let err = codec.decode(&mut raw).unwrap_err();
+        assert!(err.kind() == io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_oversized_127_length() {
+        let mut codec = WebSocketCodec::server();
+        let mut raw = vec![0x82u8, 0xFF]; // FIN | binary, masked, extended 64-bit length
+        raw.extend_from_slice(&((MAX_WEBSOCKET_MESSAGE_LEN as u64) + 1).to_be_bytes());
+        raw.extend_from_slice(&[0, 0, 0, 0]); // mask key
+        let err = codec.decode(&mut BytesMut::from(&raw[..])).unwrap_err();
+        assert!(err.kind() == io::ErrorKind::InvalidData);
     }
 
     #[test]

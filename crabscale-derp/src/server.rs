@@ -223,8 +223,10 @@ impl Relay {
             FrameType::ForwardPacket
             | FrameType::WatchConns
             | FrameType::PeerPresent
-            | FrameType::PeerGone
-            | FrameType::Ping => true,
+            | FrameType::PeerGone => true,
+            // `Ping` is server -> client only; a client sending one is a
+            // protocol violation and tears the connection down.
+            FrameType::Ping => false,
             // Anything else from a client is a protocol violation.
             _ => false,
         }
@@ -233,13 +235,8 @@ impl Relay {
     async fn accept_client_info(self: &Arc<Self>, body: &[u8]) -> Option<NodeKey> {
         let prefix = ClientInfoBody::decode_prefix(body).ok()?;
         let encrypted = &body[ClientInfoBody::PREFIX_LEN..];
-        let payload =
+        let _payload =
             open_client_info(&prefix.key, &self.server_secret, &prefix.nonce, encrypted).ok()?;
-        // Reject clients that do not speak the current protocol version.
-        if payload.version < PROTOCOL_VERSION {
-            return None;
-        }
-        let _ = payload;
         Some(prefix.key)
     }
 
@@ -283,32 +280,43 @@ impl Relay {
     }
 
     /// Remove a client and announce its departure to the remaining peers.
+    ///
+    /// Because duplicate connections are allowed, `PeerGone(Disconnected)` is
+    /// only broadcast when this was the node's last live connection; other
+    /// connections for the same node key keep the path alive.
     async fn deregister(&self, id: ClientId) {
         let mut reg = self.registry.lock().await;
         let Some(entry) = reg.conns.remove(&id) else {
             return;
         };
         let node = entry.node;
-        if let Some(set) = reg.by_key.get_mut(&node) {
+        let was_last = if let Some(set) = reg.by_key.get_mut(&node) {
             set.remove(&id);
             if set.is_empty() {
                 reg.by_key.remove(&node);
+                true
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
 
-        let gone = Frame::new(
-            FrameType::PeerGone,
-            Bytes::from(
-                PeerGoneBody {
-                    key: node,
-                    reason: PeerGoneReason::Disconnected,
-                }
-                .encode()
-                .to_vec(),
-            ),
-        );
-        for peer in reg.conns.values() {
-            let _ = peer.out.try_send(gone.clone());
+        if was_last {
+            let gone = Frame::new(
+                FrameType::PeerGone,
+                Bytes::from(
+                    PeerGoneBody {
+                        key: node,
+                        reason: PeerGoneReason::Disconnected,
+                    }
+                    .encode()
+                    .to_vec(),
+                ),
+            );
+            for peer in reg.conns.values() {
+                let _ = peer.out.try_send(gone.clone());
+            }
         }
     }
 
@@ -467,6 +475,34 @@ mod tests {
         let _a = connect_client(&relay, SecretKey::random()).await;
         let _b = connect_client(&relay, SecretKey::random()).await;
         assert_eq!(relay.registered_nodes().await, 2);
+    }
+
+    #[tokio::test]
+    async fn peer_gone_only_broadcast_after_last_connection() {
+        let relay = Arc::new(Relay::random());
+        let mut a = connect_client(&relay, SecretKey::random()).await;
+        let secret_b = SecretKey::random();
+        let key_b = secret_b.public();
+
+        let b1 = connect_client(&relay, secret_b.clone()).await;
+        let b2 = connect_client(&relay, secret_b.clone()).await;
+        assert_eq!(b1.node_key(), key_b);
+        assert_eq!(b2.node_key(), key_b);
+
+        // Dropping one duplicate must not announce PeerGone while another of
+        // the same node key remains connected.
+        drop(b1);
+        let early = tokio::time::timeout(Duration::from_millis(250), a.recv_peer_gone()).await;
+        assert!(
+            early.is_err(),
+            "PeerGone must not fire while a duplicate connection remains"
+        );
+
+        // Dropping the last duplicate announces the departure.
+        drop(b2);
+        let (key, reason) = a.recv_peer_gone().await.unwrap();
+        assert_eq!(key, key_b);
+        assert_eq!(reason, PeerGoneReason::Disconnected);
     }
 
     #[tokio::test]

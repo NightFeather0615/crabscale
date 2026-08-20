@@ -45,20 +45,25 @@ impl std::fmt::Display for HandshakeError {
 impl std::error::Error for HandshakeError {}
 
 /// The JSON payload a client seals inside `ClientInfo`.
+///
+/// The wire field names follow the reference client: `CanAckPings`,
+/// `IsProber` (Go fields without tags) and `meshKey` (tagged). Renames make
+/// serialization match the wire; aliases keep decoding tolerant of both the
+/// PascalCase and camelCase forms seen in the wild.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientInfoPayload {
     /// Whether the client answers DERP pings with pongs.
-    #[serde(default)]
+    #[serde(rename = "CanAckPings", alias = "canAckPings", default)]
     pub can_ack_pings: bool,
     /// Whether the connection belongs to a connectivity prober.
-    #[serde(default)]
+    #[serde(rename = "IsProber", alias = "isProber", default)]
     pub is_prober: bool,
     /// Optional mesh key; empty for regular clients. Stub-only in this
     /// milestone (multi-node mesh is out of scope).
-    #[serde(default)]
+    #[serde(rename = "meshKey", alias = "mesh_key", default)]
     pub mesh_key: String,
     /// The DERP protocol version the client was built with.
-    #[serde(default)]
+    #[serde(rename = "version", alias = "Version", default)]
     pub version: u32,
 }
 
@@ -78,9 +83,10 @@ impl Default for ClientInfoPayload {
 pub struct ServerInfoPayload {
     /// The wire protocol version; always [`PROTOCOL_VERSION`] on output.
     ///
-    /// The wiki declares the field as `"Version"` (PascalCase); the alias
-    /// accepts the lowercase `"version"` emitted by some clients too.
-    #[serde(rename = "Version", alias = "version")]
+    /// The wire field is lowercase `"version"` (JSON tag
+    /// `json:"version,omitempty"`); decoding also accepts the PascalCase
+    /// `"Version"` variant.
+    #[serde(rename = "version", alias = "Version")]
     pub version: u32,
     /// Sustained token-bucket refill rate in bytes per second, when limited.
     #[serde(
@@ -124,7 +130,7 @@ pub fn seal_to(
         &sender_secret.to_crypto_secret(),
     );
     boxx.encrypt(&Nonce::from(*nonce), plaintext)
-        .map_err(|_| FrameError::InvalidMagic)
+        .map_err(|_| FrameError::CryptoFailed)
 }
 
 /// Open a payload sealed by `sender_public` for `recipient_secret`.
@@ -139,7 +145,7 @@ pub fn open_from(
         &recipient_secret.to_crypto_secret(),
     );
     boxx.decrypt(&Nonce::from(*nonce), ciphertext)
-        .map_err(|_| FrameError::InvalidMagic)
+        .map_err(|_| FrameError::CryptoFailed)
 }
 
 /// Encode and seal a [`ClientInfoPayload`] with a freshly generated nonce.
@@ -267,14 +273,14 @@ mod tests {
     }
 
     #[test]
-    fn server_info_serializes_wiki_field_names() {
+    fn server_info_serializes_wire_field_names() {
         let payload = ServerInfoPayload {
             version: PROTOCOL_VERSION,
             token_bucket_bytes_per_second: Some(1_000_000),
             token_bucket_bytes_burst: Some(250_000),
         };
         let json = serde_json::to_string(&payload).unwrap();
-        assert!(json.contains("\"Version\":2"), "got {json}");
+        assert!(json.contains("\"version\":2"), "got {json}");
         assert!(
             json.contains("\"TokenBucketBytesPerSecond\":1000000"),
             "got {json}"
@@ -283,5 +289,27 @@ mod tests {
             json.contains("\"TokenBucketBytesBurst\":250000"),
             "got {json}"
         );
+
+        // Decoding accepts the PascalCase form too.
+        let parsed: ServerInfoPayload =
+            serde_json::from_str(r#"{"Version":2,"TokenBucketBytesPerSecond":1000000}"#).unwrap();
+        assert_eq!(parsed.version, PROTOCOL_VERSION);
+        assert_eq!(parsed.token_bucket_bytes_per_second, Some(1_000_000));
+    }
+
+    #[test]
+    fn client_info_accepts_reference_field_names() {
+        // The reference client sends CanAckPings/meshKey (no snake_case).
+        let parsed: ClientInfoPayload = serde_json::from_str(
+            r#"{"CanAckPings":true,"IsProber":false,"meshKey":"","version":2}"#,
+        )
+        .unwrap();
+        assert!(parsed.can_ack_pings);
+        assert!(!parsed.is_prober);
+        assert_eq!(parsed.mesh_key, "");
+
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(json.contains("\"CanAckPings\":true"), "got {json}");
+        assert!(json.contains("\"meshKey\":\"\""), "got {json}");
     }
 }

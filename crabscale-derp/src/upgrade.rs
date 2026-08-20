@@ -49,12 +49,14 @@ pub struct UpgradedRequest {
 }
 
 /// Errors returned while negotiating a `/derp` upgrade.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpgradeError {
     /// The request did not carry a DERP `Upgrade` header.
     MissingUpgrade,
     /// A WebSocket upgrade is missing the `Sec-WebSocket-Key` header.
     MissingWebSocketKey,
+    /// The WebSocket protocol version is not supported (only RFC 6455, "13").
+    UnsupportedWebSocketVersion(String),
     /// The request method is not allowed for a DERP upgrade.
     InvalidMethod,
 }
@@ -65,6 +67,9 @@ impl fmt::Display for UpgradeError {
             Self::MissingUpgrade => write!(f, "missing DERP Upgrade header"),
             Self::MissingWebSocketKey => {
                 write!(f, "WebSocket upgrade is missing Sec-WebSocket-Key")
+            }
+            Self::UnsupportedWebSocketVersion(v) => {
+                write!(f, "unsupported WebSocket version (expected 13, got {v})")
             }
             Self::InvalidMethod => write!(f, "DERP upgrade requires an HTTP GET request"),
         }
@@ -104,6 +109,10 @@ pub fn negotiate(req: &Request<()>) -> Result<DerpRequest, UpgradeError> {
         Some("websocket") => {
             if !headers.contains_key("sec-websocket-key") {
                 return Err(UpgradeError::MissingWebSocketKey);
+            }
+            let version = header_lower(headers, "sec-websocket-version").unwrap_or_default();
+            if !version.split(',').any(|v| v.trim() == "13") {
+                return Err(UpgradeError::UnsupportedWebSocketVersion(version));
             }
             Ok(DerpRequest {
                 kind: TransportKind::WebSocket,
@@ -233,6 +242,8 @@ mod tests {
             "Sec-WebSocket-Key",
             HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
         );
+        req.headers_mut()
+            .insert("Sec-WebSocket-Version", HeaderValue::from_static("13"));
         let req = negotiate(&req).unwrap();
         assert_eq!(req.kind, TransportKind::WebSocket);
     }
@@ -242,7 +253,26 @@ mod tests {
         let mut req = request();
         req.headers_mut()
             .insert("Upgrade", HeaderValue::from_static("websocket"));
+        req.headers_mut()
+            .insert("Sec-WebSocket-Version", HeaderValue::from_static("13"));
         assert_eq!(negotiate(&req), Err(UpgradeError::MissingWebSocketKey));
+    }
+
+    #[test]
+    fn websocket_rejects_non_13_version() {
+        let mut req = request();
+        req.headers_mut()
+            .insert("Upgrade", HeaderValue::from_static("websocket"));
+        req.headers_mut().insert(
+            "Sec-WebSocket-Key",
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        req.headers_mut()
+            .insert("Sec-WebSocket-Version", HeaderValue::from_static("8"));
+        assert!(matches!(
+            negotiate(&req),
+            Err(UpgradeError::UnsupportedWebSocketVersion(_))
+        ));
     }
 
     #[test]
@@ -288,6 +318,8 @@ mod tests {
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         req.headers_mut()
             .insert("Sec-WebSocket-Key", HeaderValue::from_str(key).unwrap());
+        req.headers_mut()
+            .insert("Sec-WebSocket-Version", HeaderValue::from_static("13"));
         let upgraded = build_derp_response(&req, Some(key)).unwrap();
         let response = upgraded.response.unwrap();
         assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
