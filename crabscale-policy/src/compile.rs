@@ -266,12 +266,13 @@ fn node_attr_target_matches(
         }
         return node.tags.iter().any(|t| t == target);
     }
-    if let Some(group) = target.strip_prefix("group:") {
-        return policy.groups.get(group).is_some_and(|members| {
-            members
-                .iter()
-                .any(|m| m == node.user_login.as_deref().unwrap_or(""))
-        });
+    if target.starts_with("group:") {
+        // Groups are resolved transitively (group members may themselves be
+        // users or nested groups), matching `tags::principal_matches_user`.
+        return node
+            .user_login
+            .as_deref()
+            .is_some_and(|login| crate::tags::principal_matches_user(policy, target, login));
     }
     if let Some(login) = &node.user_login {
         if login == target {
@@ -1125,6 +1126,46 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>(),
             vec!["disable-captive-portal-detection".to_string()]
+        );
+    }
+
+    #[test]
+    fn node_attrs_group_target_resolves_transitively() {
+        let policy: Policy = crate::parse_policy(
+            r#"{
+                "groups": {
+                    "all": ["group:eng", "bob@example.com"],
+                    "eng": ["alice@example.com"]
+                },
+                "nodeAttrs": [
+                    { "target": ["group:all"], "attr": ["drive:share"] }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let nodes = vec![
+            node(1, Some("alice@example.com"), &["100.64.0.1/32"]),
+            node(2, Some("bob@example.com"), &["100.64.0.2/32"]),
+            node(3, Some("carol@example.com"), &["100.64.0.3/32"]),
+        ];
+        // alice is a member of group:all via nested group:eng; bob directly.
+        assert_eq!(
+            node_attributes(&policy, &nodes[0], &nodes)
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["drive:share".to_string()]
+        );
+        assert_eq!(
+            node_attributes(&policy, &nodes[1], &nodes)
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["drive:share".to_string()]
+        );
+        assert!(
+            node_attributes(&policy, &nodes[2], &nodes).is_empty(),
+            "carol is not a member of group:all"
         );
     }
 }

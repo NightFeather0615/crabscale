@@ -42,7 +42,7 @@ pub fn is_valid_tag(tag: &str) -> bool {
 ///   therefore `false`.
 ///
 /// Group references are resolved transitively.
-fn principal_matches_user(policy: &Policy, principal: &str, user_login: &str) -> bool {
+pub(crate) fn principal_matches_user(policy: &Policy, principal: &str, user_login: &str) -> bool {
     if principal == user_login {
         return true;
     }

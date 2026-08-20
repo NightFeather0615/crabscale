@@ -889,13 +889,17 @@ impl ControlPlane {
     /// Apply a `RequestTags` transition to a node.
     ///
     /// `requested` is the client's `Hostinfo.RequestTags`; an empty slice
-    /// means "no tags" and returns a tagged node to user ownership. Tags are
-    /// authorized against `auth_user_login`, the identity presenting the
-    /// credential (the node's owner, or the approving user during
-    /// registration).
+    /// means "no tags". For a node that keeps its existing owner (a
+    /// user-owned node untagging to stay user-owned) this is a no-op; for a
+    /// tag-owned node it returns the node to the user that `auth_user_login`
+    /// identifies. If a tag-owned node presents no authorizing user (as in a
+    /// map update, where `node_owner_login` is `None`), untagging is rejected
+    /// rather than leaving the node ownerless.
     ///
-    /// Every requested tag must be listed in the policy's `tagOwners` for
-    /// that user, otherwise the transition is rejected with
+    /// Tags are authorized against `auth_user_login`, the identity presenting
+    /// the credential (the node's owner, or the approving user during
+    /// registration). Every requested tag must be listed in the policy's
+    /// `tagOwners` for that user; an unauthorized transition is rejected with
     /// [`ControlError::UnauthorizedTags`] and the node is left unchanged
     /// (Spec-Policy §4). Returns `true` when the node changed.
     fn apply_request_tags(

@@ -955,8 +955,13 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         // Tagged nodes are owned by their tags, not by a user, so `user_id`
         // must be nullable (Spec-Policy §4). SQLite cannot drop a NOT NULL
         // constraint in place, so recreate the nodes table.
+        //
+        // `PRAGMA defer_foreign_keys = ON` delays FK enforcement to the
+        // transaction commit instead of turning it off: it is transaction
+        // scoped and resets automatically, so the connection keeps the
+        // `foreign_keys = ON` setting established by from_connection.
         conn.execute_batch(
-            "PRAGMA foreign_keys = OFF;
+            "PRAGMA defer_foreign_keys = ON;
             BEGIN;
             CREATE TABLE nodes_v5 (
                 id INTEGER PRIMARY KEY,
@@ -1166,6 +1171,40 @@ mod tests {
         );
         store.delete_session(session.id).unwrap();
         assert_eq!(store.get_session(session.id).unwrap(), None);
+    }
+
+    #[test]
+    fn deleting_node_with_live_session_is_blocked_by_foreign_keys() {
+        // Regression test for the v5 migration: recreating the `nodes` table
+        // must not leave foreign-key enforcement disabled for the connection's
+        // lifetime. A node referenced by a live session must not be deletable.
+        let store = test_store();
+        let user = store.create_user(&test_user()).unwrap();
+        let node = store.upsert_node(&test_node(user.id)).unwrap();
+        store
+            .create_session(&Session {
+                id: 0,
+                node_id: node.id,
+                machine_key: node.machine_key,
+                created_at: "2026-08-20T00:00:00Z".to_string(),
+                last_seen: "2026-08-20T00:00:00Z".to_string(),
+                closed_at: None,
+            })
+            .unwrap();
+
+        let err = store.delete_node(&node.node_key).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("FOREIGN KEY constraint failed"),
+            "expected a foreign key error when deleting a node with a live session, got: {message}"
+        );
+        // The node survives the failed delete.
+        assert!(
+            store
+                .get_node_by_node_key(&node.node_key)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
