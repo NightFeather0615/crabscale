@@ -26,6 +26,9 @@ pub const PROTOCOL_VERSION: u16 = 130;
 /// Default keepalive interval for streaming map sessions.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(50);
 
+/// How often the background session reaper advances lifecycle timers.
+const REAP_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Router for the control API.
 #[derive(Clone)]
 pub struct ControlRouter {
@@ -51,6 +54,27 @@ impl ControlRouter {
     /// The machine key this router advertises and attaches to inner requests.
     pub fn machine_key(&self) -> MachineKey {
         self.machine_key
+    }
+
+    /// Spawn the single background session reaper for this control plane.
+    ///
+    /// The reaper periodically advances session lifecycle timers, emitting
+    /// offline transitions and deleting expired ephemeral nodes. It is safe to
+    /// call from every connection: only the first caller actually spawns the
+    /// task, the rest are no-ops.
+    pub fn spawn_reaper(&self) {
+        if !self.control.claim_reaper() {
+            return;
+        }
+        let control = self.control.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(REAP_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                control.reap_sessions();
+            }
+        });
     }
 
     /// Handle an outer `GET /key` request.
@@ -306,6 +330,7 @@ pub async fn serve_control<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    router.spawn_reaper();
     let machine_key = router.machine_key();
     let challenge = random_challenge();
     serve_http2(

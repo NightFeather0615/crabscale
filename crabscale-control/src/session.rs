@@ -70,6 +70,9 @@ impl SessionRegistry {
             offline_at: None,
             ephemeral,
         });
+        // `ephemeral` is refreshed on every open; today it always matches the
+        // stored node's flag, but keeping it in sync here means a node whose
+        // ephemeral status changes is handled correctly on the next session.
         entry.ephemeral = ephemeral;
 
         if entry.live == 0 {

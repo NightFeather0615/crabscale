@@ -18,6 +18,7 @@ mod time;
 use std::collections::{BTreeMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crabscale_proto::{
@@ -192,6 +193,7 @@ pub struct ControlPlane {
     store: Arc<dyn Store>,
     pending: Mutex<pending::PendingCache>,
     sessions: Mutex<SessionRegistry>,
+    reaper_started: AtomicBool,
 }
 
 impl Clone for ControlPlane {
@@ -233,6 +235,7 @@ impl ControlPlane {
             store,
             pending,
             sessions,
+            reaper_started: AtomicBool::new(false),
         }
     }
 
@@ -255,10 +258,23 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Atomically claim the single background reaper slot.
+    ///
+    /// Returns `true` for exactly one caller; the caller should then spawn the
+    /// periodic task that calls [`Self::reap_sessions`]. Subsequent callers
+    /// receive `false` and must not spawn a second reaper.
+    pub fn claim_reaper(&self) -> bool {
+        !self.reaper_started.swap(true, Ordering::SeqCst)
+    }
+
     /// Advance session lifecycle timers, emitting offline transitions and
     /// deleting ephemeral nodes whose grace period has elapsed.
     pub fn reap_sessions(&self) -> Vec<SessionEvent> {
-        let now = time::now_unix();
+        self.reap_sessions_at(time::now_unix())
+    }
+
+    /// Like [`Self::reap_sessions`] but with an explicit clock, for tests.
+    fn reap_sessions_at(&self, now: i64) -> Vec<SessionEvent> {
         let events = self.sessions.lock().unwrap().tick(now);
         for event in &events {
             if let SessionEvent::EphemeralExpired(node_id) = event {
@@ -1677,6 +1693,51 @@ mod tests {
         let response = plane.logout(&node).unwrap();
         assert!(!response.machine_authorized);
         assert!(plane.store.get_node_by_node_key(&node).unwrap().is_none());
+    }
+
+    #[test]
+    fn reap_sessions_deletes_expired_ephemeral_node() {
+        let plane = test_plane();
+        let key = plane
+            .create_pre_auth_key("ephgc", true, true, None, None)
+            .unwrap();
+        let node_key = NodeKey::from_bytes([0x46; 32]);
+        let response = plane
+            .register(test_machine_key(), request_with(node_key, &key))
+            .unwrap();
+        assert!(response.machine_authorized);
+
+        let node = plane
+            .store
+            .get_node_by_node_key(&node_key)
+            .unwrap()
+            .unwrap();
+        let session_id = plane.open_session(node.id, true).unwrap();
+        assert!(plane.is_node_online(node.id));
+
+        // A live session cancels ephemeral GC even far in the future.
+        let now = time::now_unix();
+        assert!(plane.reap_sessions_at(now + 1000).is_empty());
+        assert!(
+            plane
+                .store
+                .get_node_by_node_key(&node_key)
+                .unwrap()
+                .is_some()
+        );
+
+        // After the last session closes and the grace elapses, the ephemeral
+        // node is deleted from the store.
+        plane.close_session(session_id).unwrap();
+        let events = plane.reap_sessions_at(now + 1000);
+        assert!(events.contains(&SessionEvent::EphemeralExpired(node.id)));
+        assert!(
+            plane
+                .store
+                .get_node_by_node_key(&node_key)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
