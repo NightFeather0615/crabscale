@@ -3288,10 +3288,11 @@ mod tests {
         );
         assert_eq!(dns["Proxied"], serde_json::json!(true));
         assert!(
-            dns["SearchDomains"]
+            dns["Domains"]
                 .as_array()
                 .expect("search domains")
-                .contains(&serde_json::json!("tailnet.example"))
+                .contains(&serde_json::json!("tailnet.example")),
+            "the tailnet search domain must be delivered in Domains"
         );
         assert!(
             dns["Resolvers"]
@@ -3345,7 +3346,7 @@ mod tests {
             .expect("peer MagicDNS record must be present");
         assert_eq!(
             peer_record["Type"],
-            serde_json::json!(1),
+            serde_json::json!("A"),
             "peer A record resolves through MagicDNS"
         );
         let peer_value = peer_record["Value"].as_str().expect("value");
@@ -3381,11 +3382,11 @@ mod tests {
             "split DNS must route the suffix to the configured resolver"
         );
         assert!(
-            dns["SearchDomains"]
+            dns["Domains"]
                 .as_array()
                 .expect("search domains")
                 .contains(&serde_json::json!("corp.example")),
-            "configured search domains must reach the client"
+            "configured search domains must reach the client in Domains"
         );
     }
 
@@ -3418,7 +3419,7 @@ mod tests {
         let path = dir.join("records.json");
         std::fs::write(
             &path,
-            br#"[{ "name": "db.tailnet.example.", "type": 1, "value": "100.64.0.9" }]"#,
+            br#"[{ "name": "db.tailnet.example.", "type": "A", "value": "100.64.0.9" }]"#,
         )
         .unwrap();
 
@@ -3448,8 +3449,8 @@ mod tests {
         std::fs::write(
             &path,
             br#"[
-                { "name": "db.tailnet.example.", "type": 1, "value": "100.64.0.9" },
-                { "name": "wiki.tailnet.example.", "type": 28, "value": "fd7a:115c:a1e0::9" }
+                { "name": "db.tailnet.example.", "type": "A", "value": "100.64.0.9" },
+                { "name": "wiki.tailnet.example.", "type": "AAAA", "value": "fd7a:115c:a1e0::9" }
             ]"#,
         )
         .unwrap();

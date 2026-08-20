@@ -465,7 +465,7 @@ async fn dns_reload_pushes_delta_to_live_map_session() {
     let records_path = dir.join("records.json");
     std::fs::write(
         &records_path,
-        br#"[{ "name": "db.tailnet.example.", "type": 1, "value": "100.64.0.9" }]"#,
+        br#"[{ "name": "db.tailnet.example.", "type": "A", "value": "100.64.0.9" }]"#,
     )
     .unwrap();
 
@@ -564,8 +564,8 @@ async fn dns_reload_pushes_delta_to_live_map_session() {
     std::fs::write(
         &records_path,
         br#"[
-            { "name": "db.tailnet.example.", "type": 1, "value": "100.64.0.9" },
-            { "name": "wiki.tailnet.example.", "type": 28, "value": "fd7a:115c:a1e0::9" }
+            { "name": "db.tailnet.example.", "type": "A", "value": "100.64.0.9" },
+            { "name": "wiki.tailnet.example.", "type": "AAAA", "value": "fd7a:115c:a1e0::9" }
         ]"#,
     )
     .unwrap();

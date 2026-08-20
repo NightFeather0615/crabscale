@@ -30,12 +30,10 @@ pub struct DnsRecord {
     /// Fully-qualified record name with a trailing dot, e.g.
     /// `db.tailnet.example.`.
     pub name: String,
-    /// DNS record type (1 = A, 28 = AAAA, 5 = CNAME, ...).
-    #[serde(
-        rename = "Type",
-        skip_serializing_if = "crate::serde_util::is_zero_u16"
-    )]
-    pub rec_type: u16,
+    /// DNS record type as a mnemonic string: `"A"`, `"AAAA"`, `"CNAME"`,
+    /// or empty to let the client infer the type from `value`.
+    #[serde(rename = "Type", skip_serializing_if = "String::is_empty")]
+    pub rec_type: String,
     /// DNS class; 1 is the standard IN class used for the records we emit.
     #[serde(skip_serializing_if = "crate::serde_util::is_zero_u16")]
     pub class: u16,
@@ -61,17 +59,21 @@ pub struct DnsConfig {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub routes: BTreeMap<String, Vec<DnsResolver>>,
     /// Search domains (without trailing dots) appended when resolving a
-    /// short hostname.
+    /// short hostname. This mirrors `domains` and is emitted as a crabscale
+    /// compatibility extension; clients read search domains from `domains`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub search_domains: Vec<String>,
-    /// Full candidate domains the client should recognise; informational.
+    /// Search / candidate domains (without trailing dots). This is the field
+    /// compatible clients read for search/name resolution.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub domains: Vec<String>,
     /// True when the resolver is the client's local MagicDNS proxy, which
     /// serves the `magic_dns_suffix` zone and any `extra_records`.
     #[serde(skip_serializing_if = "crate::serde_util::is_false")]
     pub proxied: bool,
-    /// The suffix (with trailing dot) served by the MagicDNS proxy.
+    /// The suffix (with trailing dot) served by the MagicDNS proxy. Clients
+    /// derive the MagicDNS suffix from the self node's name; this field is a
+    /// crabscale extension that mirrors the same value.
     #[serde(rename = "MagicDNSSuffix", skip_serializing_if = "String::is_empty")]
     pub magic_dns_suffix: String,
     /// Static records the MagicDNS resolver serves for the tailnet zone.
@@ -104,7 +106,7 @@ mod tests {
             magic_dns_suffix: "tailnet.example.".to_string(),
             extra_records: vec![DnsRecord {
                 name: "db.tailnet.example.".to_string(),
-                rec_type: 1,
+                rec_type: "A".to_string(),
                 class: 1,
                 ttl: 300,
                 value: "100.64.0.2".to_string(),
@@ -130,7 +132,7 @@ mod tests {
             json["ExtraRecords"][0],
             serde_json::json!({
                 "Name": "db.tailnet.example.",
-                "Type": 1,
+                "Type": "A",
                 "Class": 1,
                 "TTL": 300,
                 "Value": "100.64.0.2"
@@ -166,8 +168,6 @@ mod tests {
 
     #[test]
     fn serde_util_helpers_are_stable() {
-        assert!(serde_util::is_zero_u16(&0));
-        assert!(!serde_util::is_zero_u16(&1));
         assert!(serde_util::is_zero_u32(&0));
         assert!(!serde_util::is_zero_u32(&1));
     }

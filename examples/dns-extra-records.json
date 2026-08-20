@@ -1,14 +1,14 @@
 [
   {
     "name": "db.tailnet.example.",
-    "type": 1,
+    "type": "A",
     "class": 1,
     "ttl": 300,
     "value": "100.64.0.9"
   },
   {
     "name": "wiki.tailnet.example.",
-    "type": 28,
+    "type": "AAAA",
     "class": 1,
     "ttl": 300,
     "value": "fd7a:115c:a1e0::9"

@@ -89,8 +89,10 @@ impl std::error::Error for DnsError {}
 #[serde(rename_all = "camelCase", default)]
 struct ExtraRecordFile {
     name: String,
+    /// Record type mnemonic (`"A"`, `"AAAA"`, `"CNAME"`). Empty lets the
+    /// loader infer the family from `value` where possible.
     #[serde(rename = "type")]
-    rec_type: u16,
+    rec_type: String,
     class: u16,
     ttl: u32,
     value: String,
@@ -146,6 +148,9 @@ impl DnsSettings {
                 search_domains.push(domain.clone());
             }
         }
+        config.domains = search_domains.clone();
+        // `SearchDomains` is populated as a crabscale compatibility
+        // extension; clients read search domains from `Domains`.
         config.search_domains = search_domains;
 
         if self.magic_dns {
@@ -198,13 +203,14 @@ impl DnsSettings {
         })
     }
 
-    /// Split a CIDR address into its IP literal and DNS record type (1 = A,
-    /// 28 = AAAA). Returns `None` for unparseable addresses.
-    fn split_address(address: &str) -> Option<(String, u16)> {
+    /// Split a CIDR address into its IP literal and DNS record type mnemonic
+    /// (`"A"` for IPv4, `"AAAA"` for IPv6). Returns `None` for unparseable
+    /// addresses.
+    fn split_address(address: &str) -> Option<(String, String)> {
         let ip_literal = address.split('/').next()?;
         let ip: IpAddr = ip_literal.parse().ok()?;
-        let rec_type = if ip.is_ipv4() { 1 } else { 28 };
-        Some((ip_literal.to_string(), rec_type))
+        let rec_type = if ip.is_ipv4() { "A" } else { "AAAA" };
+        Some((ip_literal.to_string(), rec_type.to_string()))
     }
 }
 
@@ -242,25 +248,39 @@ pub fn derive_magic_dns_ipv6(prefix: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
 }
 
 fn ipv4_contains(prefix: Ipv4Addr, prefix_len: u8, ip: Ipv4Addr) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
     if prefix_len > 32 {
         return false;
     }
-    let mask = u32::MAX << (32 - prefix_len);
+    let mask = if prefix_len == 32 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
     (u32::from(prefix) & mask) == (u32::from(ip) & mask)
 }
 
 fn ipv6_contains(prefix: Ipv6Addr, prefix_len: u8, ip: Ipv6Addr) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
     if prefix_len > 128 {
         return false;
     }
-    let mask = u128::MAX << (128 - prefix_len);
+    let mask = if prefix_len == 128 {
+        u128::MAX
+    } else {
+        u128::MAX << (128 - prefix_len)
+    };
     (u128::from(prefix) & mask) == (u128::from(ip) & mask)
 }
 
 /// The highest usable host in an IPv4 prefix (the broadcast address is
-/// skipped). Falls back to the network address for degenerate prefixes.
+/// skipped). Falls back to the prefix address for degenerate lengths.
 fn ipv4_last_host(prefix: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
-    if prefix_len >= 31 {
+    if prefix_len == 0 || prefix_len >= 31 {
         return prefix;
     }
     let mask = u32::MAX << (32 - prefix_len);
@@ -273,7 +293,7 @@ fn ipv4_last_host(prefix: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
 /// The highest usable host in an IPv6 prefix (the subnet-router anycast
 /// address is skipped). Falls back to the prefix for degenerate lengths.
 fn ipv6_last_host(prefix: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
-    if prefix_len >= 128 {
+    if prefix_len == 0 || prefix_len >= 128 {
         return prefix;
     }
     let mask = u128::MAX << (128 - prefix_len);
@@ -281,6 +301,23 @@ fn ipv6_last_host(prefix: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
     let host_bits = 128 - prefix_len;
     let host_count = 1u128 << host_bits;
     Ipv6Addr::from(network + host_count - 1)
+}
+
+/// Resolve a record's type mnemonic. An explicitly provided type is kept;
+/// an empty type is inferred from the value (`"A"` for an IPv4 literal,
+/// `"AAAA"` for an IPv6 literal) and stays empty otherwise so the client can
+/// infer it.
+fn infer_record_type(explicit: &str, value: &str) -> String {
+    if !explicit.is_empty() {
+        return explicit.to_string();
+    }
+    if value.parse::<Ipv4Addr>().is_ok() {
+        return "A".to_string();
+    }
+    if value.parse::<Ipv6Addr>().is_ok() {
+        return "AAAA".to_string();
+    }
+    String::new()
 }
 
 /// Parse an extra-records JSON file body into wire records.
@@ -300,9 +337,10 @@ pub fn parse_extra_records(body: &[u8]) -> Result<Vec<DnsRecord>, DnsError> {
                     "an extra record must have a non-empty value".to_string(),
                 ));
             }
+            let rec_type = infer_record_type(&r.rec_type, &r.value);
             Ok(DnsRecord {
                 name: r.name,
-                rec_type: r.rec_type,
+                rec_type,
                 class: if r.class == 0 { 1 } else { r.class },
                 ttl: r.ttl,
                 value: r.value,
@@ -354,6 +392,11 @@ mod tests {
         assert_eq!(config.magic_dns_suffix, "tailnet.example.");
         assert!(config.proxied);
         assert_eq!(config.search_domains, vec!["tailnet.example".to_string()]);
+        assert_eq!(
+            config.domains,
+            vec!["tailnet.example".to_string()],
+            "search domains must be delivered in Domains"
+        );
         assert!(config.resolvers.iter().any(|r| r.addr == "100.100.100.100"));
         let route = config
             .routes
@@ -372,13 +415,14 @@ mod tests {
             .iter()
             .find(|r| r.value == "100.64.0.2")
             .expect("node2 A record");
-        assert_eq!(a.rec_type, 1);
+        assert_eq!(a.rec_type, "A");
+        assert_eq!(a.class, 1);
         let aaaa = config
             .extra_records
             .iter()
             .find(|r| r.value == "fd7a:115c:a1e0::1")
             .expect("node1 AAAA record");
-        assert_eq!(aaaa.rec_type, 28);
+        assert_eq!(aaaa.rec_type, "AAAA");
     }
 
     #[test]
@@ -408,6 +452,7 @@ mod tests {
             "10.0.0.53"
         );
         assert_eq!(config.search_domains, vec!["corp.example".to_string()]);
+        assert_eq!(config.domains, vec!["corp.example".to_string()]);
     }
 
     #[test]
@@ -434,18 +479,51 @@ mod tests {
     }
 
     #[test]
+    fn prefix_matching_handles_degenerate_lengths() {
+        // /0 contains everything and must not overflow the shift.
+        assert!(ipv4_contains(
+            Ipv4Addr::new(10, 0, 0, 0),
+            0,
+            Ipv4Addr::new(192, 168, 1, 1)
+        ));
+        assert!(ipv6_contains(Ipv6Addr::LOCALHOST, 0, Ipv6Addr::LOCALHOST));
+        // /32 and /128 masks are the full width.
+        assert!(ipv4_contains(
+            Ipv4Addr::new(10, 0, 0, 0),
+            32,
+            Ipv4Addr::new(10, 0, 0, 0)
+        ));
+        assert!(ipv6_contains(Ipv6Addr::LOCALHOST, 128, Ipv6Addr::LOCALHOST));
+        // Last-host helpers fall back instead of overflowing on /0.
+        assert_eq!(
+            ipv4_last_host(Ipv4Addr::new(10, 0, 0, 0), 0),
+            Ipv4Addr::new(10, 0, 0, 0)
+        );
+        assert_eq!(ipv6_last_host(Ipv6Addr::LOCALHOST, 0), Ipv6Addr::LOCALHOST);
+    }
+
+    #[test]
     fn parses_extra_records_file() {
         let body = br#"[
-            { "name": "db.tailnet.example.", "type": 1, "ttl": 60, "value": "100.64.0.9" },
-            { "name": "ns.tailnet.example.", "type": 28, "value": "fd7a:115c:a1e0::9" }
+            { "name": "db.tailnet.example.", "type": "A", "ttl": 60, "value": "100.64.0.9" },
+            { "name": "ns.tailnet.example.", "value": "fd7a:115c:a1e0::9" }
         ]"#;
         let records = parse_extra_records(body).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].name, "db.tailnet.example.");
-        assert_eq!(records[0].rec_type, 1);
+        assert_eq!(records[0].rec_type, "A");
         assert_eq!(records[0].ttl, 60);
         assert_eq!(records[0].class, 1, "missing class defaults to IN");
-        assert_eq!(records[1].rec_type, 28);
+        // Empty type with an IPv6 value infers AAAA.
+        assert_eq!(records[1].rec_type, "AAAA");
+    }
+
+    #[test]
+    fn record_type_is_inferred_from_value_when_empty() {
+        assert_eq!(infer_record_type("", "100.64.0.9"), "A");
+        assert_eq!(infer_record_type("", "fd7a:115c:a1e0::9"), "AAAA");
+        assert_eq!(infer_record_type("CNAME", "alias.example."), "CNAME");
+        assert_eq!(infer_record_type("", "not-an-ip"), "");
     }
 
     #[test]
