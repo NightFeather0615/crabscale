@@ -37,7 +37,7 @@ pub use hostinfo::{Hostinfo, NetInfo};
 pub use key::{ChallengeKey, DiscoKey, KeyParseError, MachineKey, NodeKey};
 pub use logout::LogoutRequest;
 pub use netmap::{
-    FilterRule, MapRequest, MapResponse, NetPortRange, Node, PeerChange, UserProfile,
+    CapGrant, FilterRule, MapRequest, MapResponse, NetPortRange, Node, PeerChange, UserProfile,
 };
 pub use ping::PingRequest;
 pub use register::{RegisterAuth, RegisterRequest, RegisterResponse};

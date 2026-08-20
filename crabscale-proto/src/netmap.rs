@@ -210,6 +210,10 @@ pub struct UserProfile {
 }
 
 /// One rule in a packet filter.
+///
+/// A rule grants either network access (via `dst_ports`/`ip_proto`) to
+/// matching sources, or application-level capabilities (via `cap_grant`).
+/// The two kinds are mutually exclusive: a rule carries at most one of them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct FilterRule {
@@ -225,9 +229,13 @@ pub struct FilterRule {
     /// IP protocol numbers to match; empty means TCP, UDP, and ICMP.
     #[serde(rename = "IPProto", skip_serializing_if = "Option::is_none")]
     pub ip_proto: Option<Vec<i32>>,
+    /// Application capabilities granted to matching sources; empty means
+    /// this is a network rule.
+    #[serde(rename = "CapGrant", skip_serializing_if = "Vec::is_empty")]
+    pub cap_grant: Vec<CapGrant>,
 }
 
-/// An inclusive port range.
+/// An inclusive port range on the receiving node.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct NetPortRange {
@@ -235,6 +243,24 @@ pub struct NetPortRange {
     pub first: u16,
     /// Last port in the range.
     pub last: u16,
+}
+
+/// Application-level capabilities conditionally granted to the sources
+/// matched by a [`FilterRule`] when they talk to one of `dsts`.
+///
+/// The destination prefixes are the receiver's own addresses; this object is
+/// delivered inside the receiver's packet filter so the receiver can answer
+/// capability lookups for its peers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct CapGrant {
+    /// Destination IP ranges (CIDRs) this grant applies to.
+    #[serde(rename = "Dsts")]
+    pub dsts: Vec<String>,
+    /// Capability name -> values to grant. Each value is emitted as a JSON
+    /// array element on the wire.
+    #[serde(rename = "CapMap")]
+    pub cap_map: std::collections::BTreeMap<String, Vec<serde_json::Value>>,
 }
 
 /// A lightweight patch for a peer node.
@@ -327,6 +353,52 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<MapResponse>(&json).unwrap(),
             response
+        );
+    }
+
+    #[test]
+    fn cap_grant_serializes_pascal_case() {
+        let rule = FilterRule {
+            src_ips: vec!["100.64.0.1/32".to_string()],
+            cap_grant: vec![CapGrant {
+                dsts: vec!["100.64.0.2/32".to_string()],
+                cap_map: std::collections::BTreeMap::from([(
+                    "tailscale.com/cap/foo".to_string(),
+                    vec![serde_json::json!([{"a": 1}])],
+                )]),
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&rule).unwrap();
+        assert_eq!(json["SrcIPs"], serde_json::json!(["100.64.0.1/32"]));
+        assert_eq!(
+            json["CapGrant"][0]["Dsts"],
+            serde_json::json!(["100.64.0.2/32"])
+        );
+        assert!(json.get("CapGrant").is_some(), "CapGrant must be present");
+        assert_eq!(
+            json["CapGrant"][0]["CapMap"]["tailscale.com/cap/foo"],
+            serde_json::json!([[{"a": 1}]])
+        );
+        assert!(json.get("DstPorts").is_none(), "no ports on app rule");
+        assert!(json.get("IPProto").is_none(), "no ip proto on app rule");
+    }
+
+    #[test]
+    fn network_rule_omits_cap_grant() {
+        let rule = FilterRule {
+            src_ips: vec!["*".to_string()],
+            dst_ports: vec![NetPortRange {
+                first: 0,
+                last: 65535,
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&rule).unwrap();
+        assert!(json.get("CapGrant").is_none(), "CapGrant must be omitted");
+        assert_eq!(
+            json["DstPorts"],
+            serde_json::json!([{ "First": 0, "Last": 65535 }])
         );
     }
 }
