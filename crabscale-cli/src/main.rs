@@ -1,19 +1,25 @@
-//! Admin command-line client for interactive registration approval.
+//! Admin command-line client for registration and route administration.
 //!
 //! The CLI operates on a local [`ControlPlane`] and lets an administrator
-//! approve or reject a pending interactive registration by its auth id.
+//! approve or reject a pending interactive registration by its auth id, and
+//! approve or disapprove subnet/exit routes a node advertises.
 //!
 //! Usage:
 //! ```text
 //! crabscale auth approve --auth-id <id> --user <name>
 //! crabscale auth reject --auth-id <id>
+//! crabscale route approve --node <nodekey> --route <cidr>
+//! crabscale route disapprove --node <nodekey> --route <cidr>
+//! crabscale route list --node <nodekey>
 //! ```
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::str::FromStr;
 
 use clap::{Parser, Subcommand};
 use crabscale_control::{ControlConfig, ControlError, ControlPlane};
+use crabscale_proto::NodeKey;
 
 /// Admin command-line client for crabscale.
 #[derive(Parser)]
@@ -33,6 +39,11 @@ enum Command {
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
+    },
+    /// Approve, disapprove, or list subnet/exit routes.
+    Route {
+        #[command(subcommand)]
+        command: RouteCommand,
     },
 }
 
@@ -55,6 +66,34 @@ enum AuthCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum RouteCommand {
+    /// Approve a route a node advertises.
+    Approve {
+        /// The node key (`nodekey:` prefixed) that advertises the route.
+        #[arg(long)]
+        node: String,
+        /// The route to approve, as an IP or CIDR.
+        #[arg(long)]
+        route: String,
+    },
+    /// Remove an approval for a route.
+    Disapprove {
+        /// The node key (`nodekey:` prefixed) that advertises the route.
+        #[arg(long)]
+        node: String,
+        /// The route to disapprove, as an IP or CIDR.
+        #[arg(long)]
+        route: String,
+    },
+    /// List the routes a node advertises and the approved subset.
+    List {
+        /// The node key (`nodekey:` prefixed) to list routes for.
+        #[arg(long)]
+        node: String,
+    },
+}
+
 /// Run an auth command against the given control plane.
 fn run_auth_command(plane: &ControlPlane, command: AuthCommand) -> Result<String, ControlError> {
     match command {
@@ -71,9 +110,49 @@ fn run_auth_command(plane: &ControlPlane, command: AuthCommand) -> Result<String
     }
 }
 
+/// Parse a `nodekey:` argument into a [`NodeKey`].
+fn parse_node_key(node: &str) -> Result<NodeKey, ControlError> {
+    NodeKey::from_str(node).map_err(|e| ControlError::Policy(format!("invalid node key: {e}")))
+}
+
+/// Run a route command against the given control plane.
+fn run_route_command(plane: &ControlPlane, command: RouteCommand) -> Result<String, ControlError> {
+    match command {
+        RouteCommand::Approve { node, route } => {
+            let node_key = parse_node_key(&node)?;
+            plane.approve_route(&node_key, &route)?;
+            Ok(format!("approved route {route} for {node}"))
+        }
+        RouteCommand::Disapprove { node, route } => {
+            let node_key = parse_node_key(&node)?;
+            plane.disapprove_route(&node_key, &route)?;
+            Ok(format!("disapproved route {route} for {node}"))
+        }
+        RouteCommand::List { node } => {
+            let node_key = parse_node_key(&node)?;
+            let stored = plane
+                .node_by_key(&node_key)?
+                .ok_or(ControlError::NotFound)?;
+            let advertised = if stored.advertised_routes.is_empty() {
+                "(none)".to_string()
+            } else {
+                stored.advertised_routes.join(", ")
+            };
+            let approved = if stored.approved_routes.is_empty() {
+                "(none)".to_string()
+            } else {
+                stored.approved_routes.join(", ")
+            };
+            Ok(format!(
+                "node {} ({})\nadvertised: {}\napproved: {}",
+                stored.stable_id, stored.name, advertised, approved
+            ))
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let Command::Auth { command } = cli.command;
     let plane = match &cli.store {
         Some(path) => match ControlPlane::open_sqlite(ControlConfig::default(), path) {
             Ok(plane) => plane,
@@ -84,7 +163,13 @@ fn main() -> ExitCode {
         },
         None => ControlPlane::new(ControlConfig::default()),
     };
-    match run_auth_command(&plane, command) {
+
+    let result = match cli.command {
+        Command::Auth { command } => run_auth_command(&plane, command),
+        Command::Route { command } => run_route_command(&plane, command),
+    };
+
+    match result {
         Ok(message) => {
             println!("{message}");
             ExitCode::SUCCESS
@@ -125,6 +210,26 @@ mod tests {
         crabscale_control::auth_id_from_followup(&response.auth_url).unwrap()
     }
 
+    /// Register a node and return its node key string.
+    fn registered_node_key(plane: &ControlPlane) -> String {
+        let request = RegisterRequest {
+            version: 130,
+            node_key: NodeKey::from_bytes([0x22; 32]),
+            auth: Some(RegisterAuth {
+                auth_key: "hskey-auth-test-secret".to_string(),
+            }),
+            hostinfo: Some(Hostinfo {
+                hostname: "router".to_string(),
+                routable_ips: Some(vec!["10.99.0.0/16".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = plane.register(MachineKey::from_bytes([0x11; 32]), request);
+        assert!(response.machine_authorized);
+        NodeKey::from_bytes([0x22; 32]).to_string()
+    }
+
     #[test]
     fn parses_approve_command() {
         let cli = Cli::try_parse_from([
@@ -137,24 +242,77 @@ mod tests {
             "alice",
         ])
         .unwrap();
-        let Command::Auth { command } = cli.command;
-        assert!(matches!(
-            command,
-            AuthCommand::Approve {
-                auth_id,
-                user
-            } if auth_id == "abc123" && user == "alice"
-        ));
+        match cli.command {
+            Command::Auth { command } => assert!(matches!(
+                command,
+                AuthCommand::Approve { auth_id, user }
+                    if auth_id == "abc123" && user == "alice"
+            )),
+            _ => panic!("expected auth approve"),
+        }
     }
 
     #[test]
     fn parses_reject_command() {
         let cli = Cli::try_parse_from(["crabscale", "auth", "reject", "--auth-id", "abc"]).unwrap();
-        let Command::Auth { command } = cli.command;
-        assert!(matches!(
-            command,
-            AuthCommand::Reject { auth_id } if auth_id == "abc"
-        ));
+        match cli.command {
+            Command::Auth { command } => assert!(matches!(
+                command,
+                AuthCommand::Reject { auth_id } if auth_id == "abc"
+            )),
+            _ => panic!("expected auth reject"),
+        }
+    }
+
+    #[test]
+    fn parses_route_commands() {
+        let cli = Cli::try_parse_from([
+            "crabscale",
+            "route",
+            "approve",
+            "--node",
+            "nodekey:aa",
+            "--route",
+            "10.0.0.0/8",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Route { command } => assert!(matches!(
+                command,
+                RouteCommand::Approve { node, route }
+                    if node == "nodekey:aa" && route == "10.0.0.0/8"
+            )),
+            _ => panic!("expected route approve"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "crabscale",
+            "route",
+            "disapprove",
+            "--node",
+            "nodekey:aa",
+            "--route",
+            "10.0.0.0/8",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Route { command } => assert!(matches!(
+                command,
+                RouteCommand::Disapprove { node, route }
+                    if node == "nodekey:aa" && route == "10.0.0.0/8"
+            )),
+            _ => panic!("expected route disapprove"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["crabscale", "route", "list", "--node", "nodekey:aa"]).unwrap();
+        match cli.command {
+            Command::Route { command } => assert!(matches!(
+                command,
+                RouteCommand::List { node } if node == "nodekey:aa"
+            )),
+            _ => panic!("expected route list"),
+        }
     }
 
     #[test]
@@ -217,6 +375,54 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ControlError::NotFound));
+    }
+
+    #[test]
+    fn route_commands_approve_disapprove_and_list() {
+        let plane = test_plane();
+        let node = registered_node_key(&plane);
+        let node_key = NodeKey::from_str(&node).unwrap();
+
+        let message = run_route_command(
+            &plane,
+            RouteCommand::Approve {
+                node: node.clone(),
+                route: "10.99.0.0/16".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(message.contains("approved"));
+
+        let listed = run_route_command(&plane, RouteCommand::List { node: node.clone() }).unwrap();
+        assert!(listed.contains("10.99.0.0/16"));
+        assert!(listed.contains("advertised"));
+
+        let message = run_route_command(
+            &plane,
+            RouteCommand::Disapprove {
+                node: node.clone(),
+                route: "10.99.0.0/16".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(message.contains("disapproved"));
+
+        let after = plane.node_by_key(&node_key).unwrap().unwrap();
+        assert!(after.approved_routes.is_empty());
+    }
+
+    #[test]
+    fn route_command_rejects_bad_node_key() {
+        let plane = test_plane();
+        let err = run_route_command(
+            &plane,
+            RouteCommand::Approve {
+                node: "not-a-key".to_string(),
+                route: "10.0.0.0/8".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ControlError::Policy(_)));
     }
 
     #[test]

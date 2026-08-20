@@ -322,6 +322,7 @@ dependencies = [
  "bytes",
  "clap",
  "crabscale-control",
+ "crabscale-policy",
  "crabscale-proto",
  "crabscale-transport",
  "h2",
