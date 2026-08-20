@@ -706,15 +706,24 @@ impl ControlPlane {
 
     /// Log out a node.
     ///
+    /// The caller must present the Noise machine key that owns the node;
+    /// otherwise the request is rejected with [`ControlError::NotFound`] so a
+    /// client cannot deauthorize a node it does not own.
+    ///
     /// Tagged nodes are never logged out (no-expiry). Ephemeral nodes are
     /// deleted entirely. All other nodes are deauthorized and must re-auth.
-    pub fn logout(&self, node_key: &NodeKey) -> Result<RegisterResponse, ControlError> {
+    pub fn logout(
+        &self,
+        machine_key: MachineKey,
+        node_key: &NodeKey,
+    ) -> Result<RegisterResponse, ControlError> {
         let Some(node) = self
             .store
             .get_node_by_node_key(node_key)
             .map_err(|e| ControlError::Store(e.to_string()))?
+            .filter(|n| n.machine_key == machine_key)
         else {
-            return Ok(self.unauthorized_response("node not found"));
+            return Err(ControlError::NotFound);
         };
         self.logout_node(node, false)
     }
@@ -1649,13 +1658,32 @@ mod tests {
         plane
             .register(test_machine_key(), test_register_request())
             .unwrap();
-        let response = plane.logout(&test_node_key()).unwrap();
+        let response = plane.logout(test_machine_key(), &test_node_key()).unwrap();
         assert!(!response.machine_authorized);
         // Re-register without auth: still logged out.
         let mut request = test_register_request();
         request.auth = None;
         let response = plane.register(test_machine_key(), request).unwrap();
         assert!(!response.machine_authorized);
+    }
+
+    #[test]
+    fn logout_rejects_wrong_machine_key() {
+        let plane = test_plane();
+        plane
+            .register(test_machine_key(), test_register_request())
+            .unwrap();
+        // A different Noise machine key must not be able to log out the node.
+        let other = MachineKey::from_bytes([0x99; 32]);
+        let err = plane.logout(other, &test_node_key()).unwrap_err();
+        assert!(matches!(err, ControlError::NotFound));
+        // The node is still authorized.
+        let node = plane
+            .store
+            .get_node_by_node_key(&test_node_key())
+            .unwrap()
+            .unwrap();
+        assert!(node.machine_authorized);
     }
 
     #[test]
@@ -1675,7 +1703,7 @@ mod tests {
             .register(test_machine_key(), request_with(node, &key))
             .unwrap();
         assert!(response.machine_authorized);
-        let response = plane.logout(&node).unwrap();
+        let response = plane.logout(test_machine_key(), &node).unwrap();
         assert!(response.machine_authorized);
     }
 
@@ -1690,7 +1718,7 @@ mod tests {
             .register(test_machine_key(), request_with(node, &key))
             .unwrap();
         assert!(response.machine_authorized);
-        let response = plane.logout(&node).unwrap();
+        let response = plane.logout(test_machine_key(), &node).unwrap();
         assert!(!response.machine_authorized);
         assert!(plane.store.get_node_by_node_key(&node).unwrap().is_none());
     }
@@ -1821,7 +1849,7 @@ mod tests {
         assert!(first.machine_authorized);
 
         // Log out node A, then re-auth with a fresh single-use key.
-        let logout = plane.logout(&node_a).unwrap();
+        let logout = plane.logout(test_machine_key(), &node_a).unwrap();
         assert!(!logout.machine_authorized);
         let second_key = plane
             .create_pre_auth_key("reauth2", false, false, None, None)

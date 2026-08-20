@@ -178,7 +178,8 @@ impl ControlRouter {
                     .await;
             }
             ("POST", "/machine/logout") => {
-                self.handle_logout(&mut respond, &body_bytes).await;
+                self.handle_logout(&mut respond, machine_key, &body_bytes)
+                    .await;
             }
             ("POST", "/machine/set-dns")
             | ("PATCH", "/machine/set-device-attr")
@@ -231,7 +232,12 @@ impl ControlRouter {
         }
     }
 
-    async fn handle_logout(&self, respond: &mut SendResponse<Bytes>, body: &[u8]) {
+    async fn handle_logout(
+        &self,
+        respond: &mut SendResponse<Bytes>,
+        machine_key: MachineKey,
+        body: &[u8],
+    ) {
         let request: LogoutRequest = match serde_json::from_slice(body) {
             Ok(r) => r,
             Err(_) => {
@@ -239,10 +245,13 @@ impl ControlRouter {
                 return;
             }
         };
-        match self.control.logout(&request.node_key) {
+        match self.control.logout(machine_key, &request.node_key) {
             Ok(response) => {
                 let body = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
                 send_json(respond, StatusCode::OK, body);
+            }
+            Err(ControlError::NotFound) => {
+                send_plain(respond, StatusCode::NOT_FOUND, b"node not found");
             }
             Err(_) => {
                 send_plain(
