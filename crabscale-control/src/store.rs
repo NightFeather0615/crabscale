@@ -241,9 +241,9 @@ impl Store for SqliteStore {
         conn.execute(
             "INSERT INTO nodes (
                 stable_id, name, user_id, node_key, machine_key, disco_key,
-                addresses, allowed_ips, endpoints, home_derp, hostinfo, created,
+                addresses, allowed_ips, endpoints, endpoint_types, home_derp, hostinfo, created,
                 cap, tags, machine_authorized, ephemeral
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             ON CONFLICT(node_key) DO UPDATE SET
                 stable_id = excluded.stable_id,
                 name = excluded.name,
@@ -253,6 +253,7 @@ impl Store for SqliteStore {
                 addresses = excluded.addresses,
                 allowed_ips = excluded.allowed_ips,
                 endpoints = excluded.endpoints,
+                endpoint_types = excluded.endpoint_types,
                 home_derp = excluded.home_derp,
                 hostinfo = excluded.hostinfo,
                 created = excluded.created,
@@ -270,6 +271,7 @@ impl Store for SqliteStore {
                 addresses,
                 allowed_ips,
                 serde_json::to_string(&node.endpoints)?,
+                serde_json::to_string(&node.endpoint_types)?,
                 node.home_derp as i64,
                 hostinfo,
                 node.created,
@@ -305,6 +307,7 @@ impl Store for SqliteStore {
             addresses: node.addresses.clone(),
             allowed_ips: node.allowed_ips.clone(),
             endpoints: node.endpoints.clone(),
+            endpoint_types: node.endpoint_types.clone(),
             home_derp: node.home_derp,
             hostinfo: node.hostinfo.clone(),
             created: node.created.clone(),
@@ -320,7 +323,7 @@ impl Store for SqliteStore {
         let node = conn
             .query_row(
                 "SELECT id, stable_id, name, user_id, node_key, machine_key, disco_key,
-                        addresses, allowed_ips, endpoints, home_derp, hostinfo, created,
+                        addresses, allowed_ips, endpoints, endpoint_types, home_derp, hostinfo, created,
                         cap, tags, machine_authorized, ephemeral
                  FROM nodes WHERE node_key = ?1",
                 params![node_key.to_string()],
@@ -338,7 +341,7 @@ impl Store for SqliteStore {
         let node = conn
             .query_row(
                 "SELECT id, stable_id, name, user_id, node_key, machine_key, disco_key,
-                        addresses, allowed_ips, endpoints, home_derp, hostinfo, created,
+                        addresses, allowed_ips, endpoints, endpoint_types, home_derp, hostinfo, created,
                         cap, tags, machine_authorized, ephemeral
                  FROM nodes WHERE machine_key = ?1",
                 params![machine_key.to_string()],
@@ -352,7 +355,7 @@ impl Store for SqliteStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, stable_id, name, user_id, node_key, machine_key, disco_key,
-                    addresses, allowed_ips, endpoints, home_derp, hostinfo, created,
+                    addresses, allowed_ips, endpoints, endpoint_types, home_derp, hostinfo, created,
                     cap, tags, machine_authorized, ephemeral
              FROM nodes ORDER BY id",
         )?;
@@ -623,8 +626,9 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
     let addresses: String = row.get(7)?;
     let allowed_ips: Option<String> = row.get(8)?;
     let endpoints: String = row.get(9)?;
-    let hostinfo: Option<String> = row.get(11)?;
-    let tags: Option<String> = row.get(14)?;
+    let endpoint_types: String = row.get(10)?;
+    let hostinfo: Option<String> = row.get(12)?;
+    let tags: Option<String> = row.get(15)?;
     Ok(Node {
         id: row.get(0)?,
         stable_id: row.get(1)?,
@@ -667,31 +671,34 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
         endpoints: serde_json::from_str(&endpoints).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
         })?,
-        home_derp: row.get::<_, i64>(10)? as u64,
+        endpoint_types: serde_json::from_str(&endpoint_types).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        home_derp: row.get::<_, i64>(11)? as u64,
         hostinfo: hostinfo
             .map(|s| serde_json::from_str(&s))
             .transpose()
             .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    11,
+                    12,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
             })?,
-        created: row.get(12)?,
-        cap: row.get(13)?,
+        created: row.get(13)?,
+        cap: row.get(14)?,
         tags: tags
             .map(|s| serde_json::from_str(&s))
             .transpose()
             .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    14,
+                    15,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
             })?,
-        machine_authorized: row.get::<_, i64>(15)? != 0,
-        ephemeral: row.get::<_, i64>(16)? != 0,
+        machine_authorized: row.get::<_, i64>(16)? != 0,
+        ephemeral: row.get::<_, i64>(17)? != 0,
     })
 }
 
@@ -725,6 +732,7 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
                 addresses TEXT NOT NULL,
                 allowed_ips TEXT,
                 endpoints TEXT NOT NULL,
+                endpoint_types TEXT NOT NULL DEFAULT '[]',
                 home_derp INTEGER NOT NULL,
                 hostinfo TEXT,
                 created TEXT NOT NULL,
@@ -761,15 +769,21 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
                 last_seen TEXT NOT NULL,
                 closed_at TEXT
             );
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
             COMMIT;",
         )?;
-        version = 2;
+        version = 3;
     }
     if version < 2 {
         conn.execute_batch(
             "ALTER TABLE nodes ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 0;
             PRAGMA user_version = 2;",
+        )?;
+    }
+    if version < 3 {
+        conn.execute_batch(
+            "ALTER TABLE nodes ADD COLUMN endpoint_types TEXT NOT NULL DEFAULT '[]';
+            PRAGMA user_version = 3;",
         )?;
     }
     Ok(())
@@ -805,6 +819,7 @@ mod tests {
             addresses: vec!["100.64.0.1/32".to_string()],
             allowed_ips: Some(vec!["100.64.0.1/32".to_string()]),
             endpoints: Vec::new(),
+            endpoint_types: Vec::new(),
             home_derp: 1,
             hostinfo: None,
             created: "2026-08-20T00:00:00Z".to_string(),
