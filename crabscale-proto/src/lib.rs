@@ -16,6 +16,7 @@ mod early;
 mod frame;
 mod hostinfo;
 mod key;
+mod logout;
 mod netmap;
 mod ping;
 mod register;
@@ -28,6 +29,7 @@ pub use frame::{
 };
 pub use hostinfo::{Hostinfo, NetInfo};
 pub use key::{ChallengeKey, DiscoKey, KeyParseError, MachineKey, NodeKey};
+pub use logout::LogoutRequest;
 pub use netmap::{
     FilterRule, MapRequest, MapResponse, NetPortRange, Node, PeerChange, UserProfile,
 };
