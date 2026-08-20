@@ -1031,8 +1031,11 @@ impl ControlPlane {
 
     /// Approve a route for a node, making it available to peers.
     ///
-    /// The route is validated and canonicalized to CIDR form before it is
-    /// stored. Approving a route already in the set is a no-op.
+    /// The route is validated and canonicalized to CIDR form (host bits
+    /// zeroed) before it is stored. Approving a route the node is not
+    /// currently advertising is allowed: it becomes effective as soon as
+    /// the node advertises it. Approving a route already in the set is a
+    /// no-op.
     pub fn approve_route(&self, node_key: &NodeKey, route: &str) -> Result<(), ControlError> {
         let canonical = crabscale_policy::canonical_route(route)
             .ok_or_else(|| ControlError::InvalidRoute(route.to_string()))?;
@@ -2978,6 +2981,33 @@ mod tests {
         assert!(
             primary.contains(&"192.168.42.0/24".to_string()),
             "self PrimaryRoutes must list the approved subnet: {primary:?}"
+        );
+    }
+
+    #[test]
+    fn route_approval_matches_when_host_bits_differ() {
+        let plane = test_plane();
+        // The client advertises the subnet with a host address whose host bits
+        // are set; canonicalization zeroes them, so the stored advertised
+        // route is the network form.
+        register_router(&plane, [0x12; 32], [0x23; 32], &["10.0.0.5/24"]);
+        let router = stored_node(&plane, 1);
+        assert_eq!(
+            router.advertised_routes,
+            vec!["10.0.0.0/24".to_string()],
+            "advertised routes must be canonicalized to the network"
+        );
+        // The administrator approves the same network in canonical form; the
+        // string equality in the effective-route intersection must still match.
+        plane
+            .approve_route(&router.node_key, "10.0.0.0/24")
+            .unwrap();
+        register_extra_node(&plane, [0x13; 32], [0x24; 32]);
+
+        let n2 = map_json(&plane, 2);
+        assert!(
+            peer_allowed_ips(&n2, 1).contains(&"10.0.0.0/24".to_string()),
+            "an approval matching the network must reach peers"
         );
     }
 

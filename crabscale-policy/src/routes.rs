@@ -13,43 +13,22 @@
 //!
 //! [Spec-Policy](https://github.com/NightFeather0615/crabscale/wiki/Spec-Policy.md)
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::CompileNode;
 use crate::model::Policy;
 
-/// Canonical CIDR form of an IP or CIDR route.
+/// Canonical CIDR form of an IP or CIDR route, with host bits zeroed.
 ///
-/// A bare IP becomes `addr/32` (IPv4) or `addr/128` (IPv6); a CIDR keeps its
-/// prefix. Returns `None` when `s` is not a valid IP or CIDR.
+/// A bare IP becomes `addr/32` (IPv4) or `addr/128` (IPv6); a CIDR keeps
+/// its prefix and masks the address to the network (so `10.0.0.5/24`
+/// canonicalizes to `10.0.0.0/24`). Zeroing the host bits is what makes
+/// approvals and advertisements of the same network compare equal regardless
+/// of which host address the client happened to write. Returns `None` when
+/// `s` is not a valid IP or CIDR.
 pub fn canonical_route(s: &str) -> Option<String> {
-    if let Ok(ip) = s.parse::<IpAddr>() {
-        let bits = if ip.is_ipv4() { 32 } else { 128 };
-        return Some(format!("{ip}/{bits}"));
-    }
-    let (addr, bits) = s.split_once('/')?;
-    let ip = addr.parse::<IpAddr>().ok()?;
-    let bits = bits.parse::<u8>().ok()?;
-    let max = if ip.is_ipv4() { 32 } else { 128 };
-    if bits > max {
-        return None;
-    }
-    Some(format!("{ip}/{bits}"))
-}
-
-/// Whether `s` is a valid IP or CIDR route string.
-pub fn is_route(s: &str) -> bool {
-    canonical_route(s).is_some()
-}
-
-/// Whether a canonical route is an exit-node default route.
-///
-/// A node whose approved routes include `0.0.0.0/0` or `::/0` is an exit
-/// node: those prefixes are propagated to peers through `AllowedIPs` just
-/// like any other approved route, and the client recognizes the default
-/// route as the exit-node marker.
-pub fn is_exit_route(route: &str) -> bool {
-    route == "0.0.0.0/0" || route == "::/0"
+    let (ip, bits) = parse_cidr(s)?;
+    Some(format!("{}/{bits}", mask_addr(ip, bits)))
 }
 
 /// Whether network `addr` (an IP or CIDR string) falls inside `net` (a CIDR).
@@ -86,6 +65,14 @@ fn parse_cidr(s: &str) -> Option<(IpAddr, u8)> {
         return None;
     }
     Some((ip, bits))
+}
+
+/// Mask `ip` to the network determined by `bits`, zeroing the host bits.
+fn mask_addr(ip: IpAddr, bits: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(a) => IpAddr::V4(Ipv4Addr::from(u32::from(a) & mask_u32(bits as u32))),
+        IpAddr::V6(a) => IpAddr::V6(Ipv6Addr::from(u128::from(a) & mask_u128(bits as u32))),
+    }
 }
 
 fn mask_u32(bits: u32) -> u32 {
@@ -227,10 +214,19 @@ mod tests {
     }
 
     #[test]
-    fn identifies_exit_routes() {
-        assert!(is_exit_route("0.0.0.0/0"));
-        assert!(is_exit_route("::/0"));
-        assert!(!is_exit_route("10.0.0.0/8"));
+    fn canonical_route_zeros_host_bits() {
+        assert_eq!(
+            canonical_route("10.0.0.5/24").as_deref(),
+            Some("10.0.0.0/24")
+        );
+        assert_eq!(
+            canonical_route("192.168.1.7/16").as_deref(),
+            Some("192.168.0.0/16")
+        );
+        assert_eq!(
+            canonical_route("2001:db8:0:1::5/64").as_deref(),
+            Some("2001:db8:0:1::/64")
+        );
     }
 
     #[test]
