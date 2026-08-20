@@ -1,0 +1,143 @@
+{
+  "input": {
+    "Node": {
+      "ID": 1,
+      "StableID": "n00000000000000000000001",
+      "Name": "node1.tailnet.example.",
+      "User": 1,
+      "Key": "nodekey:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "Machine": "mkey:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "DiscoKey": "discokey:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "Addresses": [
+        "100.64.0.1/32",
+        "fd7a:115c:a1e0::1/128"
+      ],
+      "AllowedIPs": [
+        "100.64.0.1/32",
+        "fd7a:115c:a1e0::1/128"
+      ],
+      "Endpoints": [
+        "198.51.100.10:41641"
+      ],
+      "HomeDERP": 1,
+      "Hostinfo": {
+        "Hostname": "node1"
+      },
+      "Cap": 130,
+      "Created": "2026-08-20T00:00:00Z"
+    },
+    "DERPMap": {
+      "Regions": {
+        "1": {
+          "RegionID": 1,
+          "RegionCode": "test",
+          "RegionName": "Test",
+          "Nodes": [
+            {
+              "Name": "test-1",
+              "HostName": "derp.example.com",
+              "DERPPort": 443,
+              "STUNPort": 3478
+            }
+          ]
+        }
+      }
+    },
+    "Domain": "tailnet.example",
+    "Peers": [],
+    "PacketFilters": {
+      "base": [
+        {
+          "SrcIPs": [
+            "*"
+          ],
+          "DstPorts": [
+            {
+              "First": 0,
+              "Last": 65535
+            }
+          ]
+        }
+      ]
+    },
+    "UserProfiles": [
+      {
+        "ID": 1,
+        "LoginName": "owner@example.com",
+        "DisplayName": "Owner"
+      }
+    ],
+    "ControlTime": "2026-08-20T00:00:00Z"
+  },
+  "expected": {
+    "Node": {
+      "ID": 1,
+      "StableID": "n00000000000000000000001",
+      "Name": "node1.tailnet.example.",
+      "User": 1,
+      "Key": "nodekey:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "Machine": "mkey:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "DiscoKey": "discokey:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "Addresses": [
+        "100.64.0.1/32",
+        "fd7a:115c:a1e0::1/128"
+      ],
+      "AllowedIPs": [
+        "100.64.0.1/32",
+        "fd7a:115c:a1e0::1/128"
+      ],
+      "Endpoints": [
+        "198.51.100.10:41641"
+      ],
+      "HomeDERP": 1,
+      "Hostinfo": {
+        "Hostname": "node1"
+      },
+      "Cap": 130,
+      "Created": "2026-08-20T00:00:00Z"
+    },
+    "DERPMap": {
+      "Regions": {
+        "1": {
+          "RegionID": 1,
+          "RegionCode": "test",
+          "RegionName": "Test",
+          "Nodes": [
+            {
+              "Name": "test-1",
+              "HostName": "derp.example.com",
+              "STUNPort": 3478,
+              "DERPPort": 443
+            }
+          ]
+        }
+      }
+    },
+    "Domain": "tailnet.example",
+    "Peers": [],
+    "PacketFilters": {
+      "base": [
+        {
+          "SrcIPs": [
+            "*"
+          ],
+          "DstPorts": [
+            {
+              "First": 0,
+              "Last": 65535
+            }
+          ]
+        }
+      ]
+    },
+    "UserProfiles": [
+      {
+        "ID": 1,
+        "LoginName": "owner@example.com",
+        "DisplayName": "Owner"
+      }
+    ],
+    "ControlTime": "2026-08-20T00:00:00Z"
+  },
+  "note": "Initial MapResponse from Spec-NetMap; Peers: [] is preserved as an empty array."
+}

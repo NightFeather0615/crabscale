@@ -1,0 +1,9 @@
+{
+  "input": {
+    "nodeKeyChallenge": "chalpub:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  "expected": {
+    "nodeKeyChallenge": "chalpub:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  "note": "EarlyNoise payload from Spec-Transport; the field name is camelCase."
+}
