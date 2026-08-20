@@ -1,28 +1,47 @@
-//! In-memory control plane: registration, MapRequest handling, and
-//! MapResponse building for the M0 protocol spike.
+//! Control plane: registration, MapRequest handling, and MapResponse
+//! building backed by a durable domain model.
 //!
 //! This crate owns the server-side domain logic that sits behind the
-//! `/machine/register` and `/machine/map` endpoints. It keeps an in-memory
-//! node table, validates a single configured static auth key, assigns
-//! tailnet IPs, and builds the first complete MapResponse frame.
+//! `/machine/register` and `/machine/map` endpoints. It persists users,
+//! logins, nodes, pre-auth keys, policies, and sessions through the [`Store`]
+//! trait, assigns tailnet IPs with a random allocator, and builds the first
+//! complete MapResponse frame.
 
-use std::collections::BTreeMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+mod ip_allocator;
+mod model;
+mod store;
+
+use std::collections::{BTreeMap, HashSet};
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::Path;
+use std::sync::Arc;
 
 use crabscale_proto::{
-    DerpMap, FilterRule, Hostinfo, MachineKey, MapRequest, MapResponse, NetPortRange, Node,
-    NodeKey, RegisterRequest, RegisterResponse, UserProfile, encode_map_response_frame,
+    DerpMap, FilterRule, MachineKey, MapRequest, MapResponse, NetPortRange, Node, RegisterRequest,
+    RegisterResponse, UserProfile, encode_map_response_frame,
 };
+
+pub use ip_allocator::{IpAllocator, IpAllocatorError};
+pub use model::{Login, Node as DomainNode, Policy, PreAuthKey, Session, User};
+pub use store::{SqliteStore, Store, StoreError};
 
 /// Minimum capability version accepted by the control plane.
 pub const MIN_SUPPORTED_CAPVER: u32 = 113;
+
+/// Default IPv4 tailnet prefix.
+pub const DEFAULT_IPV4_PREFIX: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 0);
+/// Default IPv4 prefix length.
+pub const DEFAULT_IPV4_PREFIX_LEN: u8 = 10;
+/// Default IPv6 tailnet prefix.
+pub const DEFAULT_IPV6_PREFIX: Ipv6Addr = Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 0);
+/// Default IPv6 prefix length.
+pub const DEFAULT_IPV6_PREFIX_LEN: u8 = 48;
 
 /// Static timestamp used for the M0 static MapResponse. A real clock is
 /// layered on in M1 when persistence and sessions are introduced.
 const CONTROL_TIME: &str = "2026-08-20T00:00:00Z";
 
-/// Configuration for the in-memory control plane.
+/// Configuration for the control plane.
 #[derive(Clone, Debug)]
 pub struct ControlConfig {
     /// The single static pre-auth key accepted by this server.
@@ -39,6 +58,14 @@ pub struct ControlConfig {
     pub user_login_name: String,
     /// Display name shown in user profiles.
     pub user_display_name: String,
+    /// IPv4 prefix used for node address allocation.
+    pub ipv4_prefix: Ipv4Addr,
+    /// IPv4 prefix length.
+    pub ipv4_prefix_len: u8,
+    /// IPv6 prefix used for node address allocation.
+    pub ipv6_prefix: Ipv6Addr,
+    /// IPv6 prefix length.
+    pub ipv6_prefix_len: u8,
 }
 
 impl Default for ControlConfig {
@@ -69,17 +96,12 @@ impl Default for ControlConfig {
             login_id: 1,
             user_login_name: "owner@example.com".to_string(),
             user_display_name: "Owner".to_string(),
+            ipv4_prefix: DEFAULT_IPV4_PREFIX,
+            ipv4_prefix_len: DEFAULT_IPV4_PREFIX_LEN,
+            ipv6_prefix: DEFAULT_IPV6_PREFIX,
+            ipv6_prefix_len: DEFAULT_IPV6_PREFIX_LEN,
         }
     }
-}
-
-/// A registered node held in the in-memory table.
-#[derive(Clone, Debug)]
-struct NodeRecord {
-    node: Node,
-    machine_key: MachineKey,
-    hostinfo: Option<Hostinfo>,
-    endpoints: Vec<String>,
 }
 
 /// Errors returned by the control plane.
@@ -89,8 +111,10 @@ pub enum ControlError {
     NotFound,
     /// The client capability version is below the supported minimum.
     UnsupportedVersion(u32),
-    /// The supplied auth key is invalid.
-    InvalidAuth,
+    /// A persistence operation failed.
+    Store(String),
+    /// The IP allocator could not find a free address.
+    IpAllocation,
     /// JSON serialization failed.
     Json,
     /// MapResponse framing failed.
@@ -104,7 +128,8 @@ impl std::fmt::Display for ControlError {
         match self {
             Self::NotFound => write!(f, "node not found or machine key mismatch"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported capability version {v}"),
-            Self::InvalidAuth => write!(f, "invalid auth key"),
+            Self::Store(e) => write!(f, "store error: {e}"),
+            Self::IpAllocation => write!(f, "no free tailnet IP available"),
             Self::Json => write!(f, "failed to serialize JSON"),
             Self::Frame => write!(f, "failed to frame MapResponse"),
             Self::Zstd => write!(f, "failed to compress MapResponse"),
@@ -132,25 +157,37 @@ pub enum MapOutcome {
     },
 }
 
-/// In-memory control plane shared by the server router.
+/// Control plane shared by the server router.
 pub struct ControlPlane {
     config: ControlConfig,
-    nodes: Mutex<BTreeMap<NodeKey, NodeRecord>>,
-    next_id: AtomicU64,
-    next_ipv4: AtomicU32,
-    next_ipv6: AtomicU32,
+    store: Arc<dyn Store>,
 }
 
 impl ControlPlane {
-    /// Create a control plane with the given configuration.
+    /// Create a control plane with an in-memory SQLite store.
+    ///
+    /// Panics if the in-memory store cannot be created; use [`Self::try_new`]
+    /// when the caller needs to handle that failure.
     pub fn new(config: ControlConfig) -> Self {
-        Self {
-            config,
-            nodes: Mutex::new(BTreeMap::new()),
-            next_id: AtomicU64::new(1),
-            next_ipv4: AtomicU32::new(1),
-            next_ipv6: AtomicU32::new(1),
-        }
+        Self::try_new(config).expect("in-memory SQLite store")
+    }
+
+    /// Create a control plane with an in-memory SQLite store, returning an
+    /// error if the store cannot be initialized.
+    pub fn try_new(config: ControlConfig) -> Result<Self, StoreError> {
+        let store = SqliteStore::open_in_memory()?;
+        Ok(Self::with_store(config, Arc::new(store)))
+    }
+
+    /// Open a control plane backed by a SQLite database file.
+    pub fn open_sqlite(config: ControlConfig, path: &Path) -> Result<Self, StoreError> {
+        let store = SqliteStore::open(path)?;
+        Ok(Self::with_store(config, Arc::new(store)))
+    }
+
+    /// Create a control plane with an explicit store.
+    pub fn with_store(config: ControlConfig, store: Arc<dyn Store>) -> Self {
+        Self { config, store }
     }
 
     /// Register a node key for the given Noise machine key.
@@ -163,10 +200,16 @@ impl ControlPlane {
         machine_key: MachineKey,
         request: RegisterRequest,
     ) -> Result<RegisterResponse, ControlError> {
-        let mut nodes = self.nodes.lock().unwrap();
+        self.ensure_default_user()?;
 
-        if let Some(record) = nodes.get(&request.node_key) {
-            if record.machine_key == machine_key {
+        if let Some(node) = self
+            .store
+            .get_node_by_node_key(&request.node_key)
+            .map_err(|e| ControlError::Store(e.to_string()))?
+        {
+            if node.machine_key == machine_key {
+                // TODO(M1): refresh hostinfo and capability version on
+                // re-registration instead of returning early.
                 return Ok(self.authorized_response());
             }
             return Ok(RegisterResponse {
@@ -189,9 +232,30 @@ impl ControlPlane {
             });
         }
 
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let ipv4 = self.next_ipv4.fetch_add(1, Ordering::Relaxed);
-        let ipv6 = self.next_ipv6.fetch_add(1, Ordering::Relaxed);
+        let nodes = self
+            .store
+            .list_nodes()
+            .map_err(|e| ControlError::Store(e.to_string()))?;
+        let mut used_ipv4 = HashSet::new();
+        let mut used_ipv6 = HashSet::new();
+        for address in nodes.iter().flat_map(|n| n.addresses.iter()) {
+            let host = address.split('/').next().unwrap_or(address);
+            if let Ok(v4) = host.parse::<Ipv4Addr>() {
+                used_ipv4.insert(v4);
+            } else if let Ok(v6) = host.parse::<Ipv6Addr>() {
+                used_ipv6.insert(v6);
+            }
+        }
+
+        let allocator = IpAllocator::new(
+            self.config.ipv4_prefix,
+            self.config.ipv4_prefix_len,
+            self.config.ipv6_prefix,
+            self.config.ipv6_prefix_len,
+        );
+        let (ipv4, ipv6) = allocator
+            .allocate(&used_ipv4, &used_ipv6)
+            .map_err(|_| ControlError::IpAllocation)?;
 
         let hostname = request
             .hostinfo
@@ -203,20 +267,16 @@ impl ControlPlane {
                     Some(h.hostname.clone())
                 }
             })
-            .unwrap_or_else(|| format!("node{id}"));
+            .unwrap_or_else(|| "node".to_string());
 
-        let addresses = vec![
-            format!("100.64.0.{ipv4}/32"),
-            format!("fd7a:115c:a1e0::{ipv6:x}/128"),
-        ];
-
-        let node = Node {
-            id,
-            stable_id: format!("n{id:023}"),
+        let addresses = vec![format!("{ipv4}/32"), format!("{ipv6}/128")];
+        let domain_node = DomainNode {
+            id: 0,
+            stable_id: String::new(),
             name: format!("{hostname}.{}.", self.config.tailnet_domain),
-            user: self.config.user_id,
-            key: request.node_key,
-            machine: machine_key,
+            user_id: self.config.user_id as i64,
+            node_key: request.node_key,
+            machine_key,
             disco_key: crabscale_proto::DiscoKey::from_bytes([0u8; 32]),
             addresses: addresses.clone(),
             allowed_ips: Some(addresses),
@@ -225,19 +285,51 @@ impl ControlPlane {
             hostinfo: request.hostinfo.clone(),
             created: CONTROL_TIME.to_string(),
             cap: request.version,
+            tags: None,
             machine_authorized: true,
-            ..Default::default()
         };
-
-        let record = NodeRecord {
-            node: node.clone(),
-            machine_key,
-            hostinfo: request.hostinfo.clone(),
-            endpoints: Vec::new(),
-        };
-        nodes.insert(request.node_key, record);
+        self.store
+            .upsert_node(&domain_node)
+            .map_err(|e| ControlError::Store(e.to_string()))?;
 
         Ok(self.authorized_response())
+    }
+
+    fn ensure_default_user(&self) -> Result<(), ControlError> {
+        let user_id = self.config.user_id as i64;
+        if self
+            .store
+            .get_user(user_id)
+            .map_err(|e| ControlError::Store(e.to_string()))?
+            .is_none()
+        {
+            self.store
+                .create_user(&User {
+                    id: user_id,
+                    login_name: self.config.user_login_name.clone(),
+                    display_name: self.config.user_display_name.clone(),
+                    created_at: CONTROL_TIME.to_string(),
+                })
+                .map_err(|e| ControlError::Store(e.to_string()))?;
+        }
+        let login_id = self.config.login_id as i64;
+        if self
+            .store
+            .get_login(login_id)
+            .map_err(|e| ControlError::Store(e.to_string()))?
+            .is_none()
+        {
+            self.store
+                .create_login(&Login {
+                    id: login_id,
+                    user_id,
+                    provider: "authkey".to_string(),
+                    login_name: self.config.user_login_name.clone(),
+                    created_at: CONTROL_TIME.to_string(),
+                })
+                .map_err(|e| ControlError::Store(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Handle a MapRequest for the given Noise machine key.
@@ -250,16 +342,17 @@ impl ControlPlane {
             return Err(ControlError::UnsupportedVersion(request.version));
         }
 
-        let mut nodes = self.nodes.lock().unwrap();
-        let record = nodes
-            .get_mut(&request.node_key)
-            .filter(|r| r.machine_key == machine_key)
+        let mut node = self
+            .store
+            .get_node_by_node_key(&request.node_key)
+            .map_err(|e| ControlError::Store(e.to_string()))?
+            .filter(|n| n.machine_key == machine_key)
             .ok_or(ControlError::NotFound)?;
 
         // The disco key is only carried in MapRequest, not RegisterRequest, so
         // apply it here so the first MapResponse advertises the client's real
         // disco key (Spec-NetMap §3).
-        record.node.disco_key = request.disco_key;
+        node.disco_key = request.disco_key;
 
         let streaming = request.stream;
         let lite_update = !streaming && request.omit_peers && !request.read_only;
@@ -268,22 +361,23 @@ impl ControlPlane {
         // and endpoints for state updates.
         if !streaming {
             if let Some(hostinfo) = &request.hostinfo {
-                record.hostinfo = Some(hostinfo.clone());
-                record.node.hostinfo = Some(hostinfo.clone());
+                node.hostinfo = Some(hostinfo.clone());
             }
             if !request.endpoints.is_empty() {
-                record.endpoints = request.endpoints.clone();
-                record.node.endpoints = request.endpoints.clone();
+                node.endpoints = request.endpoints.clone();
             }
         }
+        self.store
+            .upsert_node(&node)
+            .map_err(|e| ControlError::Store(e.to_string()))?;
 
         if lite_update {
             return Ok(MapOutcome::LiteUpdate);
         }
 
-        let node = record.node.clone();
+        let proto_node = node.to_proto();
         let compress = request.compress == "zstd";
-        let response = self.build_initial_map(&node, &request);
+        let response = self.build_initial_map(&proto_node, &request);
         let frame = self.encode_frame(&response, compress)?;
 
         if streaming {
@@ -367,7 +461,7 @@ impl ControlPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crabscale_proto::{DiscoKey, MapRequest, RegisterRequest};
+    use crabscale_proto::{DiscoKey, Hostinfo, MapRequest, NodeKey, RegisterRequest};
 
     fn test_plane() -> ControlPlane {
         ControlPlane::new(ControlConfig::default())
@@ -451,6 +545,10 @@ mod tests {
                 "discokey:3333333333333333333333333333333333333333333333333333333333333333"
             )
         );
+        assert_eq!(
+            json["Node"]["StableID"],
+            serde_json::json!("n00000000000000000000001")
+        );
     }
 
     #[test]
@@ -488,6 +586,41 @@ mod tests {
         let json = zstd::stream::decode_all(payload).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(value["KeepAlive"], true);
+    }
+
+    #[test]
+    fn restart_preserves_registered_node_and_map() {
+        let dir = std::env::temp_dir().join(format!("crabscale-control-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("restart.sqlite");
+
+        {
+            let plane = ControlPlane::open_sqlite(ControlConfig::default(), &db_path).unwrap();
+            let response = plane
+                .register(test_machine_key(), test_register_request())
+                .unwrap();
+            assert!(response.machine_authorized);
+        }
+
+        // Reopen the same database file and map with the same machine key.
+        let plane = ControlPlane::open_sqlite(ControlConfig::default(), &db_path).unwrap();
+        let request = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: false,
+            ..Default::default()
+        };
+        let outcome = plane.handle_map(test_machine_key(), request).unwrap();
+        let MapOutcome::FullFrame(frame) = outcome else {
+            panic!("expected full frame after restart");
+        };
+        let (payload, consumed) = crabscale_proto::decode_map_response_frame(&frame).unwrap();
+        assert_eq!(consumed, frame.len());
+        let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert!(json.get("Node").is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
