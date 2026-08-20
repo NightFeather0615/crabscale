@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Cargo caching uses Swatinem/rust-cache@v2, which keys on the runner OS,
+# Cargo.lock, and the active Rust toolchain. A toolchain or dependency bump
+# therefore produces a new cache key instead of reusing stale artifacts.
 jobs:
   fmt:
     name: Format
@@ -17,6 +20,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --check
 
@@ -28,6 +33,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -37,6 +44,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
       - name: Run workspace tests
         run: cargo test --workspace
 
@@ -46,5 +55,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
       - name: Run M0-05 smoke test
         run: ./scripts/smoke-test.sh
