@@ -152,8 +152,15 @@ async fn handle_request(
     }
 
     // `GET /bootstrap-dns` serves the relay's bootstrap DNS snapshot. When no
-    // snapshot is configured the router returns 404.
-    if method == http::Method::GET && path == "/bootstrap-dns" {
+    // snapshot is configured the router returns 404, and any non-GET method
+    // is rejected with 405 (Spec-Control-API, Bootstrap DNS).
+    if path == "/bootstrap-dns" {
+        if method != http::Method::GET {
+            return Ok(plain_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
+        }
         let q = query_param(req.uri().query(), "q");
         let response = router.handle_bootstrap_dns(q);
         return Ok(response.map(Full::new));

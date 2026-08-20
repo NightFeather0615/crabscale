@@ -130,6 +130,19 @@ async fn bootstrap_dns_over_http_serves_configured_snapshot() {
 }
 
 #[tokio::test]
+async fn bootstrap_dns_rejects_non_get_method() {
+    let (head, _body) = send_raw(
+        "POST /bootstrap-dns HTTP/1.1
+Host: localhost
+Connection: close
+
+",
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 405"), "head: {head}");
+}
+
+#[tokio::test]
 async fn bootstrap_dns_unconfigured_returns_404() {
     let (head, _body) =
         send_raw("GET /bootstrap-dns HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
