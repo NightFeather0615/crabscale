@@ -423,6 +423,16 @@ impl ControlPlane {
         self.sessions.lock().unwrap().is_online(node_id)
     }
 
+    /// Number of live map sessions currently open for a node.
+    ///
+    /// This is the counter harness used by the performance/concurrency smoke
+    /// tests to prove that every connect is paired with a disconnect: after a
+    /// session closes the count must return to zero, so a leaked stream cannot
+    /// hide inside the reconnect grace window (M3-04).
+    pub fn live_session_count(&self, node_id: i64) -> usize {
+        self.sessions.lock().unwrap().live_sessions(node_id)
+    }
+
     /// The protocol version advertised to clients by `/machine/whoami`.
     pub fn protocol_version(&self) -> u16 {
         self.config.protocol_version
@@ -4183,5 +4193,292 @@ mod tests {
         let empty = ChangeBatch::default();
         let delta = plane.build_delta(node_id, &empty, &mut last_sent).unwrap();
         assert!(delta.is_none(), "no changes means no delta frame");
+    }
+
+    // ---------------------------------------------------------------------
+    // M3-04 performance and concurrency smoke tests.
+    //
+    // These follow the wiki "Performance smoke test": smoke thresholds that
+    // catch pathological regressions, not benchmarks for tuning. The
+    // 200-node build/encode benchmark is #[ignore]d so the normal suite
+    // stays fast and timing-independent; the CI perf-smoke job runs it under
+    // a time budget via `scripts/perf-smoke.sh` and reports build time and
+    // peak memory. The concurrency and session-leak scenarios are
+    // deterministic and run in the regular suite.
+    // ---------------------------------------------------------------------
+
+    /// Register `count` nodes, each with a distinct machine/node key.
+    fn register_nodes(plane: &ControlPlane, count: usize) {
+        for i in 0..count as u8 {
+            let mut request = test_register_request();
+            let mut node_bytes = [0x22u8; 32];
+            node_bytes[0] = i;
+            request.node_key = NodeKey::from_bytes(node_bytes);
+            let mut machine_bytes = [0x11u8; 32];
+            machine_bytes[0] = i;
+            let machine = MachineKey::from_bytes(machine_bytes);
+            let response = plane.register(machine, request);
+            assert!(
+                response.machine_authorized,
+                "node {i} must register, got {:?}",
+                response
+            );
+        }
+    }
+
+    /// A non-streaming map request for `node` that asks for a complete frame.
+    fn full_map_request(node: &DomainNode) -> MapRequest {
+        MapRequest {
+            version: 130,
+            node_key: node.node_key,
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: false,
+            ..Default::default()
+        }
+    }
+
+    /// Decode a full MapResponse frame and return the parsed peer count.
+    ///
+    /// When `compressed` is set the payload is first zstd-decompressed, since
+    /// the wire layer frames the compressed bytes as-is (Spec-NetMap §6).
+    fn decoded_peer_count(frame: &[u8], compressed: bool) -> usize {
+        let (payload, consumed) =
+            crabscale_proto::decode_map_response_frame(frame).expect("frame must decode");
+        assert_eq!(consumed, frame.len(), "frame must be exactly one message");
+        let json = if compressed {
+            zstd::stream::decode_all(payload).expect("zstd payload must decompress")
+        } else {
+            payload.to_vec()
+        };
+        let response: MapResponse =
+            serde_json::from_slice(&json).expect("frame payload must parse as MapResponse");
+        response.peers.as_ref().map(Vec::len).unwrap_or(0)
+    }
+
+    #[test]
+    fn perf_50_concurrent_lite_updates_do_not_panic() {
+        const NODES: usize = 50;
+        let plane = Arc::new(test_plane());
+        register_nodes(&plane, NODES);
+
+        let stored = Arc::new(plane.store.list_nodes().unwrap());
+        assert_eq!(stored.len(), NODES);
+
+        let mut handles = Vec::new();
+        for i in 0..NODES {
+            let plane = plane.clone();
+            let stored = stored.clone();
+            handles.push(std::thread::spawn(move || {
+                let node = &stored[i];
+                let request = MapRequest {
+                    version: 130,
+                    node_key: node.node_key,
+                    disco_key: DiscoKey::from_bytes([0x40 | i as u8; 32]),
+                    stream: false,
+                    omit_peers: true,
+                    read_only: false,
+                    hostinfo: Some(Hostinfo {
+                        hostname: format!("node-{i}"),
+                        ..Default::default()
+                    }),
+                    endpoints: vec![format!("192.0.2.{i}:41641")],
+                    endpoint_types: vec![1],
+                    ..Default::default()
+                };
+                let outcome = plane.handle_map(node.machine_key, request).unwrap();
+                assert!(
+                    matches!(outcome, MapOutcome::LiteUpdate),
+                    "concurrent update must be a lite update"
+                );
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .expect("concurrent lite update thread must not panic");
+        }
+
+        // Every node still maps a complete frame and sees every other peer.
+        let stored = plane.store.list_nodes().unwrap();
+        for node in &stored {
+            let outcome = plane
+                .handle_map(node.machine_key, full_map_request(node))
+                .unwrap();
+            let MapOutcome::FullFrame(frame) = outcome else {
+                panic!("expected a full frame");
+            };
+            assert_eq!(
+                decoded_peer_count(&frame, false),
+                NODES - 1,
+                "node {} must still see every peer after concurrent updates",
+                node.id
+            );
+        }
+    }
+
+    #[test]
+    fn perf_100_connect_disconnect_cycles_do_not_leak_sessions() {
+        // A zero reconnect grace makes the offline transition land immediately,
+        // so the counter harness can prove that every close releases the
+        // session without waiting out the default 10s window.
+        let plane = ControlPlane::new(ControlConfig {
+            policy: allow_all_policy(),
+            reconnect_grace_seconds: 0,
+            ..ControlConfig::default()
+        });
+        register_nodes(&plane, 1);
+        let node = plane.store.list_nodes().unwrap().remove(0);
+
+        for cycle in 0..100usize {
+            let session_id = plane.open_session(node.id, false);
+            assert_eq!(
+                plane.live_session_count(node.id),
+                1,
+                "cycle {cycle}: exactly one live session while connected"
+            );
+            plane.close_session(session_id);
+            assert_eq!(
+                plane.live_session_count(node.id),
+                0,
+                "cycle {cycle}: closing the session must release it"
+            );
+        }
+
+        // After the final cycle nothing may remain hidden in the registry.
+        assert_eq!(plane.live_session_count(node.id), 0);
+        let events = plane.reap_sessions();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Offline(id) if *id == node.id)),
+            "the node must be marked offline once its sessions are gone"
+        );
+        assert!(!plane.is_node_online(node.id), "node must not stay online");
+    }
+
+    #[tokio::test]
+    async fn perf_background_tasks_are_spawned_exactly_once() {
+        let plane = Arc::new(test_plane());
+
+        // Only the first caller may own the single reaper slot...
+        assert!(plane.claim_reaper(), "first reaper claim wins");
+        assert!(!plane.claim_reaper(), "second reaper claim must be a no-op");
+
+        // ...and at most one change-batcher sweeper runs per plane.
+        assert!(
+            plane.spawn_change_batcher().is_some(),
+            "first sweeper spawns"
+        );
+        assert!(
+            plane.spawn_change_batcher().is_none(),
+            "a second sweeper must not be spawned (no duplicate tasks)"
+        );
+
+        // The single sweeper coalesces a burst into one ordered batch.
+        let mut rx = plane.subscribe_changes();
+        plane.publish_change(ChangeEvent::NodeChanged(1));
+        plane.publish_change(ChangeEvent::PeerSeen(2));
+        let batch = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("sweeper delivers within the batch window")
+            .expect("a batch broadcast");
+        assert_eq!(
+            batch.events,
+            vec![ChangeEvent::NodeChanged(1), ChangeEvent::PeerSeen(2)]
+        );
+    }
+
+    #[test]
+    #[ignore = "timing-sensitive; run under the CI perf-smoke time budget (scripts/perf-smoke.sh)"]
+    fn perf_200_node_full_map_build_and_encode() {
+        const NODES: usize = 200;
+        const SAMPLES: usize = 25;
+        const MAP_BUILD_BUDGET_MS: f64 = 500.0;
+        const ENCODE_RAW_BUDGET_MS: f64 = 300.0;
+        const ENCODE_ZSTD_BUDGET_MS: f64 = 500.0;
+
+        let plane = test_plane();
+        register_nodes(&plane, NODES);
+
+        let stored = plane.store.list_nodes().unwrap();
+        assert_eq!(stored.len(), NODES);
+        // The last registered node observes every other node (199 peers).
+        let observer = &stored[NODES - 1];
+        let request = full_map_request(observer);
+
+        // Warm up caches and SQLite pages before sampling.
+        let warm = plane.build_initial_map(observer, &request).unwrap();
+        assert_eq!(
+            warm.peers.as_ref().map(Vec::len).unwrap_or(0),
+            NODES - 1,
+            "warm-up map must include every peer"
+        );
+
+        let mut build_min = f64::INFINITY;
+        let mut build_totals = 0.0f64;
+        let mut encode_raw_min = f64::INFINITY;
+        let mut encode_zstd_min = f64::INFINITY;
+        let mut first_raw_len = 0usize;
+        let mut first_zstd_len = 0usize;
+
+        for sample in 0..SAMPLES {
+            let start = std::time::Instant::now();
+            let response = plane.build_initial_map(observer, &request).unwrap();
+            let build_ms = start.elapsed().as_secs_f64() * 1000.0;
+            build_min = build_min.min(build_ms);
+            build_totals += build_ms;
+            assert_eq!(
+                response.peers.as_ref().map(Vec::len).unwrap_or(0),
+                NODES - 1,
+                "sample {sample} must carry the full peer set"
+            );
+
+            let start = std::time::Instant::now();
+            let raw = plane.encode_frame(&response, false).unwrap();
+            encode_raw_min = encode_raw_min.min(start.elapsed().as_secs_f64() * 1000.0);
+            let _ = decoded_peer_count(&raw, false);
+            first_raw_len = raw.len();
+
+            let start = std::time::Instant::now();
+            let zstd = plane.encode_frame(&response, true).unwrap();
+            encode_zstd_min = encode_zstd_min.min(start.elapsed().as_secs_f64() * 1000.0);
+            let _ = decoded_peer_count(&zstd, true);
+            first_zstd_len = zstd.len();
+        }
+
+        let build_avg_ms = build_totals / SAMPLES as f64;
+        // Machine-parseable lines the perf-smoke script reports to CI.
+        println!("perf_nodes={NODES}");
+        println!("perf_peer_count={}", NODES - 1);
+        println!("perf_samples={SAMPLES}");
+        println!("perf_map_build_min_ms={build_min:.2}");
+        println!("perf_map_build_avg_ms={build_avg_ms:.2}");
+        println!("perf_encode_raw_min_ms={encode_raw_min:.2}");
+        println!("perf_encode_zstd_min_ms={encode_zstd_min:.2}");
+        println!("perf_first_frame_raw_bytes={first_raw_len}");
+        println!("perf_first_frame_zstd_bytes={first_zstd_len}");
+
+        // Smoke budgets: generous enough for a shared CI runner, but tight
+        // enough to catch a regression that costs an order of magnitude.
+        assert!(
+            build_min < MAP_BUILD_BUDGET_MS,
+            "200-node map build crossed the {MAP_BUILD_BUDGET_MS:.0}ms smoke budget ({build_min:.2}ms)"
+        );
+        assert!(
+            encode_raw_min < ENCODE_RAW_BUDGET_MS,
+            "raw encode crossed the {ENCODE_RAW_BUDGET_MS:.0}ms smoke budget ({encode_raw_min:.2}ms)"
+        );
+        assert!(
+            encode_zstd_min < ENCODE_ZSTD_BUDGET_MS,
+            "zstd encode crossed the {ENCODE_ZSTD_BUDGET_MS:.0}ms smoke budget ({encode_zstd_min:.2}ms)"
+        );
+        assert!(
+            first_raw_len < crabscale_proto::MAX_MAP_RESPONSE_PAYLOAD_LEN,
+            "raw 200-node frame ({first_raw_len}B) must fit the frame payload limit"
+        );
+        assert!(
+            first_zstd_len < crabscale_proto::MAX_MAP_RESPONSE_PAYLOAD_LEN,
+            "zstd 200-node frame ({first_zstd_len}B) must fit the frame payload limit"
+        );
     }
 }

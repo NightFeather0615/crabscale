@@ -60,6 +60,22 @@ jobs:
       - name: Run M0-05 smoke test
         run: ./scripts/smoke-test.sh
 
+  perf-smoke:
+    name: Performance smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Run M3-04 performance smoke
+        run: ./scripts/perf-smoke.sh --report perf-smoke-report.md
+      - name: Upload performance smoke report
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-smoke-report
+          path: perf-smoke-report.md
+
   harness:
     name: Client compatibility harness
     runs-on: ubuntu-latest
