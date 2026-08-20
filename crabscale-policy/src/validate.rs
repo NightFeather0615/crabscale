@@ -380,6 +380,16 @@ struct Ctx<'a> {
 impl<'a> Ctx<'a> {
     /// Build an error located at the first line of `source` that contains
     /// `needle`, falling back to line 1.
+    ///
+    /// # Known limitation
+    ///
+    /// `locate_line` is a substring heuristic rather than true parser
+    /// position tracking, so the reported line can be slightly imprecise when
+    /// the offending token also appears elsewhere (for example an unknown key
+    /// `"acl"` matching the line that contains `"acls"`), and structural
+    /// errors such as a wrong top-level value type always fall back to line 1.
+    /// The guarantee promised by the issue is only that every semantic error
+    /// carries *a* line number, which this satisfies.
     fn error_here(&self, needle: &str, message: impl Into<String>) -> HujsonError {
         let line = locate_line(self.source, needle);
         HujsonError::at_line(line, message)
@@ -398,6 +408,12 @@ fn locate_line(source: &str, needle: &str) -> usize {
 
 /// A source target: `*`, `autogroup:x`, `group:x`, `tag:x`, `user@host`,
 /// or an IP/CIDR.
+///
+/// Validation is intentionally structural for this milestone: any non-empty
+/// `group:`/`tag:`/`autogroup:` suffix and any non-empty `user@host` is
+/// accepted, and the host portion of `user@host` (which may even contain
+/// spaces) is not resolved. Tighter checks belong to the later packet-filter
+/// compilation step.
 fn is_principal(target: &str) -> bool {
     if target == "*" {
         return true;
@@ -419,6 +435,11 @@ fn is_principal(target: &str) -> bool {
 
 /// A destination target: everything `is_principal` accepts plus an optional
 /// `:portlist` suffix (and bracketed IPv6 addresses).
+///
+/// Like [`is_principal`], prefix references (`group:x`, `tag:x`, ...) accept
+/// any non-empty suffix, so `tag:x:443` is allowed without validating that the
+/// port suffix is well formed; port-list grammar is only checked for literal
+/// `host:portlist` forms.
 fn is_dst(target: &str) -> bool {
     if target == "*" {
         return true;

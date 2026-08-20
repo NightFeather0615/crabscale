@@ -12,6 +12,13 @@
 //! - malformed input never panics; every failure is returned as a
 //!   [`HujsonError`].
 //!
+//! # Known divergences from strict JSON
+//!
+//! - Nesting is capped at [`MAX_DEPTH`] so pathological input reports an
+//!   error instead of overflowing the stack.
+//! - Lone surrogate escapes such as `"\uD800"` cannot be represented in a
+//!   Rust `String`; they are replaced with U+FFFD rather than rejected.
+//!
 //! [Spec-Policy]: https://github.com/NightFeather0615/crabscale/wiki/Spec-Policy.md
 
 use serde_json::{Map, Number, Value};
@@ -36,6 +43,13 @@ pub fn parse(text: &str) -> Result<Value, HujsonError> {
     Ok(value)
 }
 
+/// Maximum container nesting depth accepted by the parser.
+///
+/// This mirrors serde_json's default recursion limit and prevents a
+/// pathological input from overflowing the stack. See
+/// <https://github.com/serde-rs/json/blob/master/src/de.rs>.
+const MAX_DEPTH: usize = 128;
+
 struct Parser {
     chars: Vec<char>,
     pos: usize,
@@ -43,6 +57,8 @@ struct Parser {
     line: usize,
     /// 1-based column of `pos`.
     col: usize,
+    /// Current container nesting depth, guarded by [`MAX_DEPTH`].
+    depth: usize,
 }
 
 impl Parser {
@@ -52,7 +68,21 @@ impl Parser {
             pos: 0,
             line: 1,
             col: 1,
+            depth: 0,
         }
+    }
+
+    /// Guard one level of object/array nesting against [`MAX_DEPTH`].
+    fn enter_nested(&mut self) -> Result<(), HujsonError> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(self.err_here(format!("maximum nesting depth of {MAX_DEPTH} exceeded")));
+        }
+        Ok(())
+    }
+
+    fn leave_nested(&mut self) {
+        self.depth -= 1;
     }
 
     fn peek(&self) -> Option<char> {
@@ -157,6 +187,13 @@ impl Parser {
     }
 
     fn parse_object(&mut self) -> Result<Value, HujsonError> {
+        self.enter_nested()?;
+        let result = self.parse_object_inner();
+        self.leave_nested();
+        result
+    }
+
+    fn parse_object_inner(&mut self) -> Result<Value, HujsonError> {
         self.expect('{', "when starting an object")?;
         let mut map = Map::new();
         self.skip_ws()?;
@@ -212,6 +249,13 @@ impl Parser {
     }
 
     fn parse_array(&mut self) -> Result<Value, HujsonError> {
+        self.enter_nested()?;
+        let result = self.parse_array_inner();
+        self.leave_nested();
+        result
+    }
+
+    fn parse_array_inner(&mut self) -> Result<Value, HujsonError> {
         self.expect('[', "when starting an array")?;
         let mut values = Vec::new();
         self.skip_ws()?;
@@ -632,6 +676,25 @@ mod tests {
         assert_eq!(
             parse_ok(r#"{ "url": "http://example.com/x", }"#),
             serde_json::json!({ "url": "http://example.com/x" })
+        );
+    }
+
+    #[test]
+    fn shallow_nesting_within_limit_is_accepted() {
+        let input = format!("{}0{}", "[".repeat(100), "]".repeat(100));
+        assert!(parse(&input).is_ok());
+    }
+
+    #[test]
+    fn pathological_nesting_is_rejected_not_crashed() {
+        // A few hundred nested brackets must fail with an error instead of
+        // overflowing the stack (regression test for the review finding).
+        let input = format!("{}0{}", "[".repeat(500), "]".repeat(500));
+        let err = parse(&input).expect_err("deep nesting must fail");
+        assert!(
+            err.message.contains("nesting depth"),
+            "unexpected message: {}",
+            err.message
         );
     }
 }

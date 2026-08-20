@@ -93,3 +93,21 @@ fn minimal_allow_all_example_parses_to_expected_model() {
     assert!(policy.ssh_tests.is_empty());
     let _ = Policy::default();
 }
+
+#[test]
+fn policy_test_legacy_aliases_parse() {
+    // `user` and `allow` are legacy aliases for `src` and `accept`.
+    let text = r#"{
+  "acls": [
+    { "action": "accept", "src": ["*"], "dst": ["*:*"] }
+  ],
+  "tests": [
+    { "user": "alice@example.com", "allow": ["tag:web:443"], "deny": ["10.0.0.99:22"] }
+  ]
+}"#;
+    let policy = parse_policy(text).expect("legacy aliases must parse");
+    assert_eq!(policy.tests.len(), 1);
+    assert_eq!(policy.tests[0].src, "alice@example.com");
+    assert_eq!(policy.tests[0].accept, vec!["tag:web:443".to_string()]);
+    assert_eq!(policy.tests[0].deny, vec!["10.0.0.99:22".to_string()]);
+}

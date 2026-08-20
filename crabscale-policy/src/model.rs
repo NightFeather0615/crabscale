@@ -130,26 +130,25 @@ pub struct NodeAttrGrant {
 }
 
 /// A declarative ACL test executed against the compiled policy.
+///
+/// The legacy `user` and `allow` names are accepted as aliases for `src` and
+/// `accept` respectively, so tests written against the old vocabulary keep
+/// working.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyTest {
-    /// Source principal being tested.
+    /// Source principal being tested (legacy alias `user` accepted).
+    #[serde(alias = "user")]
     pub src: String,
-    /// Legacy alias for `src`.
-    #[serde(default)]
-    pub user: Option<String>,
     /// Optional protocol under test.
     #[serde(default)]
     pub proto: Option<String>,
-    /// Destinations that must be reachable.
-    #[serde(default)]
+    /// Destinations that must be reachable (legacy alias `allow` accepted).
+    #[serde(default, alias = "allow")]
     pub accept: Vec<String>,
     /// Destinations that must be unreachable.
     #[serde(default)]
     pub deny: Vec<String>,
-    /// Legacy alias for `accept`.
-    #[serde(default)]
-    pub allow: Vec<String>,
 }
 
 /// A declarative Tailscale SSH test.
