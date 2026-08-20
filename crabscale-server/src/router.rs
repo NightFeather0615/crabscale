@@ -184,6 +184,11 @@ impl ControlRouter {
                 self.handle_logout(&mut respond, machine_key, &body_bytes)
                     .await;
             }
+            ("GET", path) if parse_ssh_action_path(path).is_some() => {
+                let (src, dst) = parse_ssh_action_path(path).expect("just checked");
+                self.handle_ssh_action(&mut respond, machine_key, &parts.uri, src, dst)
+                    .await;
+            }
             ("POST", "/machine/set-dns")
             | ("PATCH", "/machine/set-device-attr")
             | ("POST", "/machine/audit-log")
@@ -199,6 +204,47 @@ impl ControlRouter {
             }
             _ => {
                 send_plain(&mut respond, StatusCode::NOT_FOUND, b"not found");
+            }
+        }
+    }
+
+    async fn handle_ssh_action(
+        &self,
+        respond: &mut SendResponse<Bytes>,
+        machine_key: MachineKey,
+        uri: &http::Uri,
+        src_node_id: u64,
+        dst_node_id: u64,
+    ) {
+        let query = uri.query().unwrap_or("");
+        let params = parse_query(query);
+        let auth_id = params.get("auth_id").map(String::as_str);
+        let ssh_user = params.get("ssh_user").cloned().unwrap_or_default();
+        let local_user = params.get("local_user").cloned().unwrap_or_default();
+
+        match self
+            .control
+            .handle_ssh_action(machine_key, src_node_id, dst_node_id, auth_id, &ssh_user, &local_user)
+            .await
+        {
+            Ok(action) => {
+                let body = serde_json::to_vec(&action).unwrap_or_default();
+                send_json(respond, StatusCode::OK, body);
+            }
+            Err(ControlError::NotFound) => {
+                send_plain(respond, StatusCode::NOT_FOUND, b"node or auth not found");
+            }
+            Err(ControlError::Unauthorized) => {
+                send_plain(respond, StatusCode::UNAUTHORIZED, b"unauthorized");
+            }
+            Err(ControlError::SshBinding(_)) => {
+                send_plain(respond, StatusCode::BAD_REQUEST, b"ssh binding mismatch");
+            }
+            Err(ControlError::Timeout) => {
+                send_plain(respond, StatusCode::REQUEST_TIMEOUT, b"ssh approval timed out");
+            }
+            Err(_) => {
+                send_plain(respond, StatusCode::INTERNAL_SERVER_ERROR, b"internal error");
             }
         }
     }
@@ -412,6 +458,62 @@ where
     .await
 }
 
+/// Parse `/machine/ssh/action/{src}/to/{dst}` into `(src, dst)` node ids.
+fn parse_ssh_action_path(path: &str) -> Option<(u64, u64)> {
+    // Only the path component matters; a query string (if any) is stripped.
+    let path = path.split('?').next().unwrap_or(path);
+    let rest = path.strip_prefix("/machine/ssh/action/")?;
+    let (src, to) = rest.split_once("/to/")?;
+    let src = src.parse::<u64>().ok()?;
+    let dst = to.parse::<u64>().ok()?;
+    Some((src, dst))
+}
+
+/// Parse a URL query string into a decoded key/value map.
+fn parse_query(query: &str) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        map.insert(percent_decode(key), percent_decode(value));
+    }
+    map
+}
+
+/// Percent-decode a URL query component (`%XX` and `+` for space).
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Decode a single hex digit.
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn send_plain(respond: &mut SendResponse<Bytes>, status: StatusCode, text: &'static [u8]) {
     let response = Response::builder()
         .status(status)
@@ -605,5 +707,31 @@ mod tests {
             escape_html("<a href=\"x\">&'</a>"),
             "&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;"
         );
+    }
+
+    #[test]
+    fn parses_ssh_action_path() {
+        assert_eq!(
+            parse_ssh_action_path("/machine/ssh/action/3/to/9"),
+            Some((3, 9))
+        );
+        assert_eq!(
+            parse_ssh_action_path("/machine/ssh/action/12/to/34?auth_id=x"),
+            Some((12, 34))
+        );
+        assert_eq!(parse_ssh_action_path("/machine/map"), None);
+        assert_eq!(parse_ssh_action_path("/machine/ssh/action/a/to/9"), None);
+    }
+
+    #[test]
+    fn parses_and_decodes_query() {
+        let params = parse_query("auth_id=abc123&ssh_user=root&local_user=admin");
+        assert_eq!(params["auth_id"], "abc123");
+        assert_eq!(params["ssh_user"], "root");
+        assert_eq!(params["local_user"], "admin");
+
+        let encoded = parse_query("ssh_user=ro%20ot&local_user=a+b");
+        assert_eq!(encoded["ssh_user"], "ro ot");
+        assert_eq!(encoded["local_user"], "a b");
     }
 }
