@@ -61,3 +61,13 @@ Goal: make the server safe and repeatable to deploy.
 4. Backup, observability, documentation, gap analysis.
 
 Exit criteria: compatibility matrix report, security checklist, reproducible container image.
+
+
+## Issue index
+
+- M0: #1 workspace/CI, #2 wire types, #3 TS2021/Noise, #4 HTTP2 router + /key, #5 static register/map smoke.
+- M1: #6 domain/SQLite, #7 auth keys, #8 map updates/lite, #9 initial map/stream, #10 interactive auth, #11 sessions, #12 client harness.
+- M2: #13 HUJSON parser, #14 ACL/grants, #15 tags/autogroups/attrs, #16 routes/exit, #17 DNS/MagicDNS, #18 SSH check, #19 OIDC.
+- M3: #20 DERP core, #21 STUN/verify/DERP map, #22 incremental maps/batcher, #23 performance.
+- M4: #24 capability matrix, #25 security, #26 TLS/deployment, #27 backup/observability/docs.
+- Coordination: #28 roadmap index, #29 architecture review.
