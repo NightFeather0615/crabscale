@@ -1,10 +1,11 @@
 //! RFC 3339 helpers used for registration expiry semantics.
 //!
 //! The control plane compares client-supplied expiry timestamps against the
-//! current time. Only UTC timestamps in the `YYYY-MM-DDTHH:MM:SSZ` (or
-//! numeric UTC offset) form are accepted. Fractional seconds are explicitly
-//! rejected because the public API returns whole Unix seconds and silently
-//! truncating them would hide malformed input.
+//! current time. Only UTC timestamps in the `YYYY-MM-DDTHH:MM:SS[.frac]Z`
+//! (or numeric UTC offset) form are accepted. Fractional seconds are parsed
+//! and truncated to whole Unix seconds, matching Go's `time.Parse` semantics.
+//! Numeric offsets must use the RFC 3339 colon form (e.g. `+08:00`); the
+//! compact `+0800` form is not accepted.
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 
@@ -25,13 +26,10 @@ pub fn now_plus_seconds(secs: i64) -> String {
 
 /// Parse an RFC 3339 timestamp into Unix seconds.
 ///
-/// Fractional seconds are rejected: the API returns whole Unix seconds and
-/// silently truncating would hide malformed input.
+/// Fractional seconds are parsed and truncated to whole seconds, matching
+/// Go's `time.Parse` semantics.
 pub fn parse_rfc3339(s: &str) -> Option<i64> {
     let s = s.trim();
-    if s.contains('.') {
-        return None;
-    }
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.timestamp())
@@ -77,8 +75,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fractional_seconds() {
-        assert_eq!(parse_rfc3339("2026-08-20T00:00:00.123Z"), None);
+    fn parses_fractional_seconds() {
+        assert_eq!(parse_rfc3339("2026-08-20T00:00:00.123Z"), Some(1787184000));
+        assert_eq!(
+            parse_rfc3339("2026-08-20T00:00:00.999999999Z"),
+            Some(1787184000)
+        );
+        // Comma separators are not valid RFC 3339 and stay rejected.
         assert_eq!(parse_rfc3339("2026-08-20T00:00:00,123Z"), None);
     }
 
