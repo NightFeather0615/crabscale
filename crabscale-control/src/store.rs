@@ -278,9 +278,19 @@ impl Store for SqliteStore {
         } else {
             node.id
         };
+        let stable_id = if node.stable_id.is_empty() {
+            let sid = format!("n{id:023}");
+            conn.execute(
+                "UPDATE nodes SET stable_id = ?1 WHERE id = ?2",
+                params![sid, id],
+            )?;
+            sid
+        } else {
+            node.stable_id.clone()
+        };
         Ok(Node {
             id,
-            stable_id: node.stable_id.clone(),
+            stable_id,
             name: node.name.clone(),
             user_id: node.user_id,
             node_key: node.node_key,

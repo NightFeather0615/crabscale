@@ -111,8 +111,6 @@ pub enum ControlError {
     NotFound,
     /// The client capability version is below the supported minimum.
     UnsupportedVersion(u32),
-    /// The supplied auth key is invalid.
-    InvalidAuth,
     /// A persistence operation failed.
     Store(String),
     /// The IP allocator could not find a free address.
@@ -130,7 +128,6 @@ impl std::fmt::Display for ControlError {
         match self {
             Self::NotFound => write!(f, "node not found or machine key mismatch"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported capability version {v}"),
-            Self::InvalidAuth => write!(f, "invalid auth key"),
             Self::Store(e) => write!(f, "store error: {e}"),
             Self::IpAllocation => write!(f, "no free tailnet IP available"),
             Self::Json => write!(f, "failed to serialize JSON"),
@@ -168,9 +165,18 @@ pub struct ControlPlane {
 
 impl ControlPlane {
     /// Create a control plane with an in-memory SQLite store.
+    ///
+    /// Panics if the in-memory store cannot be created; use [`Self::try_new`]
+    /// when the caller needs to handle that failure.
     pub fn new(config: ControlConfig) -> Self {
-        let store = SqliteStore::open_in_memory().expect("in-memory SQLite store");
-        Self::with_store(config, Arc::new(store))
+        Self::try_new(config).expect("in-memory SQLite store")
+    }
+
+    /// Create a control plane with an in-memory SQLite store, returning an
+    /// error if the store cannot be initialized.
+    pub fn try_new(config: ControlConfig) -> Result<Self, StoreError> {
+        let store = SqliteStore::open_in_memory()?;
+        Ok(Self::with_store(config, Arc::new(store)))
     }
 
     /// Open a control plane backed by a SQLite database file.
@@ -202,6 +208,8 @@ impl ControlPlane {
             .map_err(|e| ControlError::Store(e.to_string()))?
         {
             if node.machine_key == machine_key {
+                // TODO(M1): refresh hostinfo and capability version on
+                // re-registration instead of returning early.
                 return Ok(self.authorized_response());
             }
             return Ok(RegisterResponse {
@@ -228,18 +236,16 @@ impl ControlPlane {
             .store
             .list_nodes()
             .map_err(|e| ControlError::Store(e.to_string()))?;
-        let used_ipv4 = nodes
-            .iter()
-            .filter_map(|n| n.addresses.first())
-            .filter_map(|a| a.split('/').next())
-            .filter_map(|a| a.parse::<Ipv4Addr>().ok())
-            .collect::<HashSet<_>>();
-        let used_ipv6 = nodes
-            .iter()
-            .filter_map(|n| n.addresses.get(1))
-            .filter_map(|a| a.split('/').next())
-            .filter_map(|a| a.parse::<Ipv6Addr>().ok())
-            .collect::<HashSet<_>>();
+        let mut used_ipv4 = HashSet::new();
+        let mut used_ipv6 = HashSet::new();
+        for address in nodes.iter().flat_map(|n| n.addresses.iter()) {
+            let host = address.split('/').next().unwrap_or(address);
+            if let Ok(v4) = host.parse::<Ipv4Addr>() {
+                used_ipv4.insert(v4);
+            } else if let Ok(v6) = host.parse::<Ipv6Addr>() {
+                used_ipv6.insert(v6);
+            }
+        }
 
         let allocator = IpAllocator::new(
             self.config.ipv4_prefix,
@@ -266,7 +272,7 @@ impl ControlPlane {
         let addresses = vec![format!("{ipv4}/32"), format!("{ipv6}/128")];
         let domain_node = DomainNode {
             id: 0,
-            stable_id: format!("n{}", uuid_like_id()),
+            stable_id: String::new(),
             name: format!("{hostname}.{}.", self.config.tailnet_domain),
             user_id: self.config.user_id as i64,
             node_key: request.node_key,
@@ -452,11 +458,6 @@ impl ControlPlane {
     }
 }
 
-/// Generate a random stable node id suffix.
-fn uuid_like_id() -> u64 {
-    rand::random::<u64>()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +544,10 @@ mod tests {
             serde_json::json!(
                 "discokey:3333333333333333333333333333333333333333333333333333333333333333"
             )
+        );
+        assert_eq!(
+            json["Node"]["StableID"],
+            serde_json::json!("n00000000000000000000001")
         );
     }
 

@@ -98,14 +98,10 @@ impl IpAllocator {
 
 /// Return `(first_host, host_count)` for an IPv4 prefix.
 fn ipv4_host_range(prefix: Ipv4Addr, prefix_len: u8) -> Result<(u32, u32), IpAllocatorError> {
-    if prefix_len > 32 {
+    if prefix_len == 0 || prefix_len > 32 {
         return Err(IpAllocatorError::NoAddresses);
     }
-    let mask = if prefix_len == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix_len)
-    };
+    let mask = u32::MAX << (32 - prefix_len);
     let network = u32::from(prefix) & mask;
     let host_bits = 32 - prefix_len;
     if host_bits < 2 {
@@ -123,14 +119,10 @@ fn ipv4_host_range(prefix: Ipv4Addr, prefix_len: u8) -> Result<(u32, u32), IpAll
 
 /// Return `(first_host, host_count)` for an IPv6 prefix.
 fn ipv6_host_range(prefix: Ipv6Addr, prefix_len: u8) -> Result<(u128, u128), IpAllocatorError> {
-    if prefix_len > 128 {
+    if prefix_len == 0 || prefix_len > 128 {
         return Err(IpAllocatorError::NoAddresses);
     }
-    let mask = if prefix_len == 0 {
-        0
-    } else {
-        u128::MAX << (128 - prefix_len)
-    };
+    let mask = u128::MAX << (128 - prefix_len);
     let network = u128::from(prefix) & mask;
     let host_bits = 128 - prefix_len;
     if host_bits < 1 {
