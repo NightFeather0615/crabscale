@@ -113,6 +113,14 @@ pub trait Store: Send + Sync {
     fn get_pending(&self, auth_id: &str) -> Result<Option<PendingRegistration>, StoreError>;
     /// Delete a pending interactive registration by auth id.
     fn delete_pending(&self, auth_id: &str) -> Result<(), StoreError>;
+    /// Insert or update an SSH check-mode auth record.
+    fn save_ssh_auth(&self, auth: &crate::ssh::SshAuth) -> Result<(), StoreError>;
+    /// Fetch an SSH check-mode auth record by auth id.
+    fn get_ssh_auth(&self, auth_id: &str) -> Result<Option<crate::ssh::SshAuth>, StoreError>;
+    /// List all SSH check-mode auth records (for auto-approval lookups).
+    fn list_ssh_auths(&self) -> Result<Vec<crate::ssh::SshAuth>, StoreError>;
+    /// Delete an SSH check-mode auth record by auth id.
+    fn delete_ssh_auth(&self, auth_id: &str) -> Result<(), StoreError>;
 }
 
 /// A [`Store`] backed by SQLite.
@@ -735,6 +743,92 @@ impl Store for SqliteStore {
         )?;
         Ok(())
     }
+
+    fn save_ssh_auth(&self, auth: &crate::ssh::SshAuth) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let verdict = serde_json::to_string(&auth.verdict)?;
+        conn.execute(
+            "INSERT INTO ssh_auths (
+                auth_id, src_node_id, dst_node_id, ssh_user, local_user,
+                machine_key, created_at, expires_at, verdict
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(auth_id) DO UPDATE SET
+                src_node_id = excluded.src_node_id,
+                dst_node_id = excluded.dst_node_id,
+                ssh_user = excluded.ssh_user,
+                local_user = excluded.local_user,
+                machine_key = excluded.machine_key,
+                created_at = excluded.created_at,
+                expires_at = excluded.expires_at,
+                verdict = excluded.verdict",
+            params![
+                auth.auth_id,
+                auth.src_node_id as i64,
+                auth.dst_node_id as i64,
+                auth.ssh_user,
+                auth.local_user,
+                auth.machine_key.to_string(),
+                auth.created_at,
+                auth.expires_at,
+                verdict,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_ssh_auth(&self, auth_id: &str) -> Result<Option<crate::ssh::SshAuth>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let auth = conn
+            .query_row(
+                "SELECT auth_id, src_node_id, dst_node_id, ssh_user, local_user,
+                        machine_key, created_at, expires_at, verdict
+                 FROM ssh_auths WHERE auth_id = ?1",
+                params![auth_id],
+                row_to_ssh_auth,
+            )
+            .optional()?;
+        Ok(auth)
+    }
+
+    fn list_ssh_auths(&self) -> Result<Vec<crate::ssh::SshAuth>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT auth_id, src_node_id, dst_node_id, ssh_user, local_user,
+                    machine_key, created_at, expires_at, verdict
+             FROM ssh_auths ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], row_to_ssh_auth)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn delete_ssh_auth(&self, auth_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM ssh_auths WHERE auth_id = ?1", params![auth_id])?;
+        Ok(())
+    }
+}
+
+fn row_to_ssh_auth(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::ssh::SshAuth> {
+    let verdict: String = row.get(8)?;
+    Ok(crate::ssh::SshAuth {
+        auth_id: row.get(0)?,
+        src_node_id: row.get::<_, i64>(1)? as u64,
+        dst_node_id: row.get::<_, i64>(2)? as u64,
+        ssh_user: row.get(3)?,
+        local_user: row.get(4)?,
+        machine_key: MachineKey::from_str(&row.get::<_, String>(5)?).map_err(|_| {
+            rusqlite::Error::InvalidColumnType(
+                5,
+                "machine key".to_string(),
+                rusqlite::types::Type::Text,
+            )
+        })?,
+        created_at: row.get(6)?,
+        expires_at: row.get(7)?,
+        verdict: serde_json::from_str(&verdict).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+    })
 }
 
 fn row_to_pending(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingRegistration> {
@@ -1023,6 +1117,27 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             "ALTER TABLE nodes ADD COLUMN advertised_routes TEXT NOT NULL DEFAULT '[]';
             ALTER TABLE nodes ADD COLUMN approved_routes TEXT NOT NULL DEFAULT '[]';
             PRAGMA user_version = 6;",
+        )?;
+    }
+    if version < 7 {
+        // M2-06: SSH check-mode auth records. Each record is one (src,dst)
+        // check-mode approval/pending state keyed by an unguessable auth id,
+        // so a separate process (the CLI) can approve or reject it against
+        // the same database.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ssh_auths (
+                auth_id TEXT PRIMARY KEY,
+                src_node_id INTEGER NOT NULL,
+                dst_node_id INTEGER NOT NULL,
+                ssh_user TEXT NOT NULL,
+                local_user TEXT NOT NULL,
+                machine_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                verdict TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ssh_auths_binding ON ssh_auths(src_node_id, dst_node_id);
+            PRAGMA user_version = 7;",
         )?;
     }
     Ok(())

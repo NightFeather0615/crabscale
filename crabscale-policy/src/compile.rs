@@ -41,6 +41,10 @@ use crate::model::Policy;
 pub struct CompileNode {
     /// Unique node id.
     pub id: u64,
+    /// Stable node id string (e.g. `n00000000000000000000001`), used to emit
+    /// concrete `Node` SSH principals on the wire. May be empty for
+    /// synthetic/test nodes.
+    pub stable_id: String,
     /// Owning user's login name (e.g. `alice@example.com`), when known.
     pub user_login: Option<String>,
     /// The node's tailnet addresses as CIDR strings.
@@ -54,6 +58,7 @@ impl CompileNode {
     pub fn with_addresses(id: u64, addresses: Vec<String>) -> Self {
         CompileNode {
             id,
+            stable_id: String::new(),
             user_login: None,
             addresses,
             tags: Vec::new(),
@@ -283,7 +288,7 @@ fn node_attr_target_matches(
 }
 
 /// A snapshot of the compile context sufficient for destination matching.
-struct Ctx<'a> {
+pub(crate) struct Ctx<'a> {
     policy: &'a Policy,
     resolving_groups: BTreeSet<String>,
 }
@@ -309,15 +314,15 @@ struct NodeMatchCtx<'a> {
 ///   (user-owned) nodes.
 /// - `autogroup:tagged` ([`ResolvedTarget::tagged_match`]): tagged nodes.
 #[derive(Debug, Clone, Default)]
-struct ResolvedTarget {
+pub(crate) struct ResolvedTarget {
     /// `true` when the target is `*` and matches every node.
-    wildcard: bool,
+    pub(crate) wildcard: bool,
     /// `true` when the target contains `autogroup:self`; matches every node.
-    self_match: bool,
+    pub(crate) self_match: bool,
     /// `true` when the target contains `autogroup:member`; matches untagged nodes.
-    member_match: bool,
+    pub(crate) member_match: bool,
     /// `true` when the target contains `autogroup:tagged`; matches tagged nodes.
-    tagged_match: bool,
+    pub(crate) tagged_match: bool,
     /// IP networks (CIDR or bare IP, kept as input strings).
     nets: Vec<String>,
     /// Identities (user logins or tags) matched against node credentials.
@@ -326,7 +331,7 @@ struct ResolvedTarget {
 
 impl ResolvedTarget {
     /// Whether this target matches the given node.
-    fn matches_node(&self, node: &CompileNode) -> bool {
+    pub(crate) fn matches_node(&self, node: &CompileNode) -> bool {
         if self.wildcard || self.self_match {
             return true;
         }
@@ -410,8 +415,16 @@ impl DstTarget {
 }
 
 impl<'a> Ctx<'a> {
+    /// Create a resolution context over a parsed policy.
+    pub(crate) fn new(policy: &'a Policy) -> Self {
+        Ctx {
+            policy,
+            resolving_groups: BTreeSet::new(),
+        }
+    }
+
     /// Resolve a source/destination target (without the port suffix).
-    fn resolve<'s, I>(&mut self, targets: I) -> ResolvedTarget
+    pub(crate) fn resolve<'s, I>(&mut self, targets: I) -> ResolvedTarget
     where
         I: IntoIterator<Item = &'s str>,
     {
@@ -765,6 +778,7 @@ mod tests {
     fn node(id: u64, login: Option<&str>, addresses: &[&str]) -> CompileNode {
         CompileNode {
             id,
+            stable_id: format!("n{id:023}"),
             user_login: login.map(|s| s.to_string()),
             addresses: addresses.iter().map(|s| s.to_string()).collect(),
             tags: Vec::new(),
@@ -950,6 +964,7 @@ mod tests {
     fn tagged_node(id: u64, addresses: &[&str], tags: &[&str]) -> CompileNode {
         CompileNode {
             id,
+            stable_id: format!("n{id:023}"),
             user_login: None,
             addresses: addresses.iter().map(|s| s.to_string()).collect(),
             tags: tags.iter().map(|s| s.to_string()).collect(),

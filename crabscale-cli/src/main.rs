@@ -11,6 +11,9 @@
 //! crabscale route approve --node <nodekey> --route <cidr>
 //! crabscale route disapprove --node <nodekey> --route <cidr>
 //! crabscale route list --node <nodekey>
+//! crabscale ssh approve --auth-id <id>
+//! crabscale ssh reject --auth-id <id>
+//! crabscale ssh list
 //! ```
 
 use std::path::PathBuf;
@@ -45,6 +48,11 @@ enum Command {
         #[command(subcommand)]
         command: RouteCommand,
     },
+    /// Approve or reject a pending Tailscale SSH check-mode request.
+    Ssh {
+        #[command(subcommand)]
+        command: SshCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -64,6 +72,24 @@ enum AuthCommand {
         #[arg(long)]
         auth_id: String,
     },
+}
+
+#[derive(Subcommand)]
+enum SshCommand {
+    /// Approve a pending SSH check-mode request.
+    Approve {
+        /// The auth id from the SSH check-mode followup URL.
+        #[arg(long)]
+        auth_id: String,
+    },
+    /// Reject a pending SSH check-mode request.
+    Reject {
+        /// The auth id from the SSH check-mode followup URL.
+        #[arg(long)]
+        auth_id: String,
+    },
+    /// List pending SSH check-mode requests.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -151,6 +177,42 @@ fn run_route_command(plane: &ControlPlane, command: RouteCommand) -> Result<Stri
     }
 }
 
+/// Run an SSH command against the given control plane.
+fn run_ssh_command(plane: &ControlPlane, command: SshCommand) -> Result<String, ControlError> {
+    match command {
+        SshCommand::Approve { auth_id } => {
+            plane.approve_ssh(&auth_id)?;
+            Ok(format!("approved SSH auth {auth_id}"))
+        }
+        SshCommand::Reject { auth_id } => {
+            plane.reject_ssh(&auth_id)?;
+            Ok(format!("rejected SSH auth {auth_id}"))
+        }
+        SshCommand::List => {
+            let auths = plane.list_ssh_auths()?;
+            if auths.is_empty() {
+                return Ok("no SSH auth records".to_string());
+            }
+            let mut lines = Vec::new();
+            for auth in auths {
+                let status = match auth.verdict {
+                    crabscale_control::SshVerdict::Pending => "pending".to_string(),
+                    crabscale_control::SshVerdict::Accepted { .. } => "accepted".to_string(),
+                    crabscale_control::SshVerdict::Rejected => "rejected".to_string(),
+                };
+                lines.push(format!(
+                    "{} {}->{} {status}",
+                    auth.auth_id, auth.src_node_id, auth.dst_node_id
+                ));
+            }
+            Ok(lines.join(
+                "
+",
+            ))
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let plane = match &cli.store {
@@ -167,6 +229,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Auth { command } => run_auth_command(&plane, command),
         Command::Route { command } => run_route_command(&plane, command),
+        Command::Ssh { command } => run_ssh_command(&plane, command),
     };
 
     match result {
@@ -458,5 +521,53 @@ mod tests {
         assert!(response.machine_authorized);
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn parses_ssh_commands() {
+        let cli =
+            Cli::try_parse_from(["crabscale", "ssh", "approve", "--auth-id", "abc123"]).unwrap();
+        match cli.command {
+            Command::Ssh { command } => assert!(matches!(
+                command,
+                SshCommand::Approve { auth_id } if auth_id == "abc123"
+            )),
+            _ => panic!("expected ssh approve"),
+        }
+
+        let cli = Cli::try_parse_from(["crabscale", "ssh", "reject", "--auth-id", "abc"]).unwrap();
+        match cli.command {
+            Command::Ssh { command } => assert!(matches!(
+                command,
+                SshCommand::Reject { auth_id } if auth_id == "abc"
+            )),
+            _ => panic!("expected ssh reject"),
+        }
+
+        let cli = Cli::try_parse_from(["crabscale", "ssh", "list"]).unwrap();
+        match cli.command {
+            Command::Ssh { command } => assert!(matches!(command, SshCommand::List)),
+            _ => panic!("expected ssh list"),
+        }
+    }
+
+    #[test]
+    fn ssh_approve_unknown_auth_id_errors() {
+        let plane = test_plane();
+        let err = run_ssh_command(
+            &plane,
+            SshCommand::Approve {
+                auth_id: "does-not-exist".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ControlError::NotFound));
+    }
+
+    #[test]
+    fn ssh_list_empty_reports_no_records() {
+        let plane = test_plane();
+        let message = run_ssh_command(&plane, SshCommand::List).unwrap();
+        assert!(message.contains("no SSH auth records"));
     }
 }

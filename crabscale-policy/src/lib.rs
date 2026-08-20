@@ -15,6 +15,7 @@ mod error;
 mod hujson;
 mod model;
 mod routes;
+mod ssh;
 mod tags;
 mod validate;
 
@@ -23,6 +24,10 @@ pub use error::HujsonError;
 pub use hujson::parse as parse_hujson;
 pub use model::{Acl, AutoApprovers, Grant, NodeAttrGrant, Policy, PolicyTest, SshRule, SshTest};
 pub use routes::{auto_approved_routes, canonical_route};
+pub use ssh::{
+    CompiledSshPolicy, CompiledSshRule, DEFAULT_SSH_CHECK_PERIOD, SshRuleAction,
+    build_wire_ssh_policy, compile_ssh_policy, first_matching_ssh_rule, parse_ssh_duration,
+};
 pub use tags::{is_valid_tag, tag_owned_by_tags, unauthorized_tags, user_can_use_tag};
 pub use validate::{validate_policy, validate_unknown_keys};
 

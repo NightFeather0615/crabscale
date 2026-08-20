@@ -13,6 +13,7 @@ mod model;
 mod pending;
 mod preauth;
 mod session;
+mod ssh;
 mod store;
 mod time;
 
@@ -37,6 +38,7 @@ pub use preauth::{
     AUTH_KEY_PREFIX, format_auth_key, generate_secret, hash_secret, parse_auth_key, verify_secret,
 };
 pub use session::{DEFAULT_RECONNECT_GRACE_SECONDS, SessionEvent, SessionRegistry};
+pub use ssh::{DEFAULT_SSH_AUTH_TTL_SECONDS, DEFAULT_SSH_WAIT_TIMEOUT, SshAuth, SshVerdict};
 pub use store::{SqliteStore, Store, StoreError};
 
 /// Default IPv4 tailnet prefix.
@@ -169,6 +171,12 @@ pub enum ControlError {
     InvalidRoute(String),
     /// DNS extra records could not be read, parsed, or pushed.
     ExtraRecords(String),
+    /// The Noise machine key did not match the node it claimed.
+    Unauthorized,
+    /// An SSH followup presented a binding that did not match the auth record.
+    SshBinding(String),
+    /// An SSH followup wait timed out before an admin verdict arrived.
+    Timeout,
 }
 
 impl std::fmt::Display for ControlError {
@@ -193,6 +201,11 @@ impl std::fmt::Display for ControlError {
                 write!(f, "invalid route `{route}`: expected an IP or CIDR")
             }
             Self::ExtraRecords(e) => write!(f, "DNS extra records: {e}"),
+            Self::Unauthorized => write!(f, "unauthorized: machine key mismatch"),
+            Self::SshBinding(auth_id) => {
+                write!(f, "SSH auth binding mismatch for `{auth_id}`")
+            }
+            Self::Timeout => write!(f, "timed out waiting for an SSH approval"),
         }
     }
 }
@@ -221,12 +234,16 @@ pub enum MapOutcome {
 
 /// Control plane shared by the server router.
 pub struct ControlPlane {
-    config: ControlConfig,
-    store: Arc<dyn Store>,
+    pub(crate) config: ControlConfig,
+    pub(crate) store: Arc<dyn Store>,
     pending: Mutex<pending::PendingCache>,
     sessions: Mutex<SessionRegistry>,
     reaper_started: AtomicBool,
     dns_state: Arc<dns::DnsState>,
+    /// Broadcast channel that wakes SSH followup waiters when an auth id
+    /// resolves. Clones of a plane share the channel so an approval on any
+    /// clone notifies waiters on every clone.
+    ssh_waiters: tokio::sync::broadcast::Sender<String>,
 }
 
 impl Clone for ControlPlane {
@@ -241,6 +258,7 @@ impl Clone for ControlPlane {
             sessions: Mutex::new(SessionRegistry::new(self.config.reconnect_grace_seconds)),
             reaper_started: AtomicBool::new(false),
             dns_state: self.dns_state.clone(),
+            ssh_waiters: self.ssh_waiters.clone(),
         }
     }
 }
@@ -278,6 +296,7 @@ impl ControlPlane {
             sessions,
             reaper_started: AtomicBool::new(false),
             dns_state: Arc::new(dns::DnsState::new(Vec::new())),
+            ssh_waiters: tokio::sync::broadcast::channel(128).0,
         };
         if plane.config.dns.extra_records_path.is_some() {
             if let Err(e) = plane.reload_dns_extra_records() {
@@ -1318,6 +1337,20 @@ impl ControlPlane {
         let compiled = crabscale_policy::compile_policy(&self.config.policy, &compile_nodes);
         let self_routes = self.effective_approved_routes(node)?;
 
+        // Per-node Tailscale SSH policy (Spec-Policy §7): the policy's ssh
+        // rules are compiled and reduced to this node, then converted into
+        // the wire SSHPolicy carried in the map.
+        let ssh_policy = {
+            let ssh_compiled =
+                crabscale_policy::compile_ssh_policy(&self.config.policy, &compile_nodes);
+            crabscale_policy::build_wire_ssh_policy(
+                &ssh_compiled,
+                node.id as u64,
+                &self.config.server_url,
+                &compile_nodes,
+            )
+        };
+
         // Emit the policy-derived node attributes on the self node's CapMap
         // (Spec-Policy §6), and advertise this node's own approved routes as
         // PrimaryRoutes (the self address values are never part of it).
@@ -1412,6 +1445,7 @@ impl ControlPlane {
             peers: Some(peers),
             packet_filters: Some(packet_filters),
             user_profiles,
+            ssh_policy,
             control_time: CONTROL_TIME.to_string(),
             dns: self.build_dns_config()?,
             ..Default::default()
@@ -1419,7 +1453,7 @@ impl ControlPlane {
     }
 
     /// Snapshot the registered nodes in the shape the policy compiler needs.
-    fn compile_nodes(&self) -> Result<Vec<crabscale_policy::CompileNode>, ControlError> {
+    pub(crate) fn compile_nodes(&self) -> Result<Vec<crabscale_policy::CompileNode>, ControlError> {
         let mut nodes = Vec::new();
         for stored in self
             .store
@@ -1432,7 +1466,7 @@ impl ControlPlane {
     }
 
     /// Snapshot one stored node in the shape the policy helpers need.
-    fn compile_node(
+    pub(crate) fn compile_node(
         &self,
         node: &DomainNode,
     ) -> Result<crabscale_policy::CompileNode, ControlError> {
@@ -1446,6 +1480,7 @@ impl ControlPlane {
         };
         Ok(crabscale_policy::CompileNode {
             id: node.id as u64,
+            stable_id: node.stable_id.clone(),
             user_login,
             addresses: node.addresses.clone(),
             tags: node.tags.clone().unwrap_or_default(),
@@ -2962,6 +2997,74 @@ mod tests {
             serde_json::json!({ "drive:share": [] }),
             "a policy change must be reflected in the next map's CapMap"
         );
+    }
+
+    #[test]
+    fn ssh_policy_is_delivered_per_node_in_map() {
+        let mut plane = test_plane();
+        plane.config.policy = crabscale_policy::parse_policy(
+            r#"{
+                "tagOwners": { "tag:web": ["owner@example.com"] },
+                "acls": [ { "action": "accept", "src": ["*"], "dst": ["*:*"] } ],
+                "ssh": [
+                    { "action": "check", "src": ["autogroup:member"], "dst": ["tag:web"],
+                      "users": ["root"], "checkPeriod": "12h" }
+                ]
+            }"#,
+        )
+        .expect("policy must parse");
+        // An ordinary user-owned node (no SSH rules target it).
+        plane.register(test_machine_key(), test_register_request());
+        // A tagged destination node targeted by the ssh check rule.
+        let key = plane
+            .create_pre_auth_key(
+                "sshmap",
+                true,
+                false,
+                None,
+                Some(vec!["tag:web".to_string()]),
+            )
+            .unwrap();
+        let mut request = test_register_request();
+        request.node_key = NodeKey::from_bytes([0x27; 32]);
+        request.auth = Some(crabscale_proto::RegisterAuth { auth_key: key });
+        request.hostinfo = Some(Hostinfo {
+            hostname: "web".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            plane
+                .register(MachineKey::from_bytes([0x17; 32]), request)
+                .machine_authorized
+        );
+
+        // The plain node has no applicable ssh rule, so no SSHPolicy is sent.
+        let plain = map_json(&plane, 1);
+        assert!(
+            plain.get("SSHPolicy").is_none(),
+            "nodes with no ssh rules must not receive an SSHPolicy"
+        );
+        // The tagged node receives its per-node SSHPolicy.
+        let web = map_json(&plane, 2);
+        let policy = web.get("SSHPolicy").expect("tagged node carries SSHPolicy");
+        // Wire field names are the camelCase client vocabulary.
+        assert_eq!(policy["rules"][0]["sshUsers"]["root"], "=");
+        let action = &policy["rules"][0]["action"];
+        assert_eq!(action["message"], "approval required");
+        assert!(
+            action["holdAndDelegate"]
+                .as_str()
+                .unwrap()
+                .contains("/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID"),
+            "check-mode rules carry a delegate URL with placeholders"
+        );
+        // The autogroup:member source resolves to the plain node's stable id.
+        assert_eq!(
+            policy["rules"][0]["principals"][0]["node"],
+            serde_json::json!("n00000000000000000000001")
+        );
+        // `any` is omitted for a concrete node principal (omitzero semantics).
+        assert!(policy["rules"][0]["principals"][0]["any"].is_null());
     }
 
     /// Register a node whose Hostinfo advertises `routable_ips`.
