@@ -38,6 +38,25 @@ domains, and extra records) to clients in the MapResponse `DNS` field.
   hot-reloaded at runtime; changes are pushed to all live map sessions. See
   `examples/dns-extra-records.json`.
 
+## OIDC registration
+
+Interactive registration can be approved through an OpenID Connect provider
+instead of the CLI. Start the server with OIDC configured:
+
+- `--oidc-issuer <url>` enables the feature (required).
+- `--oidc-client-id <id>` and `--oidc-client-secret <secret>` identify the
+  relying party.
+- `--oidc-redirect-uri <url>` overrides the callback URL; default is
+  `<server-url>/oidc/callback`.
+- `--oidc-scope <scopes>` overrides the requested scopes; default is
+  `openid profile email`.
+
+Discovery is fetched and validated at startup; a mismatched issuer aborts
+startup. Once enabled, the `/register/{id}` page redirects to the provider,
+and `/oidc/callback` validates the CSRF state and nonce, exchanges the code,
+verifies the ID token, upserts the user profile, and approves the pending
+registration through the same auth cache the `crabscale auth` CLI uses.
+
 ## Development
 
 ```sh

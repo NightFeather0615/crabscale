@@ -6,8 +6,13 @@
 
 pub mod http;
 pub mod key;
+pub mod oidc;
 pub mod router;
 
 pub use http::{ServerHandle, serve, serve_on_addr};
 pub use key::{DEFAULT_KEY_FILE, ServerKey, load_or_create_machine_key, persist_machine_key};
+pub use oidc::{
+    DEFAULT_OIDC_FLOW_LIMIT, DEFAULT_OIDC_FLOW_TTL_SECONDS, OidcClient, OidcConfig, OidcError,
+    OidcFlow, OidcFlowStore,
+};
 pub use router::{ControlRouter, serve_control};

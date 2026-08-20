@@ -74,6 +74,14 @@ pub trait Store: Send + Sync {
     fn create_login(&self, login: &Login) -> Result<Login, StoreError>;
     /// Fetch a login by id.
     fn get_login(&self, id: i64) -> Result<Option<Login>, StoreError>;
+    /// Fetch a login by provider and login name, e.g. an OIDC subject.
+    fn get_login_by_provider_subject(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<Login>, StoreError>;
+    /// Update a user's display name.
+    fn update_user_display_name(&self, id: i64, display_name: &str) -> Result<(), StoreError>;
     /// Insert or update a node and return the stored entity.
     fn upsert_node(&self, node: &Node) -> Result<Node, StoreError>;
     /// Fetch a node by its node key.
@@ -259,6 +267,43 @@ impl Store for SqliteStore {
             )
             .optional()?;
         Ok(login)
+    }
+
+    fn get_login_by_provider_subject(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<Login>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let login = conn
+            .query_row(
+                "SELECT id, user_id, provider, login_name, created_at
+                 FROM logins WHERE provider = ?1 AND login_name = ?2",
+                params![provider, subject],
+                |row| {
+                    Ok(Login {
+                        id: row.get(0)?,
+                        user_id: row.get(1)?,
+                        provider: row.get(2)?,
+                        login_name: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(login)
+    }
+
+    fn update_user_display_name(&self, id: i64, display_name: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE users SET display_name = ?1 WHERE id = ?2",
+            params![display_name, id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
     }
 
     fn upsert_node(&self, node: &Node) -> Result<Node, StoreError> {
@@ -1138,6 +1183,15 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             );
             CREATE INDEX IF NOT EXISTS idx_ssh_auths_binding ON ssh_auths(src_node_id, dst_node_id);
             PRAGMA user_version = 7;",
+        )?;
+    }
+    if version < 8 {
+        // M2-07: OIDC logins are reconciled by (provider, subject). The index
+        // keeps the idempotent upsert in `upsert_oidc_user` cheap and unique.
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_logins_provider_subject
+                ON logins(provider, login_name);
+            PRAGMA user_version = 8;",
         )?;
     }
     Ok(())

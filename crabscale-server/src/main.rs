@@ -9,7 +9,8 @@ use std::process::ExitCode;
 use clap::Parser;
 use crabscale_control::{ControlConfig, ControlPlane, DnsSettings};
 use crabscale_server::{
-    ControlRouter, DEFAULT_KEY_FILE, load_or_create_machine_key, serve_on_addr,
+    ControlRouter, DEFAULT_KEY_FILE, OidcClient, OidcConfig, load_or_create_machine_key,
+    serve_on_addr,
 };
 
 /// Default address the outer HTTP server listens on.
@@ -60,6 +61,26 @@ struct Args {
     /// re-read at runtime for hot reload.
     #[arg(long)]
     dns_extra_records: Option<std::path::PathBuf>,
+
+    /// OpenID Connect issuer URL; enables OIDC browser registration approval.
+    #[arg(long)]
+    oidc_issuer: Option<String>,
+
+    /// OIDC client id registered with the provider.
+    #[arg(long)]
+    oidc_client_id: Option<String>,
+
+    /// OIDC client secret registered with the provider.
+    #[arg(long)]
+    oidc_client_secret: Option<String>,
+
+    /// OIDC callback URL; defaults to `<server-url>/oidc/callback`.
+    #[arg(long)]
+    oidc_redirect_uri: Option<String>,
+
+    /// OIDC scopes to request, space-separated.
+    #[arg(long, default_value = "openid profile email")]
+    oidc_scope: String,
 }
 
 #[tokio::main]
@@ -112,6 +133,43 @@ fn control_config(args: &Args) -> ControlConfig {
     }
 }
 
+/// Build an OIDC client from CLI arguments, if OIDC is configured.
+///
+/// Discovery is fetched and validated here so a misconfigured provider aborts
+/// startup instead of failing at the first registration. Returns `Ok(None)`
+/// when the issuer flag is absent.
+fn build_oidc(args: &Args) -> Result<Option<OidcClient>, Box<dyn std::error::Error>> {
+    let Some(issuer) = args.oidc_issuer.clone() else {
+        if args.oidc_client_id.is_some() || args.oidc_client_secret.is_some() {
+            return Err("--oidc-client-id/--oidc-client-secret require --oidc-issuer".into());
+        }
+        return Ok(None);
+    };
+    let client_id = args
+        .oidc_client_id
+        .clone()
+        .ok_or("--oidc-client-id is required with --oidc-issuer")?;
+    let client_secret = args
+        .oidc_client_secret
+        .clone()
+        .ok_or("--oidc-client-secret is required with --oidc-issuer")?;
+    let server_url = control_config(args).server_url;
+    let redirect_uri = args
+        .oidc_redirect_uri
+        .clone()
+        .unwrap_or_else(|| format!("{server_url}/oidc/callback"));
+    let config = OidcConfig {
+        issuer,
+        client_id,
+        client_secret,
+        redirect_uri,
+        scope: args.oidc_scope.clone(),
+    };
+    let client = OidcClient::discover(config)?;
+    println!("OIDC provider discovered: {}", client.issuer());
+    Ok(Some(client))
+}
+
 /// Load the machine key, build the control plane and router, and serve the
 /// outer HTTP endpoints until a shutdown signal arrives.
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -122,7 +180,10 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => ControlPlane::open_sqlite(config, path)?,
         None => ControlPlane::try_new(config)?,
     };
-    let router = ControlRouter::with_control(server_key.public_key(), control);
+    let mut router = ControlRouter::with_control(server_key.public_key(), control);
+    if let Some(oidc) = build_oidc(&args)? {
+        router = router.with_oidc(oidc);
+    }
     router.spawn_reaper();
 
     let (addr, handle) = serve_on_addr(args.listen, router, server_key.clone()).await?;
@@ -228,5 +289,42 @@ mod tests {
         assert_eq!(config.auth_key, "hskey-auth-custom-secret");
         assert_eq!(config.server_url, "https://control.example.com");
         assert_eq!(config.tailnet_domain, "tailnet.example");
+    }
+
+    #[test]
+    fn parses_oidc_options() {
+        let args = Args::try_parse_from([
+            "crabscale-server",
+            "--oidc-issuer",
+            "https://issuer.example",
+            "--oidc-client-id",
+            "client-1",
+            "--oidc-client-secret",
+            "secret-1",
+            "--oidc-redirect-uri",
+            "https://control.example/custom-callback",
+            "--oidc-scope",
+            "openid email",
+        ])
+        .unwrap();
+        assert_eq!(args.oidc_issuer.as_deref(), Some("https://issuer.example"));
+        assert_eq!(args.oidc_client_id.as_deref(), Some("client-1"));
+        assert_eq!(args.oidc_client_secret.as_deref(), Some("secret-1"));
+        assert_eq!(
+            args.oidc_redirect_uri.as_deref(),
+            Some("https://control.example/custom-callback")
+        );
+        assert_eq!(args.oidc_scope, "openid email");
+    }
+
+    #[test]
+    fn oidc_client_flags_require_issuer() {
+        // Client id without an issuer is a configuration error.
+        let args =
+            Args::try_parse_from(["crabscale-server", "--oidc-client-id", "client-1"]).unwrap();
+        assert!(build_oidc(&args).is_err());
+        // No OIDC flags at all means the feature stays off.
+        let args = Args::try_parse_from(["crabscale-server"]).unwrap();
+        assert!(build_oidc(&args).unwrap().is_none());
     }
 }
