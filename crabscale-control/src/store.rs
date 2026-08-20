@@ -130,11 +130,21 @@ impl SqliteStore {
 impl Store for SqliteStore {
     fn create_user(&self, user: &User) -> Result<User, StoreError> {
         let conn = self.conn.lock().unwrap();
+        let id_param: Option<i64> = if user.id == 0 { None } else { Some(user.id) };
         conn.execute(
-            "INSERT INTO users (login_name, display_name, created_at) VALUES (?1, ?2, ?3)",
-            params![user.login_name, user.display_name, user.created_at],
+            "INSERT INTO users (id, login_name, display_name, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                id_param,
+                user.login_name,
+                user.display_name,
+                user.created_at
+            ],
         )?;
-        let id = conn.last_insert_rowid();
+        let id = if user.id == 0 {
+            conn.last_insert_rowid()
+        } else {
+            user.id
+        };
         Ok(User {
             id,
             login_name: user.login_name.clone(),
@@ -164,11 +174,22 @@ impl Store for SqliteStore {
 
     fn create_login(&self, login: &Login) -> Result<Login, StoreError> {
         let conn = self.conn.lock().unwrap();
+        let id_param: Option<i64> = if login.id == 0 { None } else { Some(login.id) };
         conn.execute(
-            "INSERT INTO logins (user_id, provider, login_name, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![login.user_id, login.provider, login.login_name, login.created_at],
+            "INSERT INTO logins (id, user_id, provider, login_name, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id_param,
+                login.user_id,
+                login.provider,
+                login.login_name,
+                login.created_at
+            ],
         )?;
-        let id = conn.last_insert_rowid();
+        let id = if login.id == 0 {
+            conn.last_insert_rowid()
+        } else {
+            login.id
+        };
         Ok(Login {
             id,
             user_id: login.user_id,

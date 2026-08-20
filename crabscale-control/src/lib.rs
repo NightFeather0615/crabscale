@@ -299,7 +299,7 @@ impl ControlPlane {
         {
             self.store
                 .create_user(&User {
-                    id: 0,
+                    id: user_id,
                     login_name: self.config.user_login_name.clone(),
                     display_name: self.config.user_display_name.clone(),
                     created_at: CONTROL_TIME.to_string(),
@@ -315,7 +315,7 @@ impl ControlPlane {
         {
             self.store
                 .create_login(&Login {
-                    id: 0,
+                    id: login_id,
                     user_id,
                     provider: "authkey".to_string(),
                     login_name: self.config.user_login_name.clone(),
