@@ -5,3 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64 = "0.22"
+bytes = "1"
+crypto_box = { version = "0.9", features = ["std", "getrandom"] }
+futures-core = "0.3"
+futures-sink = "0.3"
+http = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+tokio = { version = "1", features = ["io-util", "rt", "rt-multi-thread", "macros", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
