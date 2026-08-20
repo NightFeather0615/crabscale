@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 crabscale-control = { path = "../crabscale-control" }
+crabscale-derp = { path = "../crabscale-derp" }
 crabscale-proto = { path = "../crabscale-proto" }
 crabscale-transport = { path = "../crabscale-transport" }
 bytes = "1"

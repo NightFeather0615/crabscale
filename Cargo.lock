@@ -366,6 +366,7 @@ dependencies = [
  "bytes",
  "clap",
  "crabscale-control",
+ "crabscale-derp",
  "crabscale-policy",
  "crabscale-proto",
  "crabscale-transport",
