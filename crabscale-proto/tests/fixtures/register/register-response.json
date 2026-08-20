@@ -1,0 +1,16 @@
+{
+  "input": {
+    "User": 1,
+    "Login": 1,
+    "NodeKeyExpired": false,
+    "MachineAuthorized": true,
+    "AuthURL": "",
+    "Error": ""
+  },
+  "expected": {
+    "User": 1,
+    "Login": 1,
+    "MachineAuthorized": true
+  },
+  "note": "RegisterResponse from Spec-Registration; false/empty fields are omitted."
+}

@@ -1,0 +1,31 @@
+{
+  "input": {
+    "Version": 130,
+    "NodeKey": "nodekey:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "OldNodeKey": "",
+    "NLKey": "",
+    "Auth": {
+      "AuthKey": "hskey-auth-<prefix>-<secret>"
+    },
+    "Expiry": "2026-11-20T00:00:00Z",
+    "Followup": "",
+    "Hostinfo": {
+      "Hostname": "node1",
+      "RequestTags": []
+    },
+    "Ephemeral": false
+  },
+  "expected": {
+    "Version": 130,
+    "NodeKey": "nodekey:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "Auth": {
+      "AuthKey": "hskey-auth-<prefix>-<secret>"
+    },
+    "Expiry": "2026-11-20T00:00:00Z",
+    "Hostinfo": {
+      "Hostname": "node1",
+      "RequestTags": []
+    }
+  },
+  "note": "RegisterRequest from Spec-Registration; empty optional fields are omitted."
+}

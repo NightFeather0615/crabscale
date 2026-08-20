@@ -1,0 +1,53 @@
+{
+  "input": {
+    "Version": 130,
+    "Compress": "",
+    "KeepAlive": true,
+    "NodeKey": "nodekey:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "DiscoKey": "discokey:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "Stream": true,
+    "Hostinfo": {
+      "Hostname": "node1",
+      "RoutableIPs": [
+        "10.0.0.0/24"
+      ],
+      "RequestTags": [],
+      "NetInfo": {
+        "PreferredDERP": 1
+      }
+    },
+    "Endpoints": [
+      "198.51.100.10:41641"
+    ],
+    "EndpointTypes": [
+      2
+    ],
+    "OmitPeers": false,
+    "ReadOnly": false,
+    "TKAHead": ""
+  },
+  "expected": {
+    "Version": 130,
+    "KeepAlive": true,
+    "NodeKey": "nodekey:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "DiscoKey": "discokey:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "Stream": true,
+    "Hostinfo": {
+      "Hostname": "node1",
+      "RoutableIPs": [
+        "10.0.0.0/24"
+      ],
+      "RequestTags": [],
+      "NetInfo": {
+        "PreferredDERP": 1
+      }
+    },
+    "Endpoints": [
+      "198.51.100.10:41641"
+    ],
+    "EndpointTypes": [
+      2
+    ]
+  },
+  "note": "MapRequest from Spec-NetMap; empty/false fields are omitted."
+}
