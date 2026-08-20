@@ -122,6 +122,10 @@ pub struct MapResponse {
     /// Profiles for the requesting user and peers.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub user_profiles: Vec<UserProfile>,
+    /// The per-node Tailscale SSH policy (Spec-Policy section 7). Absent means the
+    /// client keeps its current SSH policy.
+    #[serde(rename = "SSHPolicy", skip_serializing_if = "Option::is_none")]
+    pub ssh_policy: Option<crate::SshPolicy>,
     /// Current server timestamp as an RFC 3339 string.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub control_time: String,

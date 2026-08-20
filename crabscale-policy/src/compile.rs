@@ -283,7 +283,7 @@ fn node_attr_target_matches(
 }
 
 /// A snapshot of the compile context sufficient for destination matching.
-struct Ctx<'a> {
+pub(crate) struct Ctx<'a> {
     policy: &'a Policy,
     resolving_groups: BTreeSet<String>,
 }
@@ -309,15 +309,15 @@ struct NodeMatchCtx<'a> {
 ///   (user-owned) nodes.
 /// - `autogroup:tagged` ([`ResolvedTarget::tagged_match`]): tagged nodes.
 #[derive(Debug, Clone, Default)]
-struct ResolvedTarget {
+pub(crate) struct ResolvedTarget {
     /// `true` when the target is `*` and matches every node.
-    wildcard: bool,
+    pub(crate) wildcard: bool,
     /// `true` when the target contains `autogroup:self`; matches every node.
-    self_match: bool,
+    pub(crate) self_match: bool,
     /// `true` when the target contains `autogroup:member`; matches untagged nodes.
-    member_match: bool,
+    pub(crate) member_match: bool,
     /// `true` when the target contains `autogroup:tagged`; matches tagged nodes.
-    tagged_match: bool,
+    pub(crate) tagged_match: bool,
     /// IP networks (CIDR or bare IP, kept as input strings).
     nets: Vec<String>,
     /// Identities (user logins or tags) matched against node credentials.
@@ -326,7 +326,7 @@ struct ResolvedTarget {
 
 impl ResolvedTarget {
     /// Whether this target matches the given node.
-    fn matches_node(&self, node: &CompileNode) -> bool {
+    pub(crate) fn matches_node(&self, node: &CompileNode) -> bool {
         if self.wildcard || self.self_match {
             return true;
         }
@@ -410,8 +410,16 @@ impl DstTarget {
 }
 
 impl<'a> Ctx<'a> {
+    /// Create a resolution context over a parsed policy.
+    pub(crate) fn new(policy: &'a Policy) -> Self {
+        Ctx {
+            policy,
+            resolving_groups: BTreeSet::new(),
+        }
+    }
+
     /// Resolve a source/destination target (without the port suffix).
-    fn resolve<'s, I>(&mut self, targets: I) -> ResolvedTarget
+    pub(crate) fn resolve<'s, I>(&mut self, targets: I) -> ResolvedTarget
     where
         I: IntoIterator<Item = &'s str>,
     {
