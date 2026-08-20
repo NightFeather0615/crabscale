@@ -103,7 +103,7 @@ impl NoiseResponder {
         prologue: &[u8],
         server_ephemeral: StaticSecret,
     ) -> Result<ResponderOutput, TransportError> {
-        if init.version < crate::messages::MIN_SUPPORTED_CAPVER {
+        if init.version < crabscale_proto::MIN_SUPPORTED_CAPVER as u16 {
             return Err(TransportError::UnsupportedCapabilityVersion(init.version));
         }
         let client_ephemeral = PublicKey::from(init.client_ephemeral);

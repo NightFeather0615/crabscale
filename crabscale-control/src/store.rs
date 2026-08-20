@@ -113,8 +113,6 @@ pub trait Store: Send + Sync {
     fn get_pending(&self, auth_id: &str) -> Result<Option<PendingRegistration>, StoreError>;
     /// Delete a pending interactive registration by auth id.
     fn delete_pending(&self, auth_id: &str) -> Result<(), StoreError>;
-    /// List all pending interactive registrations.
-    fn list_pending(&self) -> Result<Vec<PendingRegistration>, StoreError>;
 }
 
 /// A [`Store`] backed by SQLite.
@@ -730,18 +728,6 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn list_pending(&self) -> Result<Vec<PendingRegistration>, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT auth_id, machine_key, node_key, hostinfo, expiry, version, ephemeral,
-                    created_at, expires_at, verdict
-             FROM pending_registrations",
-        )?;
-        let rows = stmt
-            .query_map([], row_to_pending)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
 }
 
 fn row_to_pending(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingRegistration> {

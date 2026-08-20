@@ -4,9 +4,6 @@
 
 use crate::error::TransportError;
 
-/// Minimum capability version accepted by the control server.
-pub const MIN_SUPPORTED_CAPVER: u16 = 113;
-
 /// Length of the client-to-server init message.
 pub const INIT_MESSAGE_LEN: usize = 101;
 

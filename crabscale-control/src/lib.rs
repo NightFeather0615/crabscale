@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crabscale_proto::{
-    DerpMap, FilterRule, MachineKey, MapRequest, MapResponse, NetPortRange, Node, NodeKey,
-    RegisterRequest, RegisterResponse, UserProfile, encode_map_response_frame,
+    DerpMap, FilterRule, MIN_SUPPORTED_CAPVER, MachineKey, MapRequest, MapResponse, NetPortRange,
+    Node, NodeKey, RegisterRequest, RegisterResponse, UserProfile, encode_map_response_frame,
 };
 
 pub use ip_allocator::{IpAllocator, IpAllocatorError};
@@ -36,9 +36,6 @@ pub use preauth::{
 };
 pub use session::{DEFAULT_RECONNECT_GRACE_SECONDS, SessionEvent, SessionRegistry};
 pub use store::{SqliteStore, Store, StoreError};
-
-/// Minimum capability version accepted by the control plane.
-pub const MIN_SUPPORTED_CAPVER: u32 = 113;
 
 /// Default IPv4 tailnet prefix.
 pub const DEFAULT_IPV4_PREFIX: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 0);
@@ -58,6 +55,8 @@ const CONTROL_TIME: &str = "2026-08-20T00:00:00Z";
 pub struct ControlConfig {
     /// The single static pre-auth key accepted by this server.
     pub auth_key: String,
+    /// Protocol version advertised to clients by `/machine/whoami`.
+    pub protocol_version: u16,
     /// Tailnet domain, e.g. `tailnet.example`.
     pub tailnet_domain: String,
     /// DERP regions advertised to clients.
@@ -111,6 +110,7 @@ impl Default for ControlConfig {
         );
         Self {
             auth_key: "hskey-auth-test-secret".to_string(),
+            protocol_version: 130,
             tailnet_domain: "tailnet.example".to_string(),
             derp_map,
             user_id: 1,
@@ -148,6 +148,8 @@ pub enum ControlError {
     Zstd,
     /// A pre-auth key prefix is invalid.
     InvalidAuthKey(String),
+    /// The `endpoint_types` payload does not match the `endpoints` payload.
+    InvalidEndpointTypes,
 }
 
 impl std::fmt::Display for ControlError {
@@ -161,6 +163,9 @@ impl std::fmt::Display for ControlError {
             Self::Frame => write!(f, "failed to frame MapResponse"),
             Self::Zstd => write!(f, "failed to compress MapResponse"),
             Self::InvalidAuthKey(e) => write!(f, "invalid auth key: {e}"),
+            Self::InvalidEndpointTypes => {
+                write!(f, "endpoint_types length does not match endpoints length")
+            }
         }
     }
 }
@@ -243,19 +248,18 @@ impl ControlPlane {
     ///
     /// Returns a session id that the caller must pass to [`Self::close_session`]
     /// when the streaming map connection ends.
-    pub fn open_session(&self, node_id: i64, ephemeral: bool) -> Result<i64, ControlError> {
+    pub fn open_session(&self, node_id: i64, ephemeral: bool) -> i64 {
         let now = time::now_unix();
         let mut sessions = self.sessions.lock().unwrap();
         let (session_id, _events) = sessions.open(node_id, ephemeral, now);
-        Ok(session_id)
+        session_id
     }
 
     /// Close a live map session by id.
-    pub fn close_session(&self, session_id: i64) -> Result<(), ControlError> {
+    pub fn close_session(&self, session_id: i64) {
         let now = time::now_unix();
         let mut sessions = self.sessions.lock().unwrap();
         sessions.close(session_id, now);
-        Ok(())
     }
 
     /// Atomically claim the single background reaper slot.
@@ -292,6 +296,11 @@ impl ControlPlane {
         self.sessions.lock().unwrap().is_online(node_id)
     }
 
+    /// The protocol version advertised to clients by `/machine/whoami`.
+    pub fn protocol_version(&self) -> u16 {
+        self.config.protocol_version
+    }
+
     /// Register a node key for the given Noise machine key.
     ///
     /// If the node already exists and the machine key matches, the existing
@@ -301,7 +310,8 @@ impl ControlPlane {
         &self,
         machine_key: MachineKey,
         request: RegisterRequest,
-    ) -> Result<RegisterResponse, ControlError> {
+    ) -> RegisterResponse {
+        let result = (|| -> Result<RegisterResponse, ControlError> {
         self.ensure_default_user()?;
         self.ensure_bootstrap_key()?;
         let now = time::now_rfc3339();
@@ -398,6 +408,15 @@ impl ControlPlane {
 
         // No valid auth key: start interactive registration.
         self.start_interactive(machine_key, request, &now)
+        })();
+        match result {
+            Ok(response) => response,
+            Err(e) => RegisterResponse {
+                machine_authorized: false,
+                error: e.to_string(),
+                ..Default::default()
+            },
+        }
     }
 
     /// Start an interactive registration and return an `AuthURL`.
@@ -452,7 +471,7 @@ impl ControlPlane {
             return Ok(self.unauthorized_response("auth id does not match machine key"));
         }
         if time::is_past(&entry.expires_at, now) {
-            self.remove_pending_entry(&auth_id);
+            self.remove_pending_entry(&auth_id)?;
             return Ok(self.unauthorized_response("registration expired; start a new registration"));
         }
         match entry.verdict {
@@ -462,11 +481,11 @@ impl ControlPlane {
                 ..Default::default()
             }),
             PendingVerdict::Rejected => {
-                self.remove_pending_entry(&auth_id);
+                self.remove_pending_entry(&auth_id)?;
                 Ok(self.unauthorized_response("registration rejected"))
             }
             PendingVerdict::Approved { user_id, tags } => {
-                self.remove_pending_entry(&auth_id);
+                self.remove_pending_entry(&auth_id)?;
                 // A duplicate followup after approval must still succeed.
                 if let Some(node) = self
                     .store
@@ -508,7 +527,7 @@ impl ControlPlane {
             return Err(ControlError::NotFound);
         };
         if time::is_past(&entry.expires_at, &now) {
-            self.remove_pending_entry(auth_id);
+            self.remove_pending_entry(auth_id)?;
             return Err(ControlError::NotFound);
         }
         let user_id = self.resolve_user_id(user_name)?;
@@ -530,7 +549,7 @@ impl ControlPlane {
             return Err(ControlError::NotFound);
         };
         if time::is_past(&entry.expires_at, &now) {
-            self.remove_pending_entry(auth_id);
+            self.remove_pending_entry(auth_id)?;
             return Err(ControlError::NotFound);
         }
         entry.verdict = PendingVerdict::Rejected;
@@ -542,14 +561,19 @@ impl ControlPlane {
     }
 
     /// Return a copy of a pending registration for the approval page.
-    pub fn pending_info(&self, auth_id: &str) -> Option<PendingRegistration> {
+    pub fn pending_info(
+        &self,
+        auth_id: &str,
+    ) -> Result<Option<PendingRegistration>, ControlError> {
         let now = time::now_rfc3339();
-        let entry = self.get_pending_entry(auth_id).ok()??;
+        let Some(entry) = self.get_pending_entry(auth_id)? else {
+            return Ok(None);
+        };
         if time::is_past(&entry.expires_at, &now) {
-            self.remove_pending_entry(auth_id);
-            return None;
+            self.remove_pending_entry(auth_id)?;
+            return Ok(None);
         }
-        Some(entry)
+        Ok(Some(entry))
     }
 
     /// Fetch a pending registration from the durable store, which is the
@@ -572,9 +596,11 @@ impl ControlPlane {
 
     /// Remove a pending registration from both the in-memory cache and the
     /// durable store.
-    fn remove_pending_entry(&self, auth_id: &str) {
+    fn remove_pending_entry(&self, auth_id: &str) -> Result<(), ControlError> {
         self.pending.lock().unwrap().remove(auth_id);
-        let _ = self.store.delete_pending(auth_id);
+        self.store
+            .delete_pending(auth_id)
+            .map_err(|e| ControlError::Store(e.to_string()))
     }
 
     /// Resolve a user by login name, creating the user on first approval.
@@ -913,6 +939,9 @@ impl ControlPlane {
         if request.version < MIN_SUPPORTED_CAPVER {
             return Err(ControlError::UnsupportedVersion(request.version));
         }
+        if request.endpoint_types.len() != request.endpoints.len() {
+            return Err(ControlError::InvalidEndpointTypes);
+        }
 
         let mut node = self
             .store
@@ -962,7 +991,7 @@ impl ControlPlane {
         let frame = self.encode_frame(&response, compress)?;
 
         if streaming {
-            let session_id = self.open_session(node.id, node.ephemeral)?;
+            let session_id = self.open_session(node.id, node.ephemeral);
             Ok(MapOutcome::Stream {
                 first_frame: frame,
                 keep_alive: request.keep_alive,
@@ -999,13 +1028,17 @@ impl ControlPlane {
 
         let mut peers = Vec::new();
         let mut user_ids = std::collections::BTreeSet::new();
-        user_ids.insert(self.config.user_id as i64);
+        user_ids.insert(node.user as i64);
         for stored in self
             .store
             .list_nodes()
             .map_err(|e| ControlError::Store(e.to_string()))?
         {
             if stored.node_key == node.key {
+                continue;
+            }
+            // A logged-out node must not be advertised as a peer.
+            if !stored.machine_authorized {
                 continue;
             }
             user_ids.insert(stored.user_id);
@@ -1127,12 +1160,10 @@ mod tests {
     fn registers_and_re_registers_without_error() {
         let plane = test_plane();
         let first = plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
         assert!(first.machine_authorized);
         let second = plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
         assert!(second.machine_authorized);
     }
 
@@ -1143,7 +1174,7 @@ mod tests {
         request.auth = Some(crabscale_proto::RegisterAuth {
             auth_key: "wrong".to_string(),
         });
-        let response = plane.register(test_machine_key(), request).unwrap();
+        let response = plane.register(test_machine_key(), request);
         assert!(!response.machine_authorized);
         assert!(response.error.is_empty());
         assert!(!response.auth_url.is_empty());
@@ -1154,8 +1185,7 @@ mod tests {
     fn map_returns_complete_first_frame() {
         let plane = test_plane();
         plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
         let request = MapRequest {
             version: 130,
             node_key: test_node_key(),
@@ -1190,15 +1220,14 @@ mod tests {
     fn initial_map_lists_peers_sorted_and_user_profiles() {
         let plane = test_plane();
         plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
 
         // Register a second node with a distinct node and machine key.
         let second_machine = MachineKey::from_bytes([0x12; 32]);
         let second_node = NodeKey::from_bytes([0x23; 32]);
         let mut second_request = test_register_request();
         second_request.node_key = second_node;
-        let response = plane.register(second_machine, second_request).unwrap();
+        let response = plane.register(second_machine, second_request);
         assert!(response.machine_authorized);
 
         // Map as the first node: the second node must appear as a peer.
@@ -1245,20 +1274,17 @@ mod tests {
     fn initial_map_peers_are_sorted_by_node_id() {
         let plane = test_plane();
         plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
 
         // Register two more nodes so the requesting node has two peers.
         let mut req_b = test_register_request();
         req_b.node_key = NodeKey::from_bytes([0x24; 32]);
         plane
-            .register(MachineKey::from_bytes([0x13; 32]), req_b)
-            .unwrap();
+            .register(MachineKey::from_bytes([0x13; 32]), req_b);
         let mut req_c = test_register_request();
         req_c.node_key = NodeKey::from_bytes([0x25; 32]);
         plane
-            .register(MachineKey::from_bytes([0x14; 32]), req_c)
-            .unwrap();
+            .register(MachineKey::from_bytes([0x14; 32]), req_c);
 
         let request = MapRequest {
             version: 130,
@@ -1285,8 +1311,7 @@ mod tests {
     fn lite_update_returns_empty() {
         let plane = test_plane();
         plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
         let request = MapRequest {
             version: 130,
             node_key: test_node_key(),
@@ -1303,8 +1328,7 @@ mod tests {
     fn map_merges_endpoint_types_and_preferred_derp() {
         let plane = test_plane();
         plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
         let request = MapRequest {
             version: 130,
             node_key: test_node_key(),
@@ -1341,8 +1365,7 @@ mod tests {
     fn streaming_request_is_read_only_and_does_not_clear_state() {
         let plane = test_plane();
         plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
 
         // Establish state through a non-streaming update.
         let update = MapRequest {
@@ -1408,8 +1431,7 @@ mod tests {
     fn streaming_first_request_sets_disco_key_but_not_endpoints_or_hostinfo() {
         let plane = test_plane();
         plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
 
         // A real client's first map request is often the streaming long-poll.
         // The disco key must still be applied, while endpoints/hostinfo stay
@@ -1461,8 +1483,7 @@ mod tests {
     fn lite_update_changes_endpoints_while_stream_open() {
         let plane = test_plane();
         plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
 
         // Establish state and open a long-poll stream.
         let update = MapRequest {
@@ -1518,8 +1539,7 @@ mod tests {
     fn machine_key_mismatch_returns_not_found() {
         let plane = test_plane();
         plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
         let request = MapRequest {
             version: 130,
             node_key: test_node_key(),
@@ -1560,8 +1580,7 @@ mod tests {
         {
             let plane = ControlPlane::open_sqlite(ControlConfig::default(), &db_path).unwrap();
             let response = plane
-                .register(test_machine_key(), test_register_request())
-                .unwrap();
+                .register(test_machine_key(), test_register_request());
             assert!(response.machine_authorized);
         }
 
@@ -1625,12 +1644,10 @@ mod tests {
         let node1 = NodeKey::from_bytes([0x41; 32]);
         let node2 = NodeKey::from_bytes([0x42; 32]);
         let first = plane
-            .register(test_machine_key(), request_with(node1, &key))
-            .unwrap();
+            .register(test_machine_key(), request_with(node1, &key));
         assert!(first.machine_authorized);
         let second = plane
-            .register(test_machine_key(), request_with(node2, &key))
-            .unwrap();
+            .register(test_machine_key(), request_with(node2, &key));
         assert!(!second.machine_authorized);
     }
 
@@ -1642,13 +1659,11 @@ mod tests {
             .unwrap();
         let node = NodeKey::from_bytes([0x43; 32]);
         let first = plane
-            .register(test_machine_key(), request_with(node, &key))
-            .unwrap();
+            .register(test_machine_key(), request_with(node, &key));
         assert!(first.machine_authorized);
         // Re-register the same node with the same key: still authorized.
         let second = plane
-            .register(test_machine_key(), request_with(node, &key))
-            .unwrap();
+            .register(test_machine_key(), request_with(node, &key));
         assert!(second.machine_authorized);
     }
 
@@ -1656,14 +1671,13 @@ mod tests {
     fn logout_returns_client_to_needs_login() {
         let plane = test_plane();
         plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
         let response = plane.logout(test_machine_key(), &test_node_key()).unwrap();
         assert!(!response.machine_authorized);
         // Re-register without auth: still logged out.
         let mut request = test_register_request();
         request.auth = None;
-        let response = plane.register(test_machine_key(), request).unwrap();
+        let response = plane.register(test_machine_key(), request);
         assert!(!response.machine_authorized);
     }
 
@@ -1671,8 +1685,7 @@ mod tests {
     fn logout_rejects_wrong_machine_key() {
         let plane = test_plane();
         plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
         // A different Noise machine key must not be able to log out the node.
         let other = MachineKey::from_bytes([0x99; 32]);
         let err = plane.logout(other, &test_node_key()).unwrap_err();
@@ -1700,8 +1713,7 @@ mod tests {
             .unwrap();
         let node = NodeKey::from_bytes([0x44; 32]);
         let response = plane
-            .register(test_machine_key(), request_with(node, &key))
-            .unwrap();
+            .register(test_machine_key(), request_with(node, &key));
         assert!(response.machine_authorized);
         let response = plane.logout(test_machine_key(), &node).unwrap();
         assert!(response.machine_authorized);
@@ -1715,8 +1727,7 @@ mod tests {
             .unwrap();
         let node = NodeKey::from_bytes([0x45; 32]);
         let response = plane
-            .register(test_machine_key(), request_with(node, &key))
-            .unwrap();
+            .register(test_machine_key(), request_with(node, &key));
         assert!(response.machine_authorized);
         let response = plane.logout(test_machine_key(), &node).unwrap();
         assert!(!response.machine_authorized);
@@ -1731,8 +1742,7 @@ mod tests {
             .unwrap();
         let node_key = NodeKey::from_bytes([0x46; 32]);
         let response = plane
-            .register(test_machine_key(), request_with(node_key, &key))
-            .unwrap();
+            .register(test_machine_key(), request_with(node_key, &key));
         assert!(response.machine_authorized);
 
         let node = plane
@@ -1740,7 +1750,7 @@ mod tests {
             .get_node_by_node_key(&node_key)
             .unwrap()
             .unwrap();
-        let session_id = plane.open_session(node.id, true).unwrap();
+        let session_id = plane.open_session(node.id, true);
         assert!(plane.is_node_online(node.id));
 
         // A live session cancels ephemeral GC even far in the future.
@@ -1756,7 +1766,7 @@ mod tests {
 
         // After the last session closes and the grace elapses, the ephemeral
         // node is deleted from the store.
-        plane.close_session(session_id).unwrap();
+        plane.close_session(session_id);
         let events = plane.reap_sessions_at(now + 1000);
         assert!(events.contains(&SessionEvent::EphemeralExpired(node.id)));
         assert!(
@@ -1791,8 +1801,7 @@ mod tests {
         plane.revoke_pre_auth_key(&prefix).unwrap();
         let node = NodeKey::from_bytes([0x46; 32]);
         let response = plane
-            .register(test_machine_key(), request_with(node, &key))
-            .unwrap();
+            .register(test_machine_key(), request_with(node, &key));
         assert!(!response.machine_authorized);
     }
 
@@ -1810,8 +1819,7 @@ mod tests {
             .unwrap();
         let node = NodeKey::from_bytes([0x47; 32]);
         let response = plane
-            .register(test_machine_key(), request_with(node, &key))
-            .unwrap();
+            .register(test_machine_key(), request_with(node, &key));
         assert!(!response.machine_authorized);
     }
 
@@ -1824,12 +1832,10 @@ mod tests {
         let node1 = NodeKey::from_bytes([0x48; 32]);
         let node2 = NodeKey::from_bytes([0x49; 32]);
         let first = plane
-            .register(test_machine_key(), request_with(node1, &key))
-            .unwrap();
+            .register(test_machine_key(), request_with(node1, &key));
         assert!(first.machine_authorized);
         let second = plane
-            .register(test_machine_key(), request_with(node2, &key))
-            .unwrap();
+            .register(test_machine_key(), request_with(node2, &key));
         assert!(second.machine_authorized);
     }
 
@@ -1844,8 +1850,7 @@ mod tests {
 
         // Register node A with a single-use key.
         let first = plane
-            .register(test_machine_key(), request_with(node_a, &first_key))
-            .unwrap();
+            .register(test_machine_key(), request_with(node_a, &first_key));
         assert!(first.machine_authorized);
 
         // Log out node A, then re-auth with a fresh single-use key.
@@ -1855,14 +1860,12 @@ mod tests {
             .create_pre_auth_key("reauth2", false, false, None, None)
             .unwrap();
         let reauth = plane
-            .register(test_machine_key(), request_with(node_a, &second_key))
-            .unwrap();
+            .register(test_machine_key(), request_with(node_a, &second_key));
         assert!(reauth.machine_authorized);
 
         // The same single-use key must not authorize a second distinct node.
         let second = plane
-            .register(test_machine_key(), request_with(node_b, &second_key))
-            .unwrap();
+            .register(test_machine_key(), request_with(node_b, &second_key));
         assert!(!second.machine_authorized);
     }
 
@@ -1870,11 +1873,10 @@ mod tests {
     fn past_expiry_logs_out_node() {
         let plane = test_plane();
         plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
         let mut request = test_register_request();
         request.expiry = "2000-01-01T00:00:00Z".to_string();
-        let response = plane.register(test_machine_key(), request).unwrap();
+        let response = plane.register(test_machine_key(), request);
         assert!(!response.machine_authorized);
         assert!(response.node_key_expired);
     }
@@ -1883,11 +1885,10 @@ mod tests {
     fn future_expiry_is_rejected() {
         let plane = test_plane();
         plane
-            .register(test_machine_key(), test_register_request())
-            .unwrap();
+            .register(test_machine_key(), test_register_request());
         let mut request = test_register_request();
         request.expiry = "2999-01-01T00:00:00Z".to_string();
-        let response = plane.register(test_machine_key(), request).unwrap();
+        let response = plane.register(test_machine_key(), request);
         assert!(!response.machine_authorized);
         assert!(!response.error.is_empty());
     }
@@ -1898,7 +1899,7 @@ mod tests {
         let mut request = test_register_request();
         request.node_key = NodeKey::from_bytes([0x53; 32]);
         request.expiry = "2000-01-01T00:00:00Z".to_string();
-        let response = plane.register(test_machine_key(), request).unwrap();
+        let response = plane.register(test_machine_key(), request);
         assert!(!response.machine_authorized);
         assert!(response.node_key_expired);
     }
@@ -1909,7 +1910,7 @@ mod tests {
         let mut request = test_register_request();
         request.node_key = NodeKey::from_bytes([0x54; 32]);
         request.expiry = "2999-01-01T00:00:00Z".to_string();
-        let response = plane.register(test_machine_key(), request).unwrap();
+        let response = plane.register(test_machine_key(), request);
         assert!(!response.machine_authorized);
         assert!(!response.error.is_empty());
     }
@@ -1926,7 +1927,7 @@ mod tests {
         let plane = test_plane();
         let mut request = test_register_request();
         request.auth = None;
-        let pending = plane.register(test_machine_key(), request).unwrap();
+        let pending = plane.register(test_machine_key(), request);
         assert!(!pending.machine_authorized);
         assert!(!pending.auth_url.is_empty());
         assert!(pending.error.is_empty());
@@ -1939,7 +1940,7 @@ mod tests {
         let mut followup = test_register_request();
         followup.auth = None;
         followup.followup = pending.auth_url.clone();
-        let response = plane.register(test_machine_key(), followup).unwrap();
+        let response = plane.register(test_machine_key(), followup);
         assert!(response.machine_authorized);
         assert!(
             plane
@@ -1955,7 +1956,7 @@ mod tests {
         let plane = test_plane();
         let mut request = test_register_request();
         request.auth = None;
-        let pending = plane.register(test_machine_key(), request).unwrap();
+        let pending = plane.register(test_machine_key(), request);
         let auth_id = auth_id_from_followup(&pending.auth_url).unwrap();
         plane
             .approve_pending(&auth_id, "owner@example.com")
@@ -1966,8 +1967,7 @@ mod tests {
         followup.auth = None;
         followup.followup = pending.auth_url.clone();
         let response = plane
-            .register(MachineKey::from_bytes([0x99; 32]), followup)
-            .unwrap();
+            .register(MachineKey::from_bytes([0x99; 32]), followup);
         assert!(!response.machine_authorized);
         assert!(!response.error.is_empty());
         assert!(
@@ -1984,14 +1984,14 @@ mod tests {
         let plane = test_plane();
         let mut request = test_register_request();
         request.auth = None;
-        let pending = plane.register(test_machine_key(), request).unwrap();
+        let pending = plane.register(test_machine_key(), request);
         let auth_id = auth_id_from_followup(&pending.auth_url).unwrap();
         plane.reject_pending(&auth_id).unwrap();
 
         let mut followup = test_register_request();
         followup.auth = None;
         followup.followup = pending.auth_url.clone();
-        let response = plane.register(test_machine_key(), followup).unwrap();
+        let response = plane.register(test_machine_key(), followup);
         assert!(!response.machine_authorized);
         assert!(!response.error.is_empty());
     }
@@ -2005,14 +2005,119 @@ mod tests {
         let plane = ControlPlane::new(config);
         let mut request = test_register_request();
         request.auth = None;
-        let pending = plane.register(test_machine_key(), request).unwrap();
+        let pending = plane.register(test_machine_key(), request);
         assert!(!pending.machine_authorized);
 
         let mut followup = test_register_request();
         followup.auth = None;
         followup.followup = pending.auth_url.clone();
-        let response = plane.register(test_machine_key(), followup).unwrap();
+        let response = plane.register(test_machine_key(), followup);
         assert!(!response.machine_authorized);
         assert!(response.error.contains("expired"));
+    }
+
+    #[test]
+    fn logged_out_node_is_not_advertised_as_peer() {
+        let plane = test_plane();
+        plane
+            .register(test_machine_key(), test_register_request());
+
+        // Register a second node with a distinct node and machine key.
+        let second_machine = MachineKey::from_bytes([0x12; 32]);
+        let second_node = NodeKey::from_bytes([0x23; 32]);
+        let mut second_request = test_register_request();
+        second_request.node_key = second_node;
+        let response = plane.register(second_machine, second_request);
+        assert!(response.machine_authorized);
+
+        // Log the second node out; it must no longer be advertised.
+        let logout = plane.logout(second_machine, &second_node).unwrap();
+        assert!(!logout.machine_authorized);
+
+        // Map as the first node: the logged-out node must not appear as a peer.
+        let request = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: false,
+            ..Default::default()
+        };
+        let outcome = plane.handle_map(test_machine_key(), request).unwrap();
+        let MapOutcome::FullFrame(frame) = outcome else {
+            panic!("expected full frame");
+        };
+        let (payload, _) = crabscale_proto::decode_map_response_frame(&frame).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        let peers = json["Peers"].as_array().expect("Peers must be an array");
+        assert!(peers.is_empty(), "logged-out node must not be advertised");
+    }
+
+    #[test]
+    fn non_default_user_gets_correct_requesting_profile() {
+        let plane = test_plane();
+        let mut request = test_register_request();
+        request.auth = None;
+        let pending = plane.register(test_machine_key(), request);
+        assert!(!pending.machine_authorized);
+
+        // Approve the registration under a non-default user.
+        let auth_id = auth_id_from_followup(&pending.auth_url).unwrap();
+        plane
+            .approve_pending(&auth_id, "alice@example.com")
+            .unwrap();
+
+        let mut followup = test_register_request();
+        followup.auth = None;
+        followup.followup = pending.auth_url.clone();
+        let response = plane.register(test_machine_key(), followup);
+        assert!(response.machine_authorized);
+
+        // Map as the requesting node: its user profile must be the non-default
+        // user, not the control plane's default user.
+        let request = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: false,
+            ..Default::default()
+        };
+        let outcome = plane.handle_map(test_machine_key(), request).unwrap();
+        let MapOutcome::FullFrame(frame) = outcome else {
+            panic!("expected full frame");
+        };
+        let (payload, _) = crabscale_proto::decode_map_response_frame(&frame).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+
+        let profiles = json["UserProfiles"]
+            .as_array()
+            .expect("UserProfiles must be an array");
+        assert_eq!(profiles.len(), 1, "only the requesting user is expected");
+        assert_eq!(
+            profiles[0]["LoginName"],
+            serde_json::json!("alice@example.com")
+        );
+        assert_ne!(
+            profiles[0]["ID"],
+            serde_json::json!(plane.config.user_id)
+        );
+    }
+
+    #[test]
+    fn mismatched_endpoint_types_are_rejected() {
+        let plane = test_plane();
+        plane
+            .register(test_machine_key(), test_register_request());
+
+        let request = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            endpoints: vec!["1.2.3.4:41641".to_string()],
+            endpoint_types: vec![1, 2],
+            stream: false,
+            ..Default::default()
+        };
+        let err = plane.handle_map(test_machine_key(), request).unwrap_err();
+        assert!(matches!(err, ControlError::InvalidEndpointTypes));
     }
 }
