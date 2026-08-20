@@ -5,30 +5,47 @@
 //! endpoints are served inside the HTTP/2-over-Noise connection and carry the
 //! Noise machine key recovered from the handshake.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use bytes::Bytes;
-use crabscale_proto::MachineKey;
+use crabscale_control::{ControlConfig, ControlError, ControlPlane, MapOutcome};
+use crabscale_proto::{MachineKey, MapRequest, RegisterRequest};
 use crabscale_transport::{
     MAX_INNER_BODY_LEN, NoiseStream, TransportError, random_challenge, read_body_limited,
     serve_http2,
 };
 use h2::RecvStream;
 use h2::server::SendResponse;
-use http::{Method, Request, Response, StatusCode};
+use http::{Request, Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// The protocol version reported by `/machine/whoami`.
 pub const PROTOCOL_VERSION: u16 = 130;
 
+/// Default keepalive interval for streaming map sessions.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(50);
+
 /// Router for the control API.
 #[derive(Clone)]
 pub struct ControlRouter {
     machine_key: MachineKey,
+    control: Arc<ControlPlane>,
 }
 
 impl ControlRouter {
-    /// Create a router for the given server machine key.
+    /// Create a router for the given server machine key with a default
+    /// in-memory control plane (test auth key `hskey-auth-test-secret`).
     pub fn new(machine_key: MachineKey) -> Self {
-        Self { machine_key }
+        Self::with_control(machine_key, ControlPlane::new(ControlConfig::default()))
+    }
+
+    /// Create a router with an explicit control plane.
+    pub fn with_control(machine_key: MachineKey, control: ControlPlane) -> Self {
+        Self {
+            machine_key,
+            control: Arc::new(control),
+        }
     }
 
     /// The machine key this router advertises and attaches to inner requests.
@@ -73,39 +90,172 @@ impl ControlRouter {
         let body_bytes = match read_body_limited(&mut body, MAX_INNER_BODY_LEN).await {
             Ok(b) => b,
             Err(TransportError::BodyTooLarge) => {
-                let response = Response::builder()
-                    .status(StatusCode::PAYLOAD_TOO_LARGE)
-                    .header("Content-Type", "text/plain")
-                    .body(())
-                    .expect("static response is valid");
-                let mut send = respond.send_response(response, false).unwrap();
-                let _ = send.send_data(Bytes::from_static(b"body too large"), true);
+                send_plain(
+                    &mut respond,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    b"body too large",
+                );
                 return;
             }
             Err(_) => {
-                let response = Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .header("Content-Type", "text/plain")
-                    .body(())
-                    .expect("static response is valid");
-                let mut send = respond.send_response(response, false).unwrap();
-                let _ = send.send_data(Bytes::from_static(b"invalid request body"), true);
+                send_plain(
+                    &mut respond,
+                    StatusCode::BAD_REQUEST,
+                    b"invalid request body",
+                );
                 return;
             }
         };
 
-        let (status, content_type, body) = route_inner(&method, &path, machine_key, &body_bytes);
+        match (method.as_str(), path.as_str()) {
+            ("GET", "/machine/whoami") => {
+                let body = serde_json::json!({
+                    "machineKey": machine_key.to_string(),
+                    "protocolVersion": PROTOCOL_VERSION,
+                });
+                send_json(&mut respond, StatusCode::OK, body.to_string().into_bytes());
+            }
+            ("POST", "/machine/register") => {
+                self.handle_register(&mut respond, machine_key, &body_bytes)
+                    .await;
+            }
+            ("POST", "/machine/map") => {
+                self.handle_map(&mut respond, machine_key, &body_bytes)
+                    .await;
+            }
+            ("POST", "/machine/set-dns")
+            | ("PATCH", "/machine/set-device-attr")
+            | ("POST", "/machine/audit-log")
+            | ("POST", "/machine/id-token")
+            | ("POST", "/machine/feature/query")
+            | ("POST", "/machine/update-health")
+            | ("POST", "/machine/c2n") => {
+                send_plain(
+                    &mut respond,
+                    StatusCode::NOT_IMPLEMENTED,
+                    b"not implemented",
+                );
+            }
+            _ => {
+                send_plain(&mut respond, StatusCode::NOT_FOUND, b"not found");
+            }
+        }
+    }
+
+    async fn handle_register(
+        &self,
+        respond: &mut SendResponse<Bytes>,
+        machine_key: MachineKey,
+        body: &[u8],
+    ) {
+        let request: RegisterRequest = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(_) => {
+                send_plain(
+                    respond,
+                    StatusCode::BAD_REQUEST,
+                    b"invalid register request",
+                );
+                return;
+            }
+        };
+        match self.control.register(machine_key, request) {
+            Ok(response) => {
+                let body = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
+                send_json(respond, StatusCode::OK, body);
+            }
+            Err(_) => {
+                send_plain(
+                    respond,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"internal error",
+                );
+            }
+        }
+    }
+
+    async fn handle_map(
+        &self,
+        respond: &mut SendResponse<Bytes>,
+        machine_key: MachineKey,
+        body: &[u8],
+    ) {
+        let request: MapRequest = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(_) => {
+                send_plain(respond, StatusCode::BAD_REQUEST, b"invalid map request");
+                return;
+            }
+        };
+        match self.control.handle_map(machine_key, request) {
+            Ok(MapOutcome::LiteUpdate) => {
+                send_empty(respond, StatusCode::OK);
+            }
+            Ok(MapOutcome::FullFrame(frame)) => {
+                send_bytes(respond, StatusCode::OK, frame);
+            }
+            Ok(MapOutcome::Stream {
+                first_frame,
+                keep_alive,
+                compress,
+            }) => {
+                self.send_stream(respond, first_frame, keep_alive, compress)
+                    .await;
+            }
+            Err(ControlError::NotFound) => {
+                send_plain(respond, StatusCode::NOT_FOUND, b"node not found");
+            }
+            Err(ControlError::UnsupportedVersion(_)) => {
+                send_plain(
+                    respond,
+                    StatusCode::BAD_REQUEST,
+                    b"unsupported capability version",
+                );
+            }
+            Err(_) => {
+                send_plain(
+                    respond,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"internal error",
+                );
+            }
+        }
+    }
+
+    async fn send_stream(
+        &self,
+        respond: &mut SendResponse<Bytes>,
+        first_frame: Vec<u8>,
+        keep_alive: bool,
+        compress: bool,
+    ) {
         let response = Response::builder()
-            .status(status)
-            .header("Content-Type", content_type)
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/octet-stream")
             .body(())
             .expect("static response is valid");
-        let mut send = match respond.send_response(response, body.is_empty()) {
+        let mut send = match respond.send_response(response, false) {
             Ok(s) => s,
             Err(_) => return,
         };
-        if !body.is_empty() {
-            let _ = send.send_data(body, true);
+        if send.send_data(Bytes::from(first_frame), false).is_err() {
+            return;
+        }
+        if !keep_alive {
+            let _ = send.send_data(Bytes::new(), true);
+            return;
+        }
+        loop {
+            // Spec-NetMap §5: keepalive every 50s plus 0-9s random jitter.
+            let jitter = Duration::from_secs(rand::random::<u64>() % 10);
+            tokio::time::sleep(KEEPALIVE_INTERVAL + jitter).await;
+            let frame = match self.control.keepalive_frame(compress) {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+            if send.send_data(Bytes::from(frame), false).is_err() {
+                break;
+            }
         }
     }
 }
@@ -134,41 +284,48 @@ where
     .await
 }
 
-fn route_inner(
-    method: &Method,
-    path: &str,
-    machine_key: MachineKey,
-    _body: &[u8],
-) -> (StatusCode, &'static str, Bytes) {
-    match (method.as_str(), path) {
-        ("GET", "/machine/whoami") => {
-            let body = serde_json::json!({
-                "machineKey": machine_key.to_string(),
-                "protocolVersion": PROTOCOL_VERSION,
-            });
-            (
-                StatusCode::OK,
-                "application/json",
-                Bytes::from(body.to_string()),
-            )
-        }
-        ("POST", "/machine/set-dns")
-        | ("PATCH", "/machine/set-device-attr")
-        | ("POST", "/machine/audit-log")
-        | ("POST", "/machine/id-token")
-        | ("POST", "/machine/feature/query")
-        | ("POST", "/machine/update-health")
-        | ("POST", "/machine/c2n") => (
-            StatusCode::NOT_IMPLEMENTED,
-            "text/plain",
-            Bytes::from_static(b"not implemented"),
-        ),
-        _ => (
-            StatusCode::NOT_FOUND,
-            "text/plain",
-            Bytes::from_static(b"not found"),
-        ),
-    }
+fn send_plain(respond: &mut SendResponse<Bytes>, status: StatusCode, text: &'static [u8]) {
+    let response = Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain")
+        .body(())
+        .expect("static response is valid");
+    let Ok(mut send) = respond.send_response(response, false) else {
+        return;
+    };
+    let _ = send.send_data(Bytes::from_static(text), true);
+}
+
+fn send_json(respond: &mut SendResponse<Bytes>, status: StatusCode, body: Vec<u8>) {
+    let response = Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(())
+        .expect("static response is valid");
+    let Ok(mut send) = respond.send_response(response, false) else {
+        return;
+    };
+    let _ = send.send_data(Bytes::from(body), true);
+}
+
+fn send_bytes(respond: &mut SendResponse<Bytes>, status: StatusCode, body: Vec<u8>) {
+    let response = Response::builder()
+        .status(status)
+        .header("Content-Type", "application/octet-stream")
+        .body(())
+        .expect("static response is valid");
+    let Ok(mut send) = respond.send_response(response, false) else {
+        return;
+    };
+    let _ = send.send_data(Bytes::from(body), true);
+}
+
+fn send_empty(respond: &mut SendResponse<Bytes>, status: StatusCode) {
+    let response = Response::builder()
+        .status(status)
+        .body(())
+        .expect("static response is valid");
+    let _ = respond.send_response(response, true);
 }
 
 fn key_bad_request() -> Response<Bytes> {
