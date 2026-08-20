@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crabscale_proto::{
-    DerpMap, FilterRule, MIN_SUPPORTED_CAPVER, MachineKey, MapRequest, MapResponse, NetPortRange,
-    Node, NodeKey, RegisterRequest, RegisterResponse, UserProfile, encode_map_response_frame,
+    DerpMap, MIN_SUPPORTED_CAPVER, MachineKey, MapRequest, MapResponse, Node, NodeKey,
+    RegisterRequest, RegisterResponse, UserProfile, encode_map_response_frame,
 };
 
 pub use ip_allocator::{IpAllocator, IpAllocatorError};
@@ -61,6 +61,8 @@ pub struct ControlConfig {
     pub tailnet_domain: String,
     /// DERP regions advertised to clients.
     pub derp_map: DerpMap,
+    /// The access-control policy compiled into per-node packet filters.
+    pub policy: crabscale_policy::Policy,
     /// User ID assigned to registered nodes.
     pub user_id: u64,
     /// Login ID assigned to registered nodes.
@@ -113,6 +115,8 @@ impl Default for ControlConfig {
             protocol_version: 130,
             tailnet_domain: "tailnet.example".to_string(),
             derp_map,
+            // No rules configured by default: everything is denied.
+            policy: crabscale_policy::Policy::default(),
             user_id: 1,
             login_id: 1,
             user_login_name: "owner@example.com".to_string(),
@@ -1000,26 +1004,33 @@ impl ControlPlane {
 
     /// Build the first complete MapResponse for a node.
     ///
-    /// The peer list is built from every other registered node, sorted by node
-    /// ID, and user profiles are emitted for the requesting user and each peer
-    /// user (Spec-NetMap section 3).
+    /// The access-control policy is compiled against the current node set to
+    /// derive this node's base filter and the set of peers it may see. The
+    /// peer list is built from every visible, authorized node, sorted by node
+    /// ID, and user profiles are emitted for the requesting user and each
+    /// peer user (Spec-NetMap section 3, Spec-Policy section 3).
     pub fn build_initial_map(
         &self,
         node: &Node,
         _request: &MapRequest,
     ) -> Result<MapResponse, ControlError> {
+        let compiled =
+            crabscale_policy::compile_policy(&self.config.policy, &self.compile_nodes()?);
+
+        // Per-node reduced base filter; empty means deny all.
+        let base = compiled
+            .node_filters
+            .get(&node.id)
+            .cloned()
+            .unwrap_or_default();
         let mut packet_filters = BTreeMap::new();
-        packet_filters.insert(
-            "base".to_string(),
-            vec![FilterRule {
-                src_ips: vec!["*".to_string()],
-                dst_ports: vec![NetPortRange {
-                    first: 0,
-                    last: 65535,
-                }],
-                ..Default::default()
-            }],
-        );
+        packet_filters.insert("base".to_string(), base);
+
+        let visible = compiled
+            .peer_visibility
+            .get(&node.id)
+            .cloned()
+            .unwrap_or_default();
 
         let mut peers = Vec::new();
         let mut user_ids = std::collections::BTreeSet::new();
@@ -1029,11 +1040,17 @@ impl ControlPlane {
             .list_nodes()
             .map_err(|e| ControlError::Store(e.to_string()))?
         {
+            // Do not advertise a node to itself.
             if stored.node_key == node.key {
                 continue;
             }
             // A logged-out node must not be advertised as a peer.
             if !stored.machine_authorized {
+                continue;
+            }
+            // A peer invisible in both directions is absent from the map
+            // (Spec-Policy section 3).
+            if !visible.contains(&(stored.id as u64)) {
                 continue;
             }
             user_ids.insert(stored.user_id);
@@ -1069,6 +1086,29 @@ impl ControlPlane {
             control_time: CONTROL_TIME.to_string(),
             ..Default::default()
         })
+    }
+
+    /// Snapshot the registered nodes in the shape the policy compiler needs.
+    fn compile_nodes(&self) -> Result<Vec<crabscale_policy::CompileNode>, ControlError> {
+        let mut nodes = Vec::new();
+        for stored in self
+            .store
+            .list_nodes()
+            .map_err(|e| ControlError::Store(e.to_string()))?
+        {
+            let user_login = self
+                .store
+                .get_user(stored.user_id)
+                .map_err(|e| ControlError::Store(e.to_string()))?
+                .map(|u| u.login_name);
+            nodes.push(crabscale_policy::CompileNode {
+                id: stored.id as u64,
+                user_login,
+                addresses: stored.addresses.clone(),
+                tags: stored.tags.clone().unwrap_or_default(),
+            });
+        }
+        Ok(nodes)
     }
 
     /// Serialize and frame a MapResponse, optionally zstd-compressing the
@@ -1124,8 +1164,20 @@ mod tests {
     use super::*;
     use crabscale_proto::{DiscoKey, Hostinfo, MapRequest, NetInfo, NodeKey, RegisterRequest};
 
+    /// The allow-all policy used by tests that exercise registration, map
+    /// building, and streaming mechanics (the historical default behavior).
+    fn allow_all_policy() -> crabscale_policy::Policy {
+        crabscale_policy::parse_policy(
+            r#"{ "acls": [ { "action": "accept", "src": ["*"], "dst": ["*:*"] } ] }"#,
+        )
+        .expect("allow-all policy must parse")
+    }
+
     fn test_plane() -> ControlPlane {
-        ControlPlane::new(ControlConfig::default())
+        ControlPlane::new(ControlConfig {
+            policy: allow_all_policy(),
+            ..ControlConfig::default()
+        })
     }
 
     fn test_machine_key() -> MachineKey {
@@ -1134,6 +1186,51 @@ mod tests {
 
     fn test_node_key() -> NodeKey {
         NodeKey::from_bytes([0x22; 32])
+    }
+
+    fn register_extra_node(plane: &ControlPlane, machine: [u8; 32], node: [u8; 32]) {
+        let mut request = test_register_request();
+        request.node_key = NodeKey::from_bytes(node);
+        let response = plane.register(MachineKey::from_bytes(machine), request);
+        assert!(response.machine_authorized);
+    }
+
+    /// Map as `node_id` and return the decoded MapResponse JSON.
+    fn map_json(plane: &ControlPlane, node_id: u64) -> serde_json::Value {
+        let stored = plane.store.list_nodes().unwrap();
+        let node = stored
+            .into_iter()
+            .find(|n| n.id as u64 == node_id)
+            .expect("node must exist");
+        let request = MapRequest {
+            version: 130,
+            node_key: node.node_key,
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: false,
+            ..Default::default()
+        };
+        let outcome = plane.handle_map(node.machine_key, request).unwrap();
+        let MapOutcome::FullFrame(frame) = outcome else {
+            panic!("expected full frame");
+        };
+        let (payload, consumed) = crabscale_proto::decode_map_response_frame(&frame).unwrap();
+        assert_eq!(consumed, frame.len());
+        serde_json::from_slice(payload).unwrap()
+    }
+
+    /// Extract the stable IDs of a MapResponse's peer array, sorted.
+    fn peer_stable_ids(json: &serde_json::Value) -> Vec<String> {
+        json["Peers"]
+            .as_array()
+            .expect("Peers must be an array")
+            .iter()
+            .map(|p| {
+                p["StableID"]
+                    .as_str()
+                    .expect("StableID must be a string")
+                    .to_string()
+            })
+            .collect()
     }
 
     fn test_register_request() -> RegisterRequest {
@@ -2081,5 +2178,90 @@ mod tests {
         };
         let err = plane.handle_map(test_machine_key(), request).unwrap_err();
         assert!(matches!(err, ControlError::InvalidEndpointTypes));
+    }
+
+    #[test]
+    fn deny_all_policy_serializes_empty_base_filter() {
+        // A fresh plane uses the default deny-all policy.
+        let plane = ControlPlane::new(ControlConfig::default());
+        plane.register(test_machine_key(), test_register_request());
+
+        let json = map_json(&plane, 1);
+        assert_eq!(
+            json["PacketFilters"]["base"],
+            serde_json::json!([]),
+            "deny-all must serialize an empty base filter as []"
+        );
+    }
+
+    #[test]
+    fn packet_filters_are_per_node_reduced() {
+        let mut plane = test_plane();
+        plane.register(test_machine_key(), test_register_request());
+        register_extra_node(&plane, [0x12; 32], [0x23; 32]);
+
+        // Allocated addresses are random, so build the policy from the
+        // addresses actually assigned to the nodes on this plane.
+        let nodes = plane.store.list_nodes().unwrap();
+        let n1_addr = nodes.iter().find(|n| n.id == 1).unwrap().addresses[0].clone();
+        let n2_addr = nodes.iter().find(|n| n.id == 2).unwrap().addresses[0].clone();
+        plane.config.policy = crabscale_policy::parse_policy(&format!(
+            r#"{{ "acls": [ {{ "action": "accept", "src": ["{n1_addr}"], "dst": ["{n2_addr}:22"] }} ] }}"#
+        ))
+        .expect("policy must parse");
+
+        // Node 1 (the source) has no rules on its own filter.
+        let n1 = map_json(&plane, 1);
+        assert_eq!(n1["PacketFilters"]["base"], serde_json::json!([]));
+        assert_eq!(
+            peer_stable_ids(&n1),
+            vec!["n00000000000000000000002".to_string()]
+        );
+
+        // Node 2 (the destination) carries the compiled rule.
+        let n2 = map_json(&plane, 2);
+        assert_eq!(
+            n2["PacketFilters"]["base"],
+            serde_json::json!([
+                {
+                    "SrcIPs": [n1_addr],
+                    "DstPorts": [{ "First": 22, "Last": 22 }]
+                }
+            ])
+        );
+        assert_eq!(
+            peer_stable_ids(&n2),
+            vec!["n00000000000000000000001".to_string()]
+        );
+    }
+
+    #[test]
+    fn peer_invisible_in_both_directions_is_absent_from_map() {
+        let mut plane = test_plane();
+        plane.register(test_machine_key(), test_register_request()); // node 1
+        register_extra_node(&plane, [0x12; 32], [0x23; 32]); // node 2
+        register_extra_node(&plane, [0x13; 32], [0x24; 32]); // node 3
+
+        let nodes = plane.store.list_nodes().unwrap();
+        let n1_addr = nodes.iter().find(|n| n.id == 1).unwrap().addresses[0].clone();
+        let n2_addr = nodes.iter().find(|n| n.id == 2).unwrap().addresses[0].clone();
+        plane.config.policy = crabscale_policy::parse_policy(&format!(
+            r#"{{ "acls": [ {{ "action": "accept", "src": ["{n1_addr}"], "dst": ["{n2_addr}:*"] }} ] }}"#
+        ))
+        .expect("policy must parse");
+
+        // Node 3 is invisible in both directions and must not appear anywhere.
+        let n1 = map_json(&plane, 1);
+        assert_eq!(
+            peer_stable_ids(&n1),
+            vec!["n00000000000000000000002".to_string()]
+        );
+        let n2 = map_json(&plane, 2);
+        assert_eq!(
+            peer_stable_ids(&n2),
+            vec!["n00000000000000000000001".to_string()]
+        );
+        let n3 = map_json(&plane, 3);
+        assert_eq!(n3["Peers"], serde_json::json!([]));
     }
 }
