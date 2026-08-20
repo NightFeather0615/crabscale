@@ -11,12 +11,14 @@ mod ip_allocator;
 mod model;
 mod pending;
 mod preauth;
+mod session;
 mod store;
 mod time;
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crabscale_proto::{
@@ -32,6 +34,7 @@ pub use pending::{
 pub use preauth::{
     AUTH_KEY_PREFIX, format_auth_key, generate_secret, hash_secret, parse_auth_key, verify_secret,
 };
+pub use session::{DEFAULT_RECONNECT_GRACE_SECONDS, SessionEvent, SessionRegistry};
 pub use store::{SqliteStore, Store, StoreError};
 
 /// Minimum capability version accepted by the control plane.
@@ -81,6 +84,9 @@ pub struct ControlConfig {
     pub pending_ttl_seconds: i64,
     /// Maximum number of pending interactive registrations kept in memory.
     pub pending_cache_limit: usize,
+    /// Reconnect grace in seconds before a node is marked offline after its
+    /// last live map session closes.
+    pub reconnect_grace_seconds: i64,
 }
 
 impl Default for ControlConfig {
@@ -118,6 +124,7 @@ impl Default for ControlConfig {
             server_url: "https://tailnet.example".to_string(),
             pending_ttl_seconds: DEFAULT_PENDING_TTL_SECONDS,
             pending_cache_limit: DEFAULT_PENDING_CACHE_LIMIT,
+            reconnect_grace_seconds: DEFAULT_RECONNECT_GRACE_SECONDS,
         }
     }
 }
@@ -175,6 +182,8 @@ pub enum MapOutcome {
         keep_alive: bool,
         /// Whether frames should be zstd-compressed.
         compress: bool,
+        /// The live map session id to close when the stream ends.
+        session_id: i64,
     },
 }
 
@@ -183,6 +192,8 @@ pub struct ControlPlane {
     config: ControlConfig,
     store: Arc<dyn Store>,
     pending: Mutex<pending::PendingCache>,
+    sessions: Mutex<SessionRegistry>,
+    reaper_started: AtomicBool,
 }
 
 impl Clone for ControlPlane {
@@ -218,11 +229,67 @@ impl ControlPlane {
     /// Create a control plane with an explicit store.
     pub fn with_store(config: ControlConfig, store: Arc<dyn Store>) -> Self {
         let pending = Mutex::new(pending::PendingCache::new(config.pending_cache_limit));
+        let sessions = Mutex::new(SessionRegistry::new(config.reconnect_grace_seconds));
         Self {
             config,
             store,
             pending,
+            sessions,
+            reaper_started: AtomicBool::new(false),
         }
+    }
+
+    /// Open a live map session for a node.
+    ///
+    /// Returns a session id that the caller must pass to [`Self::close_session`]
+    /// when the streaming map connection ends.
+    pub fn open_session(&self, node_id: i64, ephemeral: bool) -> Result<i64, ControlError> {
+        let now = time::now_unix();
+        let mut sessions = self.sessions.lock().unwrap();
+        let (session_id, _events) = sessions.open(node_id, ephemeral, now);
+        Ok(session_id)
+    }
+
+    /// Close a live map session by id.
+    pub fn close_session(&self, session_id: i64) -> Result<(), ControlError> {
+        let now = time::now_unix();
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.close(session_id, now);
+        Ok(())
+    }
+
+    /// Atomically claim the single background reaper slot.
+    ///
+    /// Returns `true` for exactly one caller; the caller should then spawn the
+    /// periodic task that calls [`Self::reap_sessions`]. Subsequent callers
+    /// receive `false` and must not spawn a second reaper.
+    pub fn claim_reaper(&self) -> bool {
+        !self.reaper_started.swap(true, Ordering::SeqCst)
+    }
+
+    /// Advance session lifecycle timers, emitting offline transitions and
+    /// deleting ephemeral nodes whose grace period has elapsed.
+    pub fn reap_sessions(&self) -> Vec<SessionEvent> {
+        self.reap_sessions_at(time::now_unix())
+    }
+
+    /// Like [`Self::reap_sessions`] but with an explicit clock, for tests.
+    fn reap_sessions_at(&self, now: i64) -> Vec<SessionEvent> {
+        let events = self.sessions.lock().unwrap().tick(now);
+        for event in &events {
+            if let SessionEvent::EphemeralExpired(node_id) = event {
+                if let Ok(Some(node)) = self.store.get_node_by_id(*node_id) {
+                    let _ = self.store.delete_node(&node.node_key);
+                }
+            }
+        }
+        events
+    }
+
+    /// Whether a node currently has a live session or is inside its reconnect
+    /// grace window.
+    pub fn is_node_online(&self, node_id: i64) -> bool {
+        self.sessions.lock().unwrap().is_online(node_id)
     }
 
     /// Register a node key for the given Noise machine key.
@@ -886,10 +953,12 @@ impl ControlPlane {
         let frame = self.encode_frame(&response, compress)?;
 
         if streaming {
+            let session_id = self.open_session(node.id, node.ephemeral)?;
             Ok(MapOutcome::Stream {
                 first_frame: frame,
                 keep_alive: request.keep_alive,
                 compress,
+                session_id,
             })
         } else {
             Ok(MapOutcome::FullFrame(frame))
@@ -1624,6 +1693,51 @@ mod tests {
         let response = plane.logout(&node).unwrap();
         assert!(!response.machine_authorized);
         assert!(plane.store.get_node_by_node_key(&node).unwrap().is_none());
+    }
+
+    #[test]
+    fn reap_sessions_deletes_expired_ephemeral_node() {
+        let plane = test_plane();
+        let key = plane
+            .create_pre_auth_key("ephgc", true, true, None, None)
+            .unwrap();
+        let node_key = NodeKey::from_bytes([0x46; 32]);
+        let response = plane
+            .register(test_machine_key(), request_with(node_key, &key))
+            .unwrap();
+        assert!(response.machine_authorized);
+
+        let node = plane
+            .store
+            .get_node_by_node_key(&node_key)
+            .unwrap()
+            .unwrap();
+        let session_id = plane.open_session(node.id, true).unwrap();
+        assert!(plane.is_node_online(node.id));
+
+        // A live session cancels ephemeral GC even far in the future.
+        let now = time::now_unix();
+        assert!(plane.reap_sessions_at(now + 1000).is_empty());
+        assert!(
+            plane
+                .store
+                .get_node_by_node_key(&node_key)
+                .unwrap()
+                .is_some()
+        );
+
+        // After the last session closes and the grace elapses, the ephemeral
+        // node is deleted from the store.
+        plane.close_session(session_id).unwrap();
+        let events = plane.reap_sessions_at(now + 1000);
+        assert!(events.contains(&SessionEvent::EphemeralExpired(node.id)));
+        assert!(
+            plane
+                .store
+                .get_node_by_node_key(&node_key)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
