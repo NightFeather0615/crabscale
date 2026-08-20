@@ -98,7 +98,7 @@ async fn handle_connection(
         return Ok(());
     };
 
-    if method == "GET" && path.starts_with("/key") {
+    if method == "GET" && (path == "/key" || path.starts_with("/key?")) {
         let capver = query_param(&path, "v");
         let response = router.handle_key(capver);
         let status = response.status().as_u16();
