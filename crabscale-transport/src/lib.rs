@@ -7,7 +7,6 @@
 //! Wire rules are documented in the project wiki:
 //! [Spec-Transport](https://github.com/NightFeather0615/crabscale/wiki/Spec-Transport.md).
 
-mod blocking;
 mod early;
 mod error;
 mod http2;
@@ -18,7 +17,6 @@ mod record;
 mod stream;
 mod upgrade;
 
-pub use blocking::BlockingTcpStream;
 pub use early::{
     EARLY_PAYLOAD_MAGIC, decode_early_payload, encode_early_payload, random_challenge,
 };
