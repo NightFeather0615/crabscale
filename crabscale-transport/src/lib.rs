@@ -9,6 +9,7 @@
 
 mod early;
 mod error;
+mod http2;
 mod loopback;
 mod messages;
 mod noise;
@@ -20,6 +21,7 @@ pub use early::{
     EARLY_PAYLOAD_MAGIC, decode_early_payload, encode_early_payload, random_challenge,
 };
 pub use error::TransportError;
+pub use http2::{MAX_INNER_BODY_LEN, read_body_limited, serve_http2};
 pub use loopback::loopback_handshake;
 pub use messages::{
     AEAD_TAG_LEN, INIT_MESSAGE_LEN, InitMessage, MAX_EARLY_PAYLOAD_LEN, MAX_RECORD_FRAME_SIZE,
