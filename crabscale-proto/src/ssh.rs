@@ -33,7 +33,7 @@ pub struct SshRule {
     /// Map of requested SSH user to local user. An empty value means the
     /// rule does not match that user; the value `"="` means the SSH user maps
     /// directly to the local user.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(rename = "SSHUsers", skip_serializing_if = "BTreeMap::is_empty")]
     pub ssh_users: BTreeMap<String, String>,
     /// The action to take when this rule matches.
     #[serde(skip_serializing_if = "Option::is_none")]
