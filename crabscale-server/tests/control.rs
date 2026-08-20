@@ -2,22 +2,46 @@
 
 use crabscale_proto::MachineKey;
 use crabscale_server::{ControlRouter, serve_control};
-use crabscale_transport::{NoiseResponder, loopback_handshake};
+use crabscale_transport::{
+    EARLY_PAYLOAD_MAGIC, NoiseResponder, NoiseStream, decode_early_payload, loopback_handshake,
+};
 use h2::client;
+use tokio::io::DuplexStream;
 use x25519_dalek::StaticSecret;
+
+/// Read and discard the early payload the server writes before the HTTP/2
+/// preface (Spec-Transport section 5).
+async fn read_early_payload(stream: &mut NoiseStream<DuplexStream>) {
+    let mut magic = [0u8; EARLY_PAYLOAD_MAGIC.len()];
+    stream.read_exact(&mut magic).await.unwrap();
+    assert_eq!(&magic, &EARLY_PAYLOAD_MAGIC);
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await.unwrap();
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body).await.unwrap();
+    let mut buf = Vec::with_capacity(magic.len() + len_buf.len() + body.len());
+    buf.extend_from_slice(&magic);
+    buf.extend_from_slice(&len_buf);
+    buf.extend_from_slice(&body);
+    let _ = decode_early_payload(&buf).unwrap();
+}
 
 #[tokio::test]
 async fn whoami_over_noise_returns_machine_key() {
     let server = NoiseResponder::random();
     let machine_key = MachineKey::from_bytes(server.public_key().to_bytes());
     let router = ControlRouter::new(machine_key);
-    let (client_stream, server_stream) = loopback_handshake(&server, StaticSecret::random(), 113)
-        .await
-        .unwrap();
+    let (mut client_stream, server_stream) =
+        loopback_handshake(&server, StaticSecret::random(), 113)
+            .await
+            .unwrap();
 
     let server_task = tokio::spawn(async move {
         let _ = serve_control(server_stream, router).await;
     });
+
+    read_early_payload(&mut client_stream).await;
 
     let (mut client, conn) = client::handshake(client_stream).await.unwrap();
     tokio::spawn(async move {
@@ -50,13 +74,16 @@ async fn stub_route_returns_501() {
     let server = NoiseResponder::random();
     let machine_key = MachineKey::from_bytes(server.public_key().to_bytes());
     let router = ControlRouter::new(machine_key);
-    let (client_stream, server_stream) = loopback_handshake(&server, StaticSecret::random(), 113)
-        .await
-        .unwrap();
+    let (mut client_stream, server_stream) =
+        loopback_handshake(&server, StaticSecret::random(), 113)
+            .await
+            .unwrap();
 
     let server_task = tokio::spawn(async move {
         let _ = serve_control(server_stream, router).await;
     });
+
+    read_early_payload(&mut client_stream).await;
 
     let (mut client, conn) = client::handshake(client_stream).await.unwrap();
     tokio::spawn(async move {

@@ -9,12 +9,13 @@
 use std::future::Future;
 
 use bytes::Bytes;
-use crabscale_proto::MachineKey;
+use crabscale_proto::{ChallengeKey, MachineKey};
 use h2::RecvStream;
 use h2::server::{self, SendResponse};
 use http::Request;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::early::encode_early_payload;
 use crate::error::TransportError;
 use crate::stream::NoiseStream;
 
@@ -23,12 +24,16 @@ pub const MAX_INNER_BODY_LEN: usize = 1024 * 1024;
 
 /// Serve HTTP/2 requests on a Noise stream.
 ///
-/// Each accepted request is passed to `handler` together with the Noise
-/// machine public key recovered from the handshake. The handler is spawned as
-/// a separate task so concurrent streams are served independently.
+/// Before the HTTP/2 preface, the server writes the early payload carrying
+/// `challenge` (Spec-Transport section 5). Each accepted request is then passed to
+/// `handler` together with the Noise machine public key recovered from the
+/// handshake. The handler is spawned as a detached task so concurrent streams
+/// are served independently; in-flight handlers are dropped when the
+/// connection closes.
 pub async fn serve_http2<T, H, Fut>(
-    stream: NoiseStream<T>,
+    mut stream: NoiseStream<T>,
     machine_key: MachineKey,
+    challenge: ChallengeKey,
     handler: H,
 ) -> Result<(), TransportError>
 where
@@ -36,6 +41,12 @@ where
     H: Fn(Request<RecvStream>, SendResponse<Bytes>, MachineKey) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    let early = encode_early_payload(challenge)?;
+    stream
+        .write_all(&early)
+        .await
+        .map_err(|e| TransportError::Http2(e.to_string()))?;
+
     let mut connection = server::handshake(stream)
         .await
         .map_err(|e| TransportError::Http2(e.to_string()))?;
@@ -73,9 +84,10 @@ pub async fn read_body_limited(
 mod tests {
     use super::*;
     use h2::client;
-    use tokio::io::duplex;
+    use tokio::io::{DuplexStream, duplex};
     use x25519_dalek::StaticSecret;
 
+    use crate::early::{EARLY_PAYLOAD_MAGIC, decode_early_payload, random_challenge};
     use crate::loopback::loopback_handshake;
     use crate::noise::NoiseResponder;
 
@@ -83,7 +95,8 @@ mod tests {
     async fn serves_http2_over_noise_with_machine_key() {
         let server = NoiseResponder::random();
         let machine_key = MachineKey::from_bytes(server.public_key().to_bytes());
-        let (client_stream, server_stream) =
+        let challenge = random_challenge();
+        let (mut client_stream, server_stream) =
             loopback_handshake(&server, StaticSecret::random(), 113)
                 .await
                 .unwrap();
@@ -92,6 +105,7 @@ mod tests {
             serve_http2(
                 server_stream,
                 machine_key,
+                challenge,
                 |request, mut respond, key| async move {
                     let (_, mut body) = request.into_parts();
                     let _ = read_body_limited(&mut body, MAX_INNER_BODY_LEN).await;
@@ -102,6 +116,11 @@ mod tests {
             )
             .await
         });
+
+        // The server writes the early payload before the HTTP/2 preface; read
+        // and verify it on the client side.
+        let received = read_early_payload(&mut client_stream).await;
+        assert_eq!(received, challenge);
 
         let (mut client, conn) = client::handshake(client_stream).await.unwrap();
         tokio::spawn(async move {
@@ -127,6 +146,22 @@ mod tests {
         // The server task runs until the connection closes; the response has
         // already been verified, so we let the runtime drop it.
         drop(server_task);
+    }
+
+    async fn read_early_payload(stream: &mut NoiseStream<DuplexStream>) -> ChallengeKey {
+        let mut magic = [0u8; EARLY_PAYLOAD_MAGIC.len()];
+        stream.read_exact(&mut magic).await.unwrap();
+        assert_eq!(&magic, &EARLY_PAYLOAD_MAGIC);
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).await.unwrap();
+        let mut buf = Vec::with_capacity(magic.len() + len_buf.len() + body.len());
+        buf.extend_from_slice(&magic);
+        buf.extend_from_slice(&len_buf);
+        buf.extend_from_slice(&body);
+        decode_early_payload(&buf).unwrap()
     }
 
     #[tokio::test]

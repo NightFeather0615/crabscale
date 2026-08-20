@@ -8,7 +8,8 @@
 use bytes::Bytes;
 use crabscale_proto::MachineKey;
 use crabscale_transport::{
-    MAX_INNER_BODY_LEN, NoiseStream, TransportError, read_body_limited, serve_http2,
+    MAX_INNER_BODY_LEN, NoiseStream, TransportError, random_challenge, read_body_limited,
+    serve_http2,
 };
 use h2::RecvStream;
 use h2::server::SendResponse;
@@ -71,7 +72,7 @@ impl ControlRouter {
 
         let body_bytes = match read_body_limited(&mut body, MAX_INNER_BODY_LEN).await {
             Ok(b) => b,
-            Err(_) => {
+            Err(TransportError::BodyTooLarge) => {
                 let response = Response::builder()
                     .status(StatusCode::PAYLOAD_TOO_LARGE)
                     .header("Content-Type", "text/plain")
@@ -79,6 +80,16 @@ impl ControlRouter {
                     .expect("static response is valid");
                 let mut send = respond.send_response(response, false).unwrap();
                 let _ = send.send_data(Bytes::from_static(b"body too large"), true);
+                return;
+            }
+            Err(_) => {
+                let response = Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "text/plain")
+                    .body(())
+                    .expect("static response is valid");
+                let mut send = respond.send_response(response, false).unwrap();
+                let _ = send.send_data(Bytes::from_static(b"invalid request body"), true);
                 return;
             }
         };
@@ -108,12 +119,18 @@ where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let machine_key = router.machine_key();
-    serve_http2(stream, machine_key, move |request, respond, key| {
-        let router = router.clone();
-        async move {
-            router.handle_inner(request, respond, key).await;
-        }
-    })
+    let challenge = random_challenge();
+    serve_http2(
+        stream,
+        machine_key,
+        challenge,
+        move |request, respond, key| {
+            let router = router.clone();
+            async move {
+                router.handle_inner(request, respond, key).await;
+            }
+        },
+    )
     .await
 }
 

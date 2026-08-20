@@ -61,23 +61,32 @@ pub fn load_or_create_machine_key(path: &Path) -> io::Result<ServerKey> {
 }
 
 /// Persist a raw 32-byte machine key to `path` with `0600` permissions.
+///
+/// On Unix the file is created with `0600` from the start so there is no
+/// window where the key is world-readable.
 pub fn persist_machine_key(path: &Path, key: &[u8; 32]) -> io::Result<()> {
-    fs::write(path, key)?;
-    set_0600(path)?;
-    Ok(())
+    write_key_file(path, key)
 }
 
 #[cfg(unix)]
-fn set_0600(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    fs::set_permissions(path, perms)
+fn write_key_file(path: &Path, key: &[u8; 32]) -> io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(key)?;
+    file.sync_all()
 }
 
 #[cfg(not(unix))]
-fn set_0600(_path: &Path) -> io::Result<()> {
-    Ok(())
+fn write_key_file(path: &Path, key: &[u8; 32]) -> io::Result<()> {
+    fs::write(path, key)
 }
 
 #[cfg(test)]
