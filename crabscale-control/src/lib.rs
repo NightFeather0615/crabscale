@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crabscale_proto::{
-    DerpMap, Hostinfo, MIN_SUPPORTED_CAPVER, MachineKey, MapRequest, MapResponse, Node, NodeKey,
+    DerpMap, Hostinfo, MIN_SUPPORTED_CAPVER, MachineKey, MapRequest, MapResponse, NodeKey,
     RegisterRequest, RegisterResponse, UserProfile, encode_map_response_frame,
 };
 
@@ -159,6 +159,8 @@ pub enum ControlError {
     /// A node requested tags it is not authorized to hold. Carries the
     /// rejected tags. The node's state is left unchanged.
     UnauthorizedTags(Vec<String>),
+    /// A route string is not a valid IP or CIDR.
+    InvalidRoute(String),
 }
 
 impl std::fmt::Display for ControlError {
@@ -178,6 +180,9 @@ impl std::fmt::Display for ControlError {
             Self::Policy(e) => write!(f, "policy error: {e}"),
             Self::UnauthorizedTags(tags) => {
                 write!(f, "requested tags are not permitted: {}", tags.join(", "))
+            }
+            Self::InvalidRoute(route) => {
+                write!(f, "invalid route `{route}`: expected an IP or CIDR")
             }
         }
     }
@@ -763,6 +768,8 @@ impl ControlPlane {
             created: now.to_string(),
             cap: request.version,
             tags,
+            advertised_routes: Self::route_list(request.hostinfo.as_ref()),
+            approved_routes: Vec::new(),
             machine_authorized: true,
             ephemeral,
         })
@@ -1008,11 +1015,83 @@ impl ControlPlane {
             .map_err(|e| ControlError::Store(e.to_string()))
     }
 
+    /// Fetch a registered node by its node key.
+    pub fn node_by_key(&self, node_key: &NodeKey) -> Result<Option<DomainNode>, ControlError> {
+        self.store
+            .get_node_by_node_key(node_key)
+            .map_err(|e| ControlError::Store(e.to_string()))
+    }
+
     /// Revoke a pre-auth key by prefix.
     pub fn revoke_pre_auth_key(&self, prefix: &str) -> Result<(), ControlError> {
         self.store
             .revoke_pre_auth_key(prefix)
             .map_err(|e| ControlError::Store(e.to_string()))
+    }
+
+    /// Approve a route for a node, making it available to peers.
+    ///
+    /// The route is validated and canonicalized to CIDR form before it is
+    /// stored. Approving a route already in the set is a no-op.
+    pub fn approve_route(&self, node_key: &NodeKey, route: &str) -> Result<(), ControlError> {
+        let canonical = crabscale_policy::canonical_route(route)
+            .ok_or_else(|| ControlError::InvalidRoute(route.to_string()))?;
+        let mut node = self
+            .store
+            .get_node_by_node_key(node_key)
+            .map_err(|e| ControlError::Store(e.to_string()))?
+            .ok_or(ControlError::NotFound)?;
+        if !node.approved_routes.iter().any(|r| r == &canonical) {
+            node.approved_routes.push(canonical);
+            node.approved_routes.sort();
+            node.approved_routes.dedup();
+            self.store
+                .upsert_node(&node)
+                .map_err(|e| ControlError::Store(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Remove an approved route from a node. Removing a route that is not
+    /// in the set is a no-op.
+    pub fn disapprove_route(&self, node_key: &NodeKey, route: &str) -> Result<(), ControlError> {
+        let canonical = crabscale_policy::canonical_route(route)
+            .ok_or_else(|| ControlError::InvalidRoute(route.to_string()))?;
+        let mut node = self
+            .store
+            .get_node_by_node_key(node_key)
+            .map_err(|e| ControlError::Store(e.to_string()))?
+            .ok_or(ControlError::NotFound)?;
+        let before = node.approved_routes.len();
+        node.approved_routes.retain(|r| r != &canonical);
+        if node.approved_routes.len() != before {
+            self.store
+                .upsert_node(&node)
+                .map_err(|e| ControlError::Store(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Canonicalize and validate the routes a client advertised in its
+    /// `Hostinfo.RoutableIPs`.
+    ///
+    /// Malformed entries are dropped so a misbehaving client cannot corrupt
+    /// the stored route set: only valid IPs and CIDRs are accepted, and they
+    /// are normalized to CIDR form (a bare IP becomes `/32` or `/128`).
+    fn route_list(hostinfo: Option<&Hostinfo>) -> Vec<String> {
+        let mut routes = Vec::new();
+        if let Some(hostinfo) = hostinfo {
+            if let Some(routable) = &hostinfo.routable_ips {
+                for route in routable {
+                    if let Some(canonical) = crabscale_policy::canonical_route(route) {
+                        routes.push(canonical);
+                    }
+                }
+            }
+        }
+        routes.sort();
+        routes.dedup();
+        routes
     }
 
     /// Seed the configured bootstrap auth key if it is not already present.
@@ -1142,6 +1221,7 @@ impl ControlPlane {
         if !read_only {
             if let Some(hostinfo) = &request.hostinfo {
                 node.hostinfo = Some(hostinfo.clone());
+                node.advertised_routes = Self::route_list(Some(hostinfo));
                 if let Some(net_info) = &hostinfo.net_info {
                     if net_info.preferred_derp != 0 {
                         node.home_derp = net_info.preferred_derp;
@@ -1168,9 +1248,8 @@ impl ControlPlane {
             return Ok(MapOutcome::LiteUpdate);
         }
 
-        let proto_node = node.to_proto();
         let compress = request.compress == "zstd";
-        let response = self.build_initial_map(&proto_node, &request)?;
+        let response = self.build_initial_map(&node, &request)?;
         let frame = self.encode_frame(&response, compress)?;
 
         if streaming {
@@ -1193,20 +1272,33 @@ impl ControlPlane {
     /// peer list is built from every visible, authorized node, sorted by node
     /// ID, and user profiles are emitted for the requesting user and each
     /// peer user (Spec-NetMap section 3, Spec-Policy section 3).
+    ///
+    /// Route handling: a node's effective routes are the union of the routes
+    /// an administrator explicitly approved and the routes the policy's
+    /// `autoApprovers` auto-approves for the node's advertised routes. The
+    /// node's own map carries them in `PrimaryRoutes`; a peer's map appends
+    /// them to the peer's `AllowedIPs` (which always includes the peer's own
+    /// addresses), so clients can reach subnets behind the router. Exit nodes
+    /// fall out of the same mechanism: an approved default route (`0.0.0.0/0`
+    /// or `::/0`) is propagated to peers exactly like a subnet route.
     pub fn build_initial_map(
         &self,
-        node: &Node,
+        node: &DomainNode,
         _request: &MapRequest,
     ) -> Result<MapResponse, ControlError> {
         let compile_nodes = self.compile_nodes()?;
         let compiled = crabscale_policy::compile_policy(&self.config.policy, &compile_nodes);
+        let self_routes = self.effective_approved_routes(node)?;
 
         // Emit the policy-derived node attributes on the self node's CapMap
-        // (Spec-Policy §6).
-        let mut node = node.clone();
-        if let Some(self_compile) = compile_nodes.iter().find(|n| n.id == node.id) {
+        // (Spec-Policy §6), and advertise this node's own approved routes as
+        // PrimaryRoutes (the self address values are never part of it).
+        let mut proto_node = node.to_proto();
+        proto_node.primary_routes = Self::non_address_routes(&self_routes, &node.addresses);
+
+        if let Some(self_compile) = compile_nodes.iter().find(|n| n.id == node.id as u64) {
             if !self.config.policy.node_attrs.is_empty() {
-                node.cap_map = crabscale_policy::node_attributes(
+                proto_node.cap_map = crabscale_policy::node_attributes(
                     &self.config.policy,
                     self_compile,
                     &compile_nodes,
@@ -1217,7 +1309,7 @@ impl ControlPlane {
         // Per-node reduced base filter; empty means deny all.
         let base = compiled
             .node_filters
-            .get(&node.id)
+            .get(&(node.id as u64))
             .cloned()
             .unwrap_or_default();
         let mut packet_filters = BTreeMap::new();
@@ -1225,20 +1317,20 @@ impl ControlPlane {
 
         let visible = compiled
             .peer_visibility
-            .get(&node.id)
+            .get(&(node.id as u64))
             .cloned()
             .unwrap_or_default();
 
         let mut peers = Vec::new();
         let mut user_ids = std::collections::BTreeSet::new();
-        user_ids.insert(node.user as i64);
+        user_ids.insert(node.user_id.unwrap_or(0));
         for stored in self
             .store
             .list_nodes()
             .map_err(|e| ControlError::Store(e.to_string()))?
         {
             // Do not advertise a node to itself.
-            if stored.node_key == node.key {
+            if stored.node_key == node.node_key {
                 continue;
             }
             // A logged-out node must not be advertised as a peer.
@@ -1253,7 +1345,17 @@ impl ControlPlane {
             if let Some(uid) = stored.user_id {
                 user_ids.insert(uid);
             }
-            peers.push(stored.to_proto());
+            let mut peer = stored.to_proto();
+            let routes = self.effective_approved_routes(&stored)?;
+            if !routes.is_empty() {
+                let mut allowed = stored.addresses.clone();
+                allowed.extend(routes.iter().cloned());
+                allowed.sort();
+                allowed.dedup();
+                peer.allowed_ips = Some(allowed);
+                peer.primary_routes = Self::non_address_routes(&routes, &stored.addresses);
+            }
+            peers.push(peer);
         }
         // Spec-NetMap section 4: keep peer arrays sorted by node ID.
         peers.sort_by_key(|p| p.id);
@@ -1276,7 +1378,7 @@ impl ControlPlane {
         }
 
         Ok(MapResponse {
-            node: Some(node.clone()),
+            node: Some(proto_node),
             derp_map: Some(self.config.derp_map.clone()),
             domain: self.config.tailnet_domain.clone(),
             peers: Some(peers),
@@ -1295,22 +1397,69 @@ impl ControlPlane {
             .list_nodes()
             .map_err(|e| ControlError::Store(e.to_string()))?
         {
-            let user_login = match stored.user_id {
-                Some(user_id) => self
-                    .store
-                    .get_user(user_id)
-                    .map_err(|e| ControlError::Store(e.to_string()))?
-                    .map(|u| u.login_name),
-                None => None,
-            };
-            nodes.push(crabscale_policy::CompileNode {
-                id: stored.id as u64,
-                user_login,
-                addresses: stored.addresses.clone(),
-                tags: stored.tags.clone().unwrap_or_default(),
-            });
+            nodes.push(self.compile_node(&stored)?);
         }
         Ok(nodes)
+    }
+
+    /// Snapshot one stored node in the shape the policy helpers need.
+    fn compile_node(
+        &self,
+        node: &DomainNode,
+    ) -> Result<crabscale_policy::CompileNode, ControlError> {
+        let user_login = match node.user_id {
+            Some(user_id) => self
+                .store
+                .get_user(user_id)
+                .map_err(|e| ControlError::Store(e.to_string()))?
+                .map(|u| u.login_name),
+            None => None,
+        };
+        Ok(crabscale_policy::CompileNode {
+            id: node.id as u64,
+            user_login,
+            addresses: node.addresses.clone(),
+            tags: node.tags.clone().unwrap_or_default(),
+        })
+    }
+
+    /// The routes effective for `node`: the routes an administrator
+    /// explicitly approved *and* that the node is still advertising, plus
+    /// the routes the policy's `autoApprovers` auto-approves for the node's
+    /// advertised routes.
+    ///
+    /// An explicit approval alone is not enough: a route is only propagated
+    /// while the node advertises it. The intersection with
+    /// `advertised_routes` is what makes a client removing a route trigger
+    /// a map update even when the admin approval stays in place.
+    fn effective_approved_routes(&self, node: &DomainNode) -> Result<Vec<String>, ControlError> {
+        let compile = self.compile_node(node)?;
+        let approved: std::collections::BTreeSet<String> = node
+            .approved_routes
+            .iter()
+            .filter(|route| node.advertised_routes.contains(route))
+            .cloned()
+            .collect();
+        let mut routes: Vec<String> = approved.into_iter().collect();
+        routes.extend(crabscale_policy::auto_approved_routes(
+            &self.config.policy,
+            &compile,
+            &node.advertised_routes,
+        ));
+        routes.sort();
+        routes.dedup();
+        Ok(routes)
+    }
+
+    /// The routes that are not one of the node's own tailnet addresses.
+    /// `PrimaryRoutes` must never contain the self address values that are
+    /// already in `AllowedIPs`.
+    fn non_address_routes(routes: &[String], addresses: &[String]) -> Vec<String> {
+        routes
+            .iter()
+            .filter(|route| !addresses.contains(route))
+            .cloned()
+            .collect()
     }
 
     /// Serialize and frame a MapResponse, optionally zstd-compressing the
@@ -2695,5 +2844,289 @@ mod tests {
             serde_json::json!({ "drive:share": [] }),
             "a policy change must be reflected in the next map's CapMap"
         );
+    }
+
+    /// Register a node whose Hostinfo advertises `routable_ips`.
+    fn register_router(
+        plane: &ControlPlane,
+        machine: [u8; 32],
+        node: [u8; 32],
+        routable_ips: &[&str],
+    ) {
+        let mut request = test_register_request();
+        request.node_key = NodeKey::from_bytes(node);
+        request.hostinfo = Some(Hostinfo {
+            hostname: "router".to_string(),
+            routable_ips: Some(routable_ips.iter().map(|s| s.to_string()).collect()),
+            ..Default::default()
+        });
+        let response = plane.register(MachineKey::from_bytes(machine), request);
+        assert!(response.machine_authorized);
+    }
+
+    /// Map as `node_id` after an update that advertises `routable_ips`,
+    /// returning the decoded MapResponse JSON.
+    fn map_with_routes(
+        plane: &ControlPlane,
+        node_id: u64,
+        routable_ips: &[&str],
+    ) -> serde_json::Value {
+        let stored = plane.store.list_nodes().unwrap();
+        let node = stored
+            .into_iter()
+            .find(|n| n.id as u64 == node_id)
+            .expect("node must exist");
+        let request = MapRequest {
+            version: 130,
+            node_key: node.node_key,
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: false,
+            hostinfo: Some(Hostinfo {
+                hostname: "router".to_string(),
+                routable_ips: Some(routable_ips.iter().map(|s| s.to_string()).collect()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let outcome = plane.handle_map(node.machine_key, request).unwrap();
+        let MapOutcome::FullFrame(frame) = outcome else {
+            panic!("expected full frame");
+        };
+        let (payload, consumed) = crabscale_proto::decode_map_response_frame(&frame).unwrap();
+        assert_eq!(consumed, frame.len());
+        serde_json::from_slice(payload).unwrap()
+    }
+
+    /// The `AllowedIPs` of `peer_id` in a decoded MapResponse, as strings.
+    fn peer_allowed_ips(plane_map: &serde_json::Value, peer_id: u64) -> Vec<String> {
+        plane_map["Peers"]
+            .as_array()
+            .expect("Peers must be an array")
+            .iter()
+            .find(|p| p["ID"] == serde_json::json!(peer_id))
+            .unwrap_or_else(|| panic!("peer {peer_id} not in map"))["AllowedIPs"]
+            .as_array()
+            .expect("AllowedIPs must be an array")
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .expect("AllowedIP entry must be a string")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Fetch a stored node by its numeric id.
+    fn stored_node(plane: &ControlPlane, id: u64) -> DomainNode {
+        plane
+            .store
+            .list_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.id as u64 == id)
+            .expect("node must exist")
+    }
+
+    #[test]
+    fn advertised_routes_are_parsed_and_stored() {
+        let plane = test_plane();
+        register_router(
+            &plane,
+            [0x12; 32],
+            [0x23; 32],
+            &["192.168.1.0/24", "10.0.0.5"],
+        );
+        let node = stored_node(&plane, 1);
+        assert_eq!(
+            node.advertised_routes,
+            vec!["10.0.0.5/32".to_string(), "192.168.1.0/24".to_string()],
+            "advertised routes must be canonicalized and stored"
+        );
+        assert!(node.approved_routes.is_empty());
+    }
+
+    #[test]
+    fn peer_ping_across_subnet_router() {
+        let plane = test_plane();
+        // Node 1 is the subnet router advertising a LAN subnet.
+        register_router(&plane, [0x12; 32], [0x23; 32], &["192.168.42.0/24"]);
+        let router = stored_node(&plane, 1);
+        plane
+            .approve_route(&router.node_key, "192.168.42.0/24")
+            .unwrap();
+        // Node 2 joins the tailnet as an ordinary host.
+        register_extra_node(&plane, [0x13; 32], [0x24; 32]);
+
+        // Node 2's map routes the subnet through the router: an ICMP ping to
+        // e.g. 192.168.42.7 would be forwarded via the router's AllowedIPs.
+        let n2 = map_json(&plane, 2);
+        let allowed = peer_allowed_ips(&n2, 1);
+        assert!(
+            allowed.contains(&"192.168.42.0/24".to_string()),
+            "peer AllowedIPs must include the approved subnet: {allowed:?}"
+        );
+
+        // The router's own map names the subnet in PrimaryRoutes so it knows
+        // to enable forwarding.
+        let n1 = map_json(&plane, 1);
+        let primary: Vec<String> = n1["Node"]["PrimaryRoutes"]
+            .as_array()
+            .expect("PrimaryRoutes must be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            primary.contains(&"192.168.42.0/24".to_string()),
+            "self PrimaryRoutes must list the approved subnet: {primary:?}"
+        );
+    }
+
+    #[test]
+    fn auto_approvers_propagate_route_without_admin_action() {
+        let mut plane = test_plane();
+        plane.config.policy = crabscale_policy::parse_policy(
+            r#"{
+                "autoApprovers": { "routes": { "10.0.0.0/8": ["owner@example.com"] } },
+                "acls": [ { "action": "accept", "src": ["*"], "dst": ["*:*"] } ]
+            }"#,
+        )
+        .expect("policy must parse");
+        // The router is registered by the default user, which matches the
+        // autoApprovers entry, so the route needs no explicit approval.
+        register_router(&plane, [0x12; 32], [0x23; 32], &["10.1.0.0/16"]);
+        register_extra_node(&plane, [0x13; 32], [0x24; 32]);
+
+        let n2 = map_json(&plane, 2);
+        let allowed = peer_allowed_ips(&n2, 1);
+        assert!(
+            allowed.contains(&"10.1.0.0/16".to_string()),
+            "autoApprovers must propagate the route to peers: {allowed:?}"
+        );
+    }
+
+    #[test]
+    fn exit_node_default_routes_propagate_to_peers() {
+        let plane = test_plane();
+        register_router(&plane, [0x12; 32], [0x23; 32], &["0.0.0.0/0", "::/0"]);
+        let router = stored_node(&plane, 1);
+        plane.approve_route(&router.node_key, "0.0.0.0/0").unwrap();
+        plane.approve_route(&router.node_key, "::/0").unwrap();
+        register_extra_node(&plane, [0x13; 32], [0x24; 32]);
+
+        let n2 = map_json(&plane, 2);
+        let allowed = peer_allowed_ips(&n2, 1);
+        assert!(
+            allowed.contains(&"0.0.0.0/0".to_string()),
+            "peer must receive the IPv4 default route (exit node): {allowed:?}"
+        );
+        assert!(
+            allowed.contains(&"::/0".to_string()),
+            "peer must receive the IPv6 default route (exit node): {allowed:?}"
+        );
+
+        let n1 = map_json(&plane, 1);
+        let primary: Vec<String> = n1["Node"]["PrimaryRoutes"]
+            .as_array()
+            .expect("PrimaryRoutes must be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            primary.contains(&"0.0.0.0/0".to_string()),
+            "the exit node's own map must mark PrimaryRoutes: {primary:?}"
+        );
+    }
+
+    #[test]
+    fn route_removal_triggers_map_update() {
+        let plane = test_plane();
+        register_router(&plane, [0x12; 32], [0x23; 32], &["192.168.42.0/24"]);
+        let router = stored_node(&plane, 1);
+        plane
+            .approve_route(&router.node_key, "192.168.42.0/24")
+            .unwrap();
+        register_extra_node(&plane, [0x13; 32], [0x24; 32]);
+
+        // The peer sees the route while the router advertises it.
+        let before = map_json(&plane, 2);
+        assert!(peer_allowed_ips(&before, 1).contains(&"192.168.42.0/24".to_string()));
+
+        // The router stops advertising the route: the next peer map must drop
+        // it even though the admin approval remains.
+        map_with_routes(&plane, 1, &[]);
+        let after = map_json(&plane, 2);
+        assert!(
+            !peer_allowed_ips(&after, 1).contains(&"192.168.42.0/24".to_string()),
+            "removing an advertised route must update the peer map"
+        );
+
+        // An explicit admin disapproval also removes it once it is advertised
+        // again.
+        map_with_routes(&plane, 1, &["192.168.42.0/24"]);
+        plane
+            .disapprove_route(&router.node_key, "192.168.42.0/24")
+            .unwrap();
+        let again = map_json(&plane, 2);
+        assert!(
+            !peer_allowed_ips(&again, 1).contains(&"192.168.42.0/24".to_string()),
+            "disapproving a route must update the peer map"
+        );
+    }
+
+    #[test]
+    fn approve_route_rejects_invalid_input() {
+        let plane = test_plane();
+        plane.register(test_machine_key(), test_register_request());
+        let node = stored_node(&plane, 1);
+        let err = plane
+            .approve_route(&node.node_key, "not-a-route")
+            .unwrap_err();
+        assert!(matches!(err, ControlError::InvalidRoute(_)));
+        let err = plane
+            .disapprove_route(&node.node_key, "10.0.0.0/33")
+            .unwrap_err();
+        assert!(matches!(err, ControlError::InvalidRoute(_)));
+    }
+
+    #[test]
+    fn route_approval_persists_across_restart() {
+        let dir = std::env::temp_dir().join(format!("crabscale-routes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("routes.sqlite");
+
+        let node_key = NodeKey::from_bytes([0x23; 32]);
+        let machine_key = MachineKey::from_bytes([0x12; 32]);
+        let config = ControlConfig {
+            policy: allow_all_policy(),
+            ..ControlConfig::default()
+        };
+        {
+            let plane = ControlPlane::open_sqlite(config.clone(), &db_path).unwrap();
+            register_router(
+                &plane,
+                machine_key.to_bytes(),
+                node_key.to_bytes(),
+                &["10.20.0.0/16"],
+            );
+            let router = stored_node(&plane, 1);
+            plane
+                .approve_route(&router.node_key, "10.20.0.0/16")
+                .unwrap();
+        }
+        {
+            let plane = ControlPlane::open_sqlite(config, &db_path).unwrap();
+            let router = plane
+                .store
+                .get_node_by_node_key(&node_key)
+                .unwrap()
+                .expect("node must survive restart");
+            assert_eq!(
+                router.approved_routes,
+                vec!["10.20.0.0/16".to_string()],
+                "approved routes must survive restart"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

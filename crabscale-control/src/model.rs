@@ -47,6 +47,13 @@ pub struct Node {
     pub created: String,
     pub cap: u32,
     pub tags: Option<Vec<String>>,
+    /// IP/CIDR ranges this node has advertised it can route, parsed from
+    /// `Hostinfo.RoutableIPs` and canonicalized to CIDR form.
+    pub advertised_routes: Vec<String>,
+    /// IP/CIDR routes an administrator has explicitly approved for this
+    /// node, in canonical CIDR form. Auto-approved routes from the policy's
+    /// `autoApprovers` are computed at map time and are not stored here.
+    pub approved_routes: Vec<String>,
     pub machine_authorized: bool,
     pub ephemeral: bool,
 }

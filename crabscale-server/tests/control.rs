@@ -1,5 +1,6 @@
 //! Integration tests for the control router over HTTP/2-over-Noise.
 
+use bytes::Bytes;
 use crabscale_proto::MachineKey;
 use crabscale_server::{ControlRouter, serve_control};
 use crabscale_transport::{
@@ -286,4 +287,171 @@ async fn interactive_register_approve_followup_authorizes() {
     assert_eq!(followup_json["MachineAuthorized"], true);
 
     drop(server_task);
+}
+
+/// Build an h2 client over a fresh Noise connection to `server` and return
+/// it along with the spawned server task.
+async fn connect_client(
+    server: &NoiseResponder,
+    router: ControlRouter,
+) -> (client::SendRequest<Bytes>, tokio::task::JoinHandle<()>) {
+    let (mut client_stream, server_stream) =
+        loopback_handshake(server, StaticSecret::random(), 113)
+            .await
+            .unwrap();
+    let server_task = tokio::spawn(async move {
+        let _ = serve_control(server_stream, router).await;
+    });
+
+    read_early_payload(&mut client_stream).await;
+
+    let (client, conn) = client::handshake(client_stream).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    (client, server_task)
+}
+
+/// POST `body` to the inner Noise-protected path and return the raw body.
+async fn post_json_raw(
+    client: &mut client::SendRequest<Bytes>,
+    path: &str,
+    body: &serde_json::Value,
+) -> Vec<u8> {
+    let body_bytes = serde_json::to_vec(body).unwrap();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream.send_data(body_bytes.into(), true).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body();
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    buf
+}
+
+/// Decode a `MapResponse` frame returned by `/machine/map`.
+fn decode_map(buf: &[u8]) -> serde_json::Value {
+    let (payload, consumed) = crabscale_proto::decode_map_response_frame(buf).unwrap();
+    assert_eq!(consumed, buf.len());
+    serde_json::from_slice(payload).unwrap()
+}
+
+#[tokio::test]
+async fn peer_ping_across_subnet_router() {
+    let server = NoiseResponder::random();
+    let machine_key = MachineKey::from_bytes(server.public_key().to_bytes());
+    let policy = crabscale_policy::parse_policy(
+        r#"{ "acls": [ { "action": "accept", "src": ["*"], "dst": ["*:*"] } ] }"#,
+    )
+    .unwrap();
+    let control = crabscale_control::ControlPlane::new(crabscale_control::ControlConfig {
+        policy,
+        ..Default::default()
+    });
+    let router = ControlRouter::with_control(machine_key, control.clone());
+
+    // Two clients: a subnet router and a regular host.
+    let (mut router_client, router_task) = connect_client(&server, router.clone()).await;
+    let (mut peer_client, peer_task) = connect_client(&server, router.clone()).await;
+
+    let router_key = crabscale_proto::NodeKey::from_bytes([0x51; 32]);
+    let router_disco = crabscale_proto::DiscoKey::from_bytes([0x61; 32]);
+
+    // The router registers and advertises the LAN subnet it can route.
+    let reg = serde_json::json!({
+        "Version": 130,
+        "NodeKey": router_key.to_string(),
+        "Auth": { "AuthKey": "hskey-auth-test-secret" },
+        "Hostinfo": {
+            "Hostname": "router",
+            "RoutableIPs": ["192.168.77.0/24"]
+        }
+    });
+    let reg_raw = post_json_raw(&mut router_client, "/machine/register", &reg).await;
+    let reg_json: serde_json::Value = serde_json::from_slice(&reg_raw).unwrap();
+    assert_eq!(reg_json["MachineAuthorized"], true);
+
+    // The administrator approves the advertised route.
+    let router_node = control
+        .node_by_key(&router_key)
+        .unwrap()
+        .expect("router node must exist");
+    control
+        .approve_route(&router_node.node_key, "192.168.77.0/24")
+        .unwrap();
+
+    // The regular host registers.
+    let peer_key = crabscale_proto::NodeKey::from_bytes([0x52; 32]);
+    let peer_disco = crabscale_proto::DiscoKey::from_bytes([0x62; 32]);
+    let reg = serde_json::json!({
+        "Version": 130,
+        "NodeKey": peer_key.to_string(),
+        "Auth": { "AuthKey": "hskey-auth-test-secret" },
+        "Hostinfo": { "Hostname": "host" }
+    });
+    let reg_raw = post_json_raw(&mut peer_client, "/machine/register", &reg).await;
+    let reg_json: serde_json::Value = serde_json::from_slice(&reg_raw).unwrap();
+    assert_eq!(reg_json["MachineAuthorized"], true);
+
+    // The host maps: the peer list routes the LAN subnet through the router,
+    // so a ping to 192.168.77.7 would be forwarded via the router's
+    // AllowedIPs.
+    let map = serde_json::json!({
+        "Version": 130,
+        "NodeKey": peer_key.to_string(),
+        "DiscoKey": peer_disco.to_string(),
+        "Stream": false
+    });
+    let map_raw = post_json_raw(&mut peer_client, "/machine/map", &map).await;
+    let host_map = decode_map(&map_raw);
+    let peers = host_map["Peers"]
+        .as_array()
+        .expect("Peers must be an array");
+    let router_peer = peers
+        .iter()
+        .find(|p| p["StableID"] == "n00000000000000000000001")
+        .unwrap_or_else(|| panic!("router peer not advertised"));
+    let allowed: Vec<String> = router_peer["AllowedIPs"]
+        .as_array()
+        .expect("AllowedIPs must be an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        allowed.contains(&"192.168.77.0/24".to_string()),
+        "host must route the LAN subnet through the router: {allowed:?}"
+    );
+    assert_eq!(
+        router_peer["PrimaryRoutes"][0],
+        serde_json::json!("192.168.77.0/24")
+    );
+
+    // Keep the router's own map request exercised too: its PrimaryRoutes
+    // advertise the subnet back to it.
+    let map = serde_json::json!({
+        "Version": 130,
+        "NodeKey": router_key.to_string(),
+        "DiscoKey": router_disco.to_string(),
+        "Stream": false,
+        "Hostinfo": { "Hostname": "router", "RoutableIPs": ["192.168.77.0/24"] }
+    });
+    let map_raw = post_json_raw(&mut router_client, "/machine/map", &map).await;
+    let router_map = decode_map(&map_raw);
+    let primary: Vec<String> = router_map["Node"]["PrimaryRoutes"]
+        .as_array()
+        .expect("PrimaryRoutes must be an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(primary.contains(&"192.168.77.0/24".to_string()));
+
+    drop(router_task);
+    drop(peer_task);
 }
