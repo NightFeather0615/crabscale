@@ -7,6 +7,10 @@ use std::fmt;
 pub enum TransportError {
     /// The init message did not have the required 101-byte layout.
     InvalidInitMessage,
+    /// The response message did not have the required 51-byte layout.
+    InvalidResponseMessage,
+    /// A record frame had an invalid body length.
+    InvalidRecord,
     /// The init message carried an unsupported capability version.
     UnsupportedCapabilityVersion(u16),
     /// A message had an unexpected type byte.
@@ -31,6 +35,8 @@ impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidInitMessage => write!(f, "invalid TS2021 init message"),
+            Self::InvalidResponseMessage => write!(f, "invalid TS2021 response message"),
+            Self::InvalidRecord => write!(f, "invalid Noise record frame"),
             Self::UnsupportedCapabilityVersion(v) => {
                 write!(f, "unsupported capability version {v}")
             }

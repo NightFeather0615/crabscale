@@ -47,9 +47,6 @@ pub async fn loopback_handshake(
             let mut init = [0u8; INIT_MESSAGE_LEN];
             conn.read_exact(&mut init).await.map_err(io_err)?;
             let parsed = parse_init_message(&init)?;
-            if parsed.version < crate::messages::MIN_SUPPORTED_CAPVER {
-                return Err(TransportError::UnsupportedCapabilityVersion(parsed.version));
-            }
             let output = server.respond(&parsed, prologue2.as_bytes())?;
             conn.write_all(&output.response).await.map_err(io_err)?;
             Ok::<_, TransportError>(NoiseStream::new(

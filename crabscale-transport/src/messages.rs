@@ -112,14 +112,14 @@ pub fn write_response_message(
 /// Parse a 51-byte TS2021 response message.
 pub fn parse_response_message(buf: &[u8]) -> Result<ResponseMessage, TransportError> {
     if buf.len() != RESPONSE_MESSAGE_LEN {
-        return Err(TransportError::InvalidInitMessage);
+        return Err(TransportError::InvalidResponseMessage);
     }
     if buf[0] != MSG_TYPE_RESPONSE {
         return Err(TransportError::UnexpectedMessageType(buf[0]));
     }
     let payload_len = u16::from_be_bytes([buf[1], buf[2]]);
     if payload_len != 48 {
-        return Err(TransportError::InvalidInitMessage);
+        return Err(TransportError::InvalidResponseMessage);
     }
 
     let mut server_ephemeral = [0u8; 32];

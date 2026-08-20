@@ -81,7 +81,7 @@ impl RecordCipher {
         match msg_type {
             MSG_TYPE_RECORD => {
                 if len < AEAD_TAG_LEN {
-                    return Err(TransportError::InvalidInitMessage);
+                    return Err(TransportError::InvalidRecord);
                 }
                 let mut body = buf[RECORD_HEADER_LEN..total].to_vec();
                 let tag = body.split_off(body.len() - AEAD_TAG_LEN);

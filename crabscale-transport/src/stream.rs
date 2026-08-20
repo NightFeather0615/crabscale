@@ -20,6 +20,9 @@ pub struct NoiseStream<T> {
     read_buf: Vec<u8>,
     read_pos: usize,
     read_chunk: [u8; 4096],
+    write_buf: Vec<u8>,
+    write_pos: usize,
+    write_acked: usize,
 }
 
 impl<T> NoiseStream<T>
@@ -35,6 +38,9 @@ where
             read_buf: Vec::new(),
             read_pos: 0,
             read_chunk: [0u8; 4096],
+            write_buf: Vec::new(),
+            write_pos: 0,
+            write_acked: 0,
         }
     }
 
@@ -75,6 +81,25 @@ where
             self.read_buf = plaintext;
         }
         Ok(())
+    }
+
+    fn flush_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.write_pos < self.write_buf.len() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.write_buf[self.write_pos..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "noise stream write returned zero",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => self.write_pos += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        self.write_buf.clear();
+        self.write_pos = 0;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -127,25 +152,138 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let framed = match self.writer.encode(buf) {
-            Ok(f) => f,
-            Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
-        };
-        match Pin::new(&mut self.inner).poll_write(cx, &framed) {
-            Poll::Ready(Ok(n)) => {
-                // The underlying transport consumed the whole encoded frame set.
-                let _ = n;
-                Poll::Ready(Ok(buf.len()))
+        let this = &mut *self;
+
+        // If a previous write is still being flushed, finish it before
+        // accepting more plaintext so no encoded bytes are dropped.
+        if this.write_acked > 0 {
+            match this.flush_pending(cx) {
+                Poll::Ready(Ok(())) => {
+                    let acked = this.write_acked;
+                    this.write_acked = 0;
+                    Poll::Ready(Ok(acked))
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            let framed = match this.writer.encode(buf) {
+                Ok(f) => f,
+                Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
+            };
+            this.write_buf = framed;
+            this.write_pos = 0;
+            this.write_acked = buf.len();
+
+            match this.flush_pending(cx) {
+                Poll::Ready(Ok(())) => {
+                    let acked = this.write_acked;
+                    this.write_acked = 0;
+                    Poll::Ready(Ok(acked))
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        match this.flush_pending(cx) {
+            Poll::Ready(Ok(())) => {
+                this.write_acked = 0;
+                Pin::new(&mut this.inner).poll_flush(cx)
             }
             other => other,
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        match this.flush_pending(cx) {
+            Poll::Ready(Ok(())) => {
+                this.write_acked = 0;
+                Pin::new(&mut this.inner).poll_shutdown(cx)
+            }
+            other => other,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    /// A writer that only accepts a few bytes per `poll_write` call, forcing
+    /// the Noise stream to buffer and retry partial writes.
+    struct ChunkedWriter {
+        inner: Vec<u8>,
+        max_per_write: usize,
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+    impl AsyncWrite for ChunkedWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let n = buf.len().min(self.max_per_write);
+            self.inner.extend_from_slice(&buf[..n]);
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for ChunkedWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn partial_writes_are_buffered_and_flushed() {
+        let inner = ChunkedWriter {
+            inner: Vec::new(),
+            max_per_write: 3,
+        };
+        let mut stream = NoiseStream::new(inner, [1u8; 32], [2u8; 32]);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        let mut written = 0;
+        let payload = b"partial write test payload";
+        // Drive poll_write until it reports the full plaintext was accepted.
+        while written < payload.len() {
+            match Pin::new(&mut stream).poll_write(&mut cx, &payload[written..]) {
+                Poll::Ready(Ok(n)) => written += n,
+                Poll::Ready(Err(e)) => panic!("write failed: {e}"),
+                Poll::Pending => continue,
+            }
+        }
+        assert_eq!(written, payload.len());
+
+        // Flush any remaining buffered frames.
+        match Pin::new(&mut stream).poll_flush(&mut cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => panic!("flush failed: {e}"),
+            Poll::Pending => panic!("flush should complete immediately"),
+        }
+
+        // The underlying writer must have received all encoded bytes.
+        assert!(!stream.inner.inner.is_empty());
     }
 }
