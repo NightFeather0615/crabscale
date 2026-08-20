@@ -599,17 +599,19 @@ impl ControlPlane {
         let streaming = request.stream;
         let lite_update = !streaming && request.omit_peers && !request.read_only;
 
-        // Streaming requests (version >= 68) are read-only: they must not
-        // mutate stored node state, so a long-poll can never clear or clobber
-        // the endpoints, hostinfo, disco key, or DERP region a client already
-        // reported through a non-streaming update.
+        // The disco key is only carried in MapRequest, not RegisterRequest, so
+        // apply it unconditionally: a streaming-first client still needs its
+        // real disco key advertised in the first MapResponse (Spec-NetMap §3).
+        // The read-only rule below is scoped to Hostinfo and Endpoints only.
+        node.disco_key = request.disco_key;
+
+        // Streaming requests (version >= 68) are read-only for Hostinfo and
+        // Endpoints: they must not clear or clobber the state a client already
+        // reported through a non-streaming update. The `version >= 68` clause
+        // is redundant today because handle_map rejects versions below
+        // MIN_SUPPORTED_CAPVER, but it documents the spec rule.
         let read_only = streaming && request.version >= 68;
         if !read_only {
-            // The disco key is only carried in MapRequest, not RegisterRequest,
-            // so apply it here so the first MapResponse advertises the
-            // client's real disco key (Spec-NetMap §3).
-            node.disco_key = request.disco_key;
-
             if let Some(hostinfo) = &request.hostinfo {
                 node.hostinfo = Some(hostinfo.clone());
                 if let Some(net_info) = &hostinfo.net_info {
@@ -888,7 +890,8 @@ mod tests {
         };
         plane.handle_map(test_machine_key(), update).unwrap();
 
-        // A streaming request must not clear or clobber that state.
+        // A streaming request must not clear or clobber endpoints/hostinfo,
+        // but the disco key is still applied (Spec-NetMap §3).
         let stream = MapRequest {
             version: 130,
             node_key: test_node_key(),
@@ -923,7 +926,60 @@ mod tests {
         assert_eq!(stored.endpoints, vec!["1.2.3.4:41641"]);
         assert_eq!(stored.endpoint_types, vec![2]);
         assert_eq!(stored.home_derp, 5);
-        assert_eq!(stored.disco_key, DiscoKey::from_bytes([0x33; 32]));
+        assert_eq!(stored.disco_key, DiscoKey::from_bytes([0x99; 32]));
+        assert_eq!(stored.hostinfo.as_ref().unwrap().hostname, "node1");
+    }
+
+    #[test]
+    fn streaming_first_request_sets_disco_key_but_not_endpoints_or_hostinfo() {
+        let plane = test_plane();
+        plane
+            .register(test_machine_key(), test_register_request())
+            .unwrap();
+
+        // A real client's first map request is often the streaming long-poll.
+        // The disco key must still be applied, while endpoints/hostinfo stay
+        // read-only for stream=true, version>=68.
+        let stream = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x44; 32]),
+            stream: true,
+            endpoints: vec!["198.51.100.10:41641".to_string()],
+            endpoint_types: vec![2],
+            hostinfo: Some(Hostinfo {
+                hostname: "other".to_string(),
+                net_info: Some(NetInfo {
+                    preferred_derp: 9,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let outcome = plane.handle_map(test_machine_key(), stream).unwrap();
+        let MapOutcome::Stream { first_frame, .. } = outcome else {
+            panic!("expected stream");
+        };
+        let (payload, consumed) = crabscale_proto::decode_map_response_frame(&first_frame).unwrap();
+        assert_eq!(consumed, first_frame.len());
+        let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(
+            json["Node"]["DiscoKey"],
+            serde_json::json!(
+                "discokey:4444444444444444444444444444444444444444444444444444444444444444"
+            )
+        );
+
+        let stored = plane
+            .store
+            .get_node_by_node_key(&test_node_key())
+            .unwrap()
+            .expect("node should exist");
+        assert_eq!(stored.disco_key, DiscoKey::from_bytes([0x44; 32]));
+        assert!(stored.endpoints.is_empty());
+        assert!(stored.endpoint_types.is_empty());
+        assert_eq!(stored.home_derp, 1);
         assert_eq!(stored.hostinfo.as_ref().unwrap().hostname, "node1");
     }
 
