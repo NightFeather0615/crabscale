@@ -196,3 +196,94 @@ async fn register_and_map_over_noise() {
 
     drop(server_task);
 }
+
+#[tokio::test]
+async fn interactive_register_approve_followup_authorizes() {
+    let server = NoiseResponder::random();
+    let machine_key = MachineKey::from_bytes(server.public_key().to_bytes());
+    // The control plane is shared with the router so the test can approve the
+    // pending registration locally (the admin API is intentionally not exposed
+    // over the Noise channel).
+    let control = crabscale_control::ControlPlane::new(crabscale_control::ControlConfig::default());
+    let router = ControlRouter::with_control(machine_key, control.clone());
+    let (mut client_stream, server_stream) =
+        loopback_handshake(&server, StaticSecret::random(), 113)
+            .await
+            .unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let _ = serve_control(server_stream, router).await;
+    });
+
+    read_early_payload(&mut client_stream).await;
+
+    let (mut client, conn) = client::handshake(client_stream).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let node_key = crabscale_proto::NodeKey::from_bytes([0x44; 32]);
+
+    // 1. Register with an invalid auth key -> interactive AuthURL.
+    let register = crabscale_proto::RegisterRequest {
+        version: 130,
+        node_key,
+        auth: Some(crabscale_proto::RegisterAuth {
+            auth_key: "wrong".to_string(),
+        }),
+        hostinfo: Some(crabscale_proto::Hostinfo {
+            hostname: "node1".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let register_body = serde_json::to_vec(&register).unwrap();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/machine/register")
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream.send_data(register_body.into(), true).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body();
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    let reg_json: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+    assert!(reg_json.get("MachineAuthorized").is_none());
+    let auth_url = reg_json["AuthURL"].as_str().unwrap().to_string();
+    let auth_id = crabscale_control::auth_id_from_followup(&auth_url).unwrap();
+
+    // 2. Approve the pending registration via the local control plane.
+    control.approve_pending(&auth_id, "alice").unwrap();
+
+    // 3. Followup with the same machine key -> authorized.
+    let followup = crabscale_proto::RegisterRequest {
+        version: 130,
+        node_key,
+        followup: auth_url,
+        ..Default::default()
+    };
+    let followup_body = serde_json::to_vec(&followup).unwrap();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/machine/register")
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream.send_data(followup_body.into(), true).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body();
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    let followup_json: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+    assert_eq!(followup_json["MachineAuthorized"], true);
+
+    drop(server_task);
+}

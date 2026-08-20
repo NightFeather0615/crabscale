@@ -76,6 +76,36 @@ impl ControlRouter {
             .expect("static response is valid")
     }
 
+    /// Handle an outer `GET /register/{id}` approval page.
+    ///
+    /// Returns a minimal HTML page describing the pending registration, or a
+    /// `404` when the auth id is unknown or has expired.
+    pub fn handle_register_page(&self, auth_id: &str) -> Response<Bytes> {
+        let Some(pending) = self.control.pending_info(auth_id) else {
+            return plain_response(StatusCode::NOT_FOUND, "pending registration not found");
+        };
+        let hostname = pending
+            .hostinfo
+            .as_ref()
+            .map(|h| h.hostname.as_str())
+            .unwrap_or("unknown");
+        let html = format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Pending registration</title></head>\
+             <body><h1>Pending registration</h1>\
+             <p>Auth id: <code>{auth_id}</code></p>\
+             <p>Hostname: <code>{hostname}</code></p>\
+             <p>Expires: <code>{}</code></p>\
+             <p>Approve or reject this registration with the <code>crabscale auth</code> CLI.</p>\
+             </body></html>",
+            pending.expires_at
+        );
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .body(Bytes::from(html))
+            .expect("static response is valid")
+    }
+
     /// Handle an inner `/machine/*` request.
     pub async fn handle_inner(
         &self,

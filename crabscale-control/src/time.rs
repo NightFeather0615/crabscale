@@ -15,6 +15,15 @@ pub fn now_rfc3339() -> String {
     format_unix(secs)
 }
 
+/// Return the current time plus `secs` seconds as an RFC 3339 UTC string.
+pub fn now_plus_seconds(secs: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    format_unix(now + secs)
+}
+
 /// Parse an RFC 3339 timestamp into Unix seconds.
 pub fn parse_rfc3339(s: &str) -> Option<i64> {
     let s = s.trim();

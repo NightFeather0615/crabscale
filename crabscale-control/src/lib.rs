@@ -9,6 +9,7 @@
 
 mod ip_allocator;
 mod model;
+mod pending;
 mod preauth;
 mod store;
 mod time;
@@ -16,7 +17,7 @@ mod time;
 use std::collections::{BTreeMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crabscale_proto::{
     DerpMap, FilterRule, MachineKey, MapRequest, MapResponse, NetPortRange, Node, NodeKey,
@@ -25,6 +26,9 @@ use crabscale_proto::{
 
 pub use ip_allocator::{IpAllocator, IpAllocatorError};
 pub use model::{Login, Node as DomainNode, Policy, PreAuthKey, Session, User};
+pub use pending::{
+    DEFAULT_PENDING_CACHE_LIMIT, DEFAULT_PENDING_TTL_SECONDS, PendingRegistration, PendingVerdict,
+};
 pub use preauth::{
     AUTH_KEY_PREFIX, format_auth_key, generate_secret, hash_secret, parse_auth_key, verify_secret,
 };
@@ -71,6 +75,12 @@ pub struct ControlConfig {
     pub ipv6_prefix: Ipv6Addr,
     /// IPv6 prefix length.
     pub ipv6_prefix_len: u8,
+    /// Base URL used to build interactive registration AuthURLs.
+    pub server_url: String,
+    /// Time-to-live in seconds for pending interactive registrations.
+    pub pending_ttl_seconds: i64,
+    /// Maximum number of pending interactive registrations kept in memory.
+    pub pending_cache_limit: usize,
 }
 
 impl Default for ControlConfig {
@@ -105,6 +115,9 @@ impl Default for ControlConfig {
             ipv4_prefix_len: DEFAULT_IPV4_PREFIX_LEN,
             ipv6_prefix: DEFAULT_IPV6_PREFIX,
             ipv6_prefix_len: DEFAULT_IPV6_PREFIX_LEN,
+            server_url: "https://tailnet.example".to_string(),
+            pending_ttl_seconds: DEFAULT_PENDING_TTL_SECONDS,
+            pending_cache_limit: DEFAULT_PENDING_CACHE_LIMIT,
         }
     }
 }
@@ -169,6 +182,15 @@ pub enum MapOutcome {
 pub struct ControlPlane {
     config: ControlConfig,
     store: Arc<dyn Store>,
+    pending: Mutex<pending::PendingCache>,
+}
+
+impl Clone for ControlPlane {
+    fn clone(&self) -> Self {
+        // The store is shared via `Arc`; the pending cache is a read-through
+        // cache backed by the store, so a fresh cache is created on clone.
+        Self::with_store(self.config.clone(), self.store.clone())
+    }
 }
 
 impl ControlPlane {
@@ -195,7 +217,12 @@ impl ControlPlane {
 
     /// Create a control plane with an explicit store.
     pub fn with_store(config: ControlConfig, store: Arc<dyn Store>) -> Self {
-        Self { config, store }
+        let pending = Mutex::new(pending::PendingCache::new(config.pending_cache_limit));
+        Self {
+            config,
+            store,
+            pending,
+        }
     }
 
     /// Register a node key for the given Noise machine key.
@@ -211,6 +238,11 @@ impl ControlPlane {
         self.ensure_default_user()?;
         self.ensure_bootstrap_key()?;
         let now = time::now_rfc3339();
+
+        // Followup long-poll: return the current verdict for the pending id.
+        if !request.followup.is_empty() {
+            return self.poll_followup(machine_key, &request, &now);
+        }
 
         if let Some(node) = self
             .store
@@ -255,14 +287,14 @@ impl ControlPlane {
                     }
                     return Ok(self.authorized_response());
                 }
-                return Ok(self.unauthorized_response("invalid or missing auth key"));
-            }
-
-            // No auth key supplied: return the current authorization state.
-            if node.machine_authorized {
+                // Invalid auth key: fall through to interactive registration.
+            } else if node.machine_authorized {
+                // No auth key supplied and already authorized: return current state.
                 return Ok(self.authorized_response());
             }
-            return Ok(self.unauthorized_response("node is logged out"));
+
+            // Existing but unauthorized node: start interactive registration.
+            return self.start_interactive(machine_key, request, &now);
         }
 
         // New node registration.
@@ -274,13 +306,241 @@ impl ControlPlane {
                 return Ok(self.unauthorized_response("clients may not extend their own key"));
             }
         }
-        let Some(auth) = &request.auth else {
-            return Ok(self.unauthorized_response("invalid or missing auth key"));
-        };
-        let Some(key) = self.validated_auth_key(auth, &now)? else {
-            return Ok(self.unauthorized_response("invalid or missing auth key"));
-        };
+        if let Some(auth) = &request.auth {
+            if let Some(key) = self.validated_auth_key(auth, &now)? {
+                let node = self.create_node_from_request(
+                    machine_key,
+                    &request,
+                    key.user_id,
+                    key.tags.clone(),
+                    key.ephemeral,
+                    &now,
+                )?;
+                self.store
+                    .upsert_node(&node)
+                    .map_err(|e| ControlError::Store(e.to_string()))?;
+                if !key.reusable {
+                    self.store
+                        .mark_pre_auth_key_used(key.id)
+                        .map_err(|e| ControlError::Store(e.to_string()))?;
+                }
+                return Ok(self.authorized_response());
+            }
+            // Invalid auth key: fall through to interactive registration.
+        }
 
+        // No valid auth key: start interactive registration.
+        self.start_interactive(machine_key, request, &now)
+    }
+
+    /// Start an interactive registration and return an `AuthURL`.
+    fn start_interactive(
+        &self,
+        machine_key: MachineKey,
+        request: RegisterRequest,
+        now: &str,
+    ) -> Result<RegisterResponse, ControlError> {
+        let auth_id = generate_secret();
+        let entry = PendingRegistration {
+            auth_id: auth_id.clone(),
+            machine_key,
+            node_key: request.node_key,
+            hostinfo: request.hostinfo.clone(),
+            expiry: request.expiry.clone(),
+            version: request.version,
+            ephemeral: request.ephemeral,
+            created_at: now.to_string(),
+            expires_at: time::now_plus_seconds(self.config.pending_ttl_seconds),
+            verdict: PendingVerdict::Pending,
+        };
+        self.pending.lock().unwrap().insert(entry.clone());
+        self.store
+            .save_pending(&entry)
+            .map_err(|e| ControlError::Store(e.to_string()))?;
+        Ok(RegisterResponse {
+            machine_authorized: false,
+            auth_url: format!("{}/register/{auth_id}", self.config.server_url),
+            ..Default::default()
+        })
+    }
+
+    /// Return the current verdict for a followup registration request.
+    ///
+    /// The followup path is authenticated by the unguessable auth id and the
+    /// original machine key: a different machine key can never authorize a
+    /// pending registration (Spec-Registration §6).
+    fn poll_followup(
+        &self,
+        machine_key: MachineKey,
+        request: &RegisterRequest,
+        now: &str,
+    ) -> Result<RegisterResponse, ControlError> {
+        let Some(auth_id) = auth_id_from_followup(&request.followup) else {
+            return Ok(self.unauthorized_response("invalid followup URL"));
+        };
+        let Some(entry) = self.get_pending_entry(&auth_id)? else {
+            return Ok(self.unauthorized_response("registration expired; start a new registration"));
+        };
+        if entry.machine_key != machine_key {
+            return Ok(self.unauthorized_response("auth id does not match machine key"));
+        }
+        if time::is_past(&entry.expires_at, now) {
+            self.remove_pending_entry(&auth_id);
+            return Ok(self.unauthorized_response("registration expired; start a new registration"));
+        }
+        match entry.verdict {
+            PendingVerdict::Pending => Ok(RegisterResponse {
+                machine_authorized: false,
+                auth_url: format!("{}/register/{}", self.config.server_url, entry.auth_id),
+                ..Default::default()
+            }),
+            PendingVerdict::Rejected => {
+                self.remove_pending_entry(&auth_id);
+                Ok(self.unauthorized_response("registration rejected"))
+            }
+            PendingVerdict::Approved { user_id, tags } => {
+                self.remove_pending_entry(&auth_id);
+                // A duplicate followup after approval must still succeed.
+                if let Some(node) = self
+                    .store
+                    .get_node_by_node_key(&entry.node_key)
+                    .map_err(|e| ControlError::Store(e.to_string()))?
+                {
+                    if node.machine_key == machine_key && node.machine_authorized {
+                        return Ok(self.authorized_response());
+                    }
+                }
+                let pending_request = RegisterRequest {
+                    version: entry.version,
+                    node_key: entry.node_key,
+                    expiry: entry.expiry.clone(),
+                    hostinfo: entry.hostinfo.clone(),
+                    ephemeral: entry.ephemeral,
+                    ..Default::default()
+                };
+                let node = self.create_node_from_request(
+                    machine_key,
+                    &pending_request,
+                    user_id,
+                    tags,
+                    entry.ephemeral,
+                    now,
+                )?;
+                self.store
+                    .upsert_node(&node)
+                    .map_err(|e| ControlError::Store(e.to_string()))?;
+                Ok(self.authorized_response())
+            }
+        }
+    }
+
+    /// Approve a pending interactive registration for the given user.
+    pub fn approve_pending(&self, auth_id: &str, user_name: &str) -> Result<(), ControlError> {
+        let now = time::now_rfc3339();
+        let Some(mut entry) = self.get_pending_entry(auth_id)? else {
+            return Err(ControlError::NotFound);
+        };
+        if time::is_past(&entry.expires_at, &now) {
+            self.remove_pending_entry(auth_id);
+            return Err(ControlError::NotFound);
+        }
+        let user_id = self.resolve_user_id(user_name)?;
+        entry.verdict = PendingVerdict::Approved {
+            user_id,
+            tags: None,
+        };
+        self.pending.lock().unwrap().insert(entry.clone());
+        self.store
+            .save_pending(&entry)
+            .map_err(|e| ControlError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Reject a pending interactive registration.
+    pub fn reject_pending(&self, auth_id: &str) -> Result<(), ControlError> {
+        let now = time::now_rfc3339();
+        let Some(mut entry) = self.get_pending_entry(auth_id)? else {
+            return Err(ControlError::NotFound);
+        };
+        if time::is_past(&entry.expires_at, &now) {
+            self.remove_pending_entry(auth_id);
+            return Err(ControlError::NotFound);
+        }
+        entry.verdict = PendingVerdict::Rejected;
+        self.pending.lock().unwrap().insert(entry.clone());
+        self.store
+            .save_pending(&entry)
+            .map_err(|e| ControlError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Return a copy of a pending registration for the approval page.
+    pub fn pending_info(&self, auth_id: &str) -> Option<PendingRegistration> {
+        let now = time::now_rfc3339();
+        let entry = self.get_pending_entry(auth_id).ok()??;
+        if time::is_past(&entry.expires_at, &now) {
+            self.remove_pending_entry(auth_id);
+            return None;
+        }
+        Some(entry)
+    }
+
+    /// Fetch a pending registration from the durable store, which is the
+    /// source of truth so that a separate process (e.g. the CLI opening the
+    /// same database) can approve it. The in-memory cache is updated as a
+    /// side effect for bounded LRU bookkeeping.
+    fn get_pending_entry(
+        &self,
+        auth_id: &str,
+    ) -> Result<Option<PendingRegistration>, ControlError> {
+        let entry = self
+            .store
+            .get_pending(auth_id)
+            .map_err(|e| ControlError::Store(e.to_string()))?;
+        if let Some(entry) = &entry {
+            self.pending.lock().unwrap().insert(entry.clone());
+        }
+        Ok(entry)
+    }
+
+    /// Remove a pending registration from both the in-memory cache and the
+    /// durable store.
+    fn remove_pending_entry(&self, auth_id: &str) {
+        self.pending.lock().unwrap().remove(auth_id);
+        let _ = self.store.delete_pending(auth_id);
+    }
+
+    /// Resolve a user by login name, creating the user on first approval.
+    fn resolve_user_id(&self, user_name: &str) -> Result<i64, ControlError> {
+        if let Some(user) = self
+            .store
+            .get_user_by_login_name(user_name)
+            .map_err(|e| ControlError::Store(e.to_string()))?
+        {
+            return Ok(user.id);
+        }
+        let user = self
+            .store
+            .create_user(&User {
+                id: 0,
+                login_name: user_name.to_string(),
+                display_name: user_name.to_string(),
+                created_at: time::now_rfc3339(),
+            })
+            .map_err(|e| ControlError::Store(e.to_string()))?;
+        Ok(user.id)
+    }
+
+    /// Allocate addresses and build a durable node for a registration.
+    fn create_node_from_request(
+        &self,
+        machine_key: MachineKey,
+        request: &RegisterRequest,
+        user_id: i64,
+        tags: Option<Vec<String>>,
+        ephemeral: bool,
+        now: &str,
+    ) -> Result<DomainNode, ControlError> {
         let nodes = self
             .store
             .list_nodes()
@@ -319,11 +579,11 @@ impl ControlPlane {
             .unwrap_or_else(|| "node".to_string());
 
         let addresses = vec![format!("{ipv4}/32"), format!("{ipv6}/128")];
-        let domain_node = DomainNode {
+        Ok(DomainNode {
             id: 0,
             stable_id: String::new(),
             name: format!("{hostname}.{}.", self.config.tailnet_domain),
-            user_id: key.user_id,
+            user_id,
             node_key: request.node_key,
             machine_key,
             disco_key: crabscale_proto::DiscoKey::from_bytes([0u8; 32]),
@@ -333,23 +593,12 @@ impl ControlPlane {
             endpoint_types: Vec::new(),
             home_derp: 1,
             hostinfo: request.hostinfo.clone(),
-            created: now,
+            created: now.to_string(),
             cap: request.version,
-            tags: key.tags.clone(),
+            tags,
             machine_authorized: true,
-            ephemeral: key.ephemeral,
-        };
-        self.store
-            .upsert_node(&domain_node)
-            .map_err(|e| ControlError::Store(e.to_string()))?;
-
-        if !key.reusable {
-            self.store
-                .mark_pre_auth_key_used(key.id)
-                .map_err(|e| ControlError::Store(e.to_string()))?;
-        }
-
-        Ok(self.authorized_response())
+            ephemeral,
+        })
     }
 
     /// Validate a pre-auth key against the store and current time.
@@ -751,6 +1000,19 @@ impl ControlPlane {
     }
 }
 
+/// Extract the auth id from a followup URL of the form
+/// `https://<server>/register/<authId>`.
+pub fn auth_id_from_followup(followup: &str) -> Option<String> {
+    let marker = "/register/";
+    let idx = followup.rfind(marker)?;
+    let id = &followup[idx + marker.len()..];
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_auth_key() {
+    fn invalid_auth_key_starts_interactive_registration() {
         let plane = test_plane();
         let mut request = test_register_request();
         request.auth = Some(crabscale_proto::RegisterAuth {
@@ -805,7 +1067,9 @@ mod tests {
         });
         let response = plane.register(test_machine_key(), request).unwrap();
         assert!(!response.machine_authorized);
-        assert!(!response.error.is_empty());
+        assert!(response.error.is_empty());
+        assert!(!response.auth_url.is_empty());
+        assert!(response.auth_url.contains("/register/"));
     }
 
     #[test]
@@ -1513,5 +1777,100 @@ mod tests {
         let plane = test_plane();
         let result = plane.create_pre_auth_key("bad-prefix", true, false, None, None);
         assert!(matches!(result, Err(ControlError::InvalidAuthKey(_))));
+    }
+
+    #[test]
+    fn interactive_registration_approve_followup_authorizes() {
+        let plane = test_plane();
+        let mut request = test_register_request();
+        request.auth = None;
+        let pending = plane.register(test_machine_key(), request).unwrap();
+        assert!(!pending.machine_authorized);
+        assert!(!pending.auth_url.is_empty());
+        assert!(pending.error.is_empty());
+
+        let auth_id = auth_id_from_followup(&pending.auth_url).unwrap();
+        plane
+            .approve_pending(&auth_id, "owner@example.com")
+            .unwrap();
+
+        let mut followup = test_register_request();
+        followup.auth = None;
+        followup.followup = pending.auth_url.clone();
+        let response = plane.register(test_machine_key(), followup).unwrap();
+        assert!(response.machine_authorized);
+        assert!(
+            plane
+                .store
+                .get_node_by_node_key(&test_node_key())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn unknown_auth_id_cannot_authorize_different_machine_key() {
+        let plane = test_plane();
+        let mut request = test_register_request();
+        request.auth = None;
+        let pending = plane.register(test_machine_key(), request).unwrap();
+        let auth_id = auth_id_from_followup(&pending.auth_url).unwrap();
+        plane
+            .approve_pending(&auth_id, "owner@example.com")
+            .unwrap();
+
+        // A different machine key polling the same auth id must be rejected.
+        let mut followup = test_register_request();
+        followup.auth = None;
+        followup.followup = pending.auth_url.clone();
+        let response = plane
+            .register(MachineKey::from_bytes([0x99; 32]), followup)
+            .unwrap();
+        assert!(!response.machine_authorized);
+        assert!(!response.error.is_empty());
+        assert!(
+            plane
+                .store
+                .get_node_by_node_key(&test_node_key())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejected_pending_returns_error() {
+        let plane = test_plane();
+        let mut request = test_register_request();
+        request.auth = None;
+        let pending = plane.register(test_machine_key(), request).unwrap();
+        let auth_id = auth_id_from_followup(&pending.auth_url).unwrap();
+        plane.reject_pending(&auth_id).unwrap();
+
+        let mut followup = test_register_request();
+        followup.auth = None;
+        followup.followup = pending.auth_url.clone();
+        let response = plane.register(test_machine_key(), followup).unwrap();
+        assert!(!response.machine_authorized);
+        assert!(!response.error.is_empty());
+    }
+
+    #[test]
+    fn expired_pending_returns_new_registration_prompt() {
+        let config = ControlConfig {
+            pending_ttl_seconds: -1,
+            ..Default::default()
+        };
+        let plane = ControlPlane::new(config);
+        let mut request = test_register_request();
+        request.auth = None;
+        let pending = plane.register(test_machine_key(), request).unwrap();
+        assert!(!pending.machine_authorized);
+
+        let mut followup = test_register_request();
+        followup.auth = None;
+        followup.followup = pending.auth_url.clone();
+        let response = plane.register(test_machine_key(), followup).unwrap();
+        assert!(!response.machine_authorized);
+        assert!(response.error.contains("expired"));
     }
 }
