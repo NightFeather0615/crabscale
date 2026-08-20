@@ -117,7 +117,27 @@ async fn handle_request(
         return Ok(handle_ts2021(req, router, server_key).await);
     }
 
+    // `GET /register/{id}` serves the interactive-registration approval page
+    // (Spec-Registration section 4). Unknown or expired ids return 404.
+    if let Some(auth_id) = register_auth_id(&path) {
+        if method == http::Method::GET {
+            let response = router.handle_register_page(auth_id);
+            return Ok(response.map(Full::new));
+        }
+    }
+
     Ok(plain_response(StatusCode::NOT_FOUND, "not found"))
+}
+
+/// Extract the auth id from a `/register/{id}` path.
+///
+/// Returns `None` for any other path shape, including ids containing a slash.
+fn register_auth_id(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/register/")?;
+    if rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    Some(rest)
 }
 
 async fn handle_ts2021(
@@ -222,5 +242,14 @@ mod tests {
     fn extracts_query_param() {
         assert_eq!(query_param(Some("v=130"), "v"), Some("130"));
         assert_eq!(query_param(None, "v"), None);
+    }
+
+    #[test]
+    fn extracts_register_auth_id() {
+        assert_eq!(register_auth_id("/register/abc123"), Some("abc123"));
+        assert_eq!(register_auth_id("/register/abc/def"), None);
+        assert_eq!(register_auth_id("/register/"), None);
+        assert_eq!(register_auth_id("/register"), None);
+        assert_eq!(register_auth_id("/key"), None);
     }
 }
