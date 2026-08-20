@@ -118,15 +118,13 @@ impl ControlRouter {
             .as_ref()
             .map(|h| h.hostname.as_str())
             .unwrap_or("unknown");
+        // Host metadata is supplied by the (unauthenticated) client, so escape
+        // every interpolated value before placing it in the HTML page.
+        let auth_id_escaped = escape_html(auth_id);
+        let hostname_escaped = escape_html(hostname);
+        let expires_escaped = escape_html(&pending.expires_at);
         let html = format!(
-            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Pending registration</title></head>\
-             <body><h1>Pending registration</h1>\
-             <p>Auth id: <code>{auth_id}</code></p>\
-             <p>Hostname: <code>{hostname}</code></p>\
-             <p>Expires: <code>{}</code></p>\
-             <p>Approve or reject this registration with the <code>crabscale auth</code> CLI.</p>\
-             </body></html>",
-            pending.expires_at
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Pending registration</title></head>             <body><h1>Pending registration</h1>             <p>Auth id: <code>{auth_id_escaped}</code></p>             <p>Hostname: <code>{hostname_escaped}</code></p>             <p>Expires: <code>{expires_escaped}</code></p>             <p>Approve or reject this registration with the <code>crabscale auth</code> CLI.</p>             </body></html>"
         );
         Response::builder()
             .status(StatusCode::OK)
@@ -435,6 +433,22 @@ fn key_bad_request() -> Response<Bytes> {
     )
 }
 
+/// Escape text for safe inclusion in an HTML text node.
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn plain_response(status: StatusCode, text: &'static str) -> Response<Bytes> {
     Response::builder()
         .status(status)
@@ -446,10 +460,30 @@ fn plain_response(status: StatusCode, text: &'static str) -> Response<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crabscale_proto::MachineKey;
+    use crabscale_control::{ControlConfig, ControlPlane};
+    use crabscale_proto::{Hostinfo, MachineKey, NodeKey, RegisterAuth, RegisterRequest};
 
     fn test_key() -> MachineKey {
         MachineKey::from_bytes([0x42; 32])
+    }
+
+    fn start_pending(plane: &ControlPlane, machine_key: MachineKey) -> String {
+        let request = RegisterRequest {
+            version: 130,
+            node_key: NodeKey::from_bytes([0x22; 32]),
+            auth: Some(RegisterAuth {
+                auth_key: "wrong".to_string(),
+            }),
+            hostinfo: Some(Hostinfo {
+                hostname: "node1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = plane.register(machine_key, request);
+        assert!(!response.machine_authorized);
+        assert!(!response.auth_url.is_empty());
+        crabscale_control::auth_id_from_followup(&response.auth_url).unwrap()
     }
 
     #[test]
@@ -479,6 +513,67 @@ mod tests {
         assert_eq!(
             router.handle_key(Some("abc")).status(),
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn register_page_returns_html_for_known_id() {
+        let plane = ControlPlane::new(ControlConfig::default());
+        let router_machine_key = test_key();
+        let router = ControlRouter::with_control(router_machine_key, plane.clone());
+        let auth_id = start_pending(&plane, router_machine_key);
+
+        let response = router.handle_register_page(&auth_id);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/html; charset=utf-8"
+        );
+        let body = String::from_utf8(response.body().to_vec()).unwrap();
+        assert!(body.contains(&auth_id));
+        assert!(body.contains("node1"));
+        assert!(body.contains("<title>Pending registration</title>"));
+    }
+
+    #[test]
+    fn register_page_returns_404_for_unknown_id() {
+        let router = ControlRouter::new(test_key());
+        let response = router.handle_register_page("does-not-exist");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["content-type"], "text/plain");
+    }
+
+    #[test]
+    fn register_page_escapes_hostname() {
+        let plane = ControlPlane::new(ControlConfig::default());
+        let router_machine_key = test_key();
+        let router = ControlRouter::with_control(router_machine_key, plane.clone());
+        let request = RegisterRequest {
+            version: 130,
+            node_key: NodeKey::from_bytes([0x22; 32]),
+            auth: Some(RegisterAuth {
+                auth_key: "wrong".to_string(),
+            }),
+            hostinfo: Some(Hostinfo {
+                hostname: "<script>alert(1)</script>".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = plane.register(router_machine_key, request);
+        let auth_id = crabscale_control::auth_id_from_followup(&response.auth_url).unwrap();
+
+        let page = router.handle_register_page(&auth_id);
+        let body = String::from_utf8(page.body().to_vec()).unwrap();
+        assert!(!body.contains("<script>"));
+        assert!(body.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn escape_html_escapes_special_characters() {
+        assert_eq!(
+            escape_html("<a href=\"x\">&'</a>"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;"
         );
     }
 }
