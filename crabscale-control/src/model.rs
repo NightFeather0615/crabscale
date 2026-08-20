@@ -56,6 +56,14 @@ pub struct Node {
     pub approved_routes: Vec<String>,
     pub machine_authorized: bool,
     pub ephemeral: bool,
+    /// RFC 3339 timestamp of the last time the control plane observed the
+    /// node (a map or registration request). `None` when never observed.
+    pub last_seen: Option<String>,
+    /// RFC 3339 timestamp at which the node's key expires, if the server has
+    /// granted the node an expiry. Clients may never extend their own key
+    /// (Spec-Registration §5), so this is administratively set and is `None`
+    /// for the default no-expiry nodes.
+    pub key_expiry: Option<String>,
 }
 
 impl Node {
@@ -78,6 +86,7 @@ impl Node {
             created: self.created.clone(),
             cap: self.cap,
             tags: self.tags.clone(),
+            last_seen: self.last_seen.clone(),
             machine_authorized: self.machine_authorized,
             ..Default::default()
         }

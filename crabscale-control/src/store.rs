@@ -327,8 +327,9 @@ impl Store for SqliteStore {
             "INSERT INTO nodes (
                 stable_id, name, user_id, node_key, machine_key, disco_key,
                 addresses, allowed_ips, endpoints, endpoint_types, home_derp, hostinfo, created,
-                cap, tags, advertised_routes, approved_routes, machine_authorized, ephemeral
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                cap, tags, advertised_routes, approved_routes, machine_authorized, ephemeral,
+                last_seen, key_expiry
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
             ON CONFLICT(node_key) DO UPDATE SET
                 stable_id = excluded.stable_id,
                 name = excluded.name,
@@ -347,7 +348,9 @@ impl Store for SqliteStore {
                 advertised_routes = excluded.advertised_routes,
                 approved_routes = excluded.approved_routes,
                 machine_authorized = excluded.machine_authorized,
-                ephemeral = excluded.ephemeral",
+                ephemeral = excluded.ephemeral,
+                last_seen = excluded.last_seen,
+                key_expiry = excluded.key_expiry",
             params![
                 node.stable_id,
                 node.name,
@@ -368,6 +371,8 @@ impl Store for SqliteStore {
                 approved_routes,
                 node.machine_authorized as i64,
                 node.ephemeral as i64,
+                node.last_seen,
+                node.key_expiry,
             ],
         )?;
         let id = if node.id == 0 {
@@ -406,6 +411,8 @@ impl Store for SqliteStore {
             approved_routes: node.approved_routes.clone(),
             machine_authorized: node.machine_authorized,
             ephemeral: node.ephemeral,
+            last_seen: node.last_seen.clone(),
+            key_expiry: node.key_expiry.clone(),
         })
     }
 
@@ -415,7 +422,8 @@ impl Store for SqliteStore {
             .query_row(
                 "SELECT id, stable_id, name, user_id, node_key, machine_key, disco_key,
                         addresses, allowed_ips, endpoints, endpoint_types, home_derp, hostinfo, created,
-                        cap, tags, advertised_routes, approved_routes, machine_authorized, ephemeral
+                        cap, tags, advertised_routes, approved_routes, machine_authorized, ephemeral,
+                        last_seen, key_expiry
                  FROM nodes WHERE node_key = ?1",
                 params![node_key.to_string()],
                 row_to_node,
@@ -433,7 +441,8 @@ impl Store for SqliteStore {
             .query_row(
                 "SELECT id, stable_id, name, user_id, node_key, machine_key, disco_key,
                         addresses, allowed_ips, endpoints, endpoint_types, home_derp, hostinfo, created,
-                        cap, tags, advertised_routes, approved_routes, machine_authorized, ephemeral
+                        cap, tags, advertised_routes, approved_routes, machine_authorized, ephemeral,
+                        last_seen, key_expiry
                  FROM nodes WHERE machine_key = ?1",
                 params![machine_key.to_string()],
                 row_to_node,
@@ -448,7 +457,8 @@ impl Store for SqliteStore {
             .query_row(
                 "SELECT id, stable_id, name, user_id, node_key, machine_key, disco_key,
                         addresses, allowed_ips, endpoints, endpoint_types, home_derp, hostinfo, created,
-                        cap, tags, advertised_routes, approved_routes, machine_authorized, ephemeral
+                        cap, tags, advertised_routes, approved_routes, machine_authorized, ephemeral,
+                        last_seen, key_expiry
                  FROM nodes WHERE id = ?1",
                 params![id],
                 row_to_node,
@@ -462,7 +472,8 @@ impl Store for SqliteStore {
         let mut stmt = conn.prepare(
             "SELECT id, stable_id, name, user_id, node_key, machine_key, disco_key,
                     addresses, allowed_ips, endpoints, endpoint_types, home_derp, hostinfo, created,
-                    cap, tags, advertised_routes, approved_routes, machine_authorized, ephemeral
+                    cap, tags, advertised_routes, approved_routes, machine_authorized, ephemeral,
+                    last_seen, key_expiry
              FROM nodes ORDER BY id",
         )?;
         let rows = stmt.query_map([], row_to_node)?;
@@ -1001,6 +1012,8 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
         })?,
         machine_authorized: row.get::<_, i64>(18)? != 0,
         ephemeral: row.get::<_, i64>(19)? != 0,
+        last_seen: row.get(20)?,
+        key_expiry: row.get(21)?,
     })
 }
 
@@ -1194,6 +1207,16 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             PRAGMA user_version = 8;",
         )?;
     }
+    if version < 9 {
+        // M3-03: the control plane records when it last observed a node and
+        // (administratively) when a node's key expires so incremental map
+        // deltas can push `last_seen` and `key_expiry` patches.
+        conn.execute_batch(
+            "ALTER TABLE nodes ADD COLUMN last_seen TEXT;
+            ALTER TABLE nodes ADD COLUMN key_expiry TEXT;
+            PRAGMA user_version = 9;",
+        )?;
+    }
     Ok(())
 }
 
@@ -1237,6 +1260,8 @@ mod tests {
             approved_routes: Vec::new(),
             machine_authorized: true,
             ephemeral: false,
+            last_seen: None,
+            key_expiry: None,
         }
     }
 
