@@ -37,3 +37,10 @@ This wiki is the canonical source for architecture, protocol standards, roadmap,
 - All acceptance criteria in the issue are automated tests or a reproducible manual command.
 - No new issue-level undocumented wire behavior: any new format rule is added to this wiki in the same PR.
 - The change is reviewable in one session: one crate, one module or one endpoint at a time.
+
+## GitHub artifacts
+
+- Issues: https://github.com/NightFeather0615/crabscale/issues
+- Milestones: https://github.com/NightFeather0615/crabscale/milestones
+- Roadmap index issue: #28
+- Architecture review issue: #29
