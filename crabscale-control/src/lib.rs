@@ -11,6 +11,7 @@ mod ip_allocator;
 mod model;
 mod pending;
 mod preauth;
+mod session;
 mod store;
 mod time;
 
@@ -32,6 +33,7 @@ pub use pending::{
 pub use preauth::{
     AUTH_KEY_PREFIX, format_auth_key, generate_secret, hash_secret, parse_auth_key, verify_secret,
 };
+pub use session::{DEFAULT_RECONNECT_GRACE_SECONDS, SessionEvent, SessionRegistry};
 pub use store::{SqliteStore, Store, StoreError};
 
 /// Minimum capability version accepted by the control plane.
@@ -81,6 +83,9 @@ pub struct ControlConfig {
     pub pending_ttl_seconds: i64,
     /// Maximum number of pending interactive registrations kept in memory.
     pub pending_cache_limit: usize,
+    /// Reconnect grace in seconds before a node is marked offline after its
+    /// last live map session closes.
+    pub reconnect_grace_seconds: i64,
 }
 
 impl Default for ControlConfig {
@@ -118,6 +123,7 @@ impl Default for ControlConfig {
             server_url: "https://tailnet.example".to_string(),
             pending_ttl_seconds: DEFAULT_PENDING_TTL_SECONDS,
             pending_cache_limit: DEFAULT_PENDING_CACHE_LIMIT,
+            reconnect_grace_seconds: DEFAULT_RECONNECT_GRACE_SECONDS,
         }
     }
 }
@@ -175,6 +181,8 @@ pub enum MapOutcome {
         keep_alive: bool,
         /// Whether frames should be zstd-compressed.
         compress: bool,
+        /// The live map session id to close when the stream ends.
+        session_id: i64,
     },
 }
 
@@ -183,6 +191,7 @@ pub struct ControlPlane {
     config: ControlConfig,
     store: Arc<dyn Store>,
     pending: Mutex<pending::PendingCache>,
+    sessions: Mutex<SessionRegistry>,
 }
 
 impl Clone for ControlPlane {
@@ -218,11 +227,53 @@ impl ControlPlane {
     /// Create a control plane with an explicit store.
     pub fn with_store(config: ControlConfig, store: Arc<dyn Store>) -> Self {
         let pending = Mutex::new(pending::PendingCache::new(config.pending_cache_limit));
+        let sessions = Mutex::new(SessionRegistry::new(config.reconnect_grace_seconds));
         Self {
             config,
             store,
             pending,
+            sessions,
         }
+    }
+
+    /// Open a live map session for a node.
+    ///
+    /// Returns a session id that the caller must pass to [`Self::close_session`]
+    /// when the streaming map connection ends.
+    pub fn open_session(&self, node_id: i64, ephemeral: bool) -> Result<i64, ControlError> {
+        let now = time::now_unix();
+        let mut sessions = self.sessions.lock().unwrap();
+        let (session_id, _events) = sessions.open(node_id, ephemeral, now);
+        Ok(session_id)
+    }
+
+    /// Close a live map session by id.
+    pub fn close_session(&self, session_id: i64) -> Result<(), ControlError> {
+        let now = time::now_unix();
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.close(session_id, now);
+        Ok(())
+    }
+
+    /// Advance session lifecycle timers, emitting offline transitions and
+    /// deleting ephemeral nodes whose grace period has elapsed.
+    pub fn reap_sessions(&self) -> Vec<SessionEvent> {
+        let now = time::now_unix();
+        let events = self.sessions.lock().unwrap().tick(now);
+        for event in &events {
+            if let SessionEvent::EphemeralExpired(node_id) = event {
+                if let Ok(Some(node)) = self.store.get_node_by_id(*node_id) {
+                    let _ = self.store.delete_node(&node.node_key);
+                }
+            }
+        }
+        events
+    }
+
+    /// Whether a node currently has a live session or is inside its reconnect
+    /// grace window.
+    pub fn is_node_online(&self, node_id: i64) -> bool {
+        self.sessions.lock().unwrap().is_online(node_id)
     }
 
     /// Register a node key for the given Noise machine key.
@@ -886,10 +937,12 @@ impl ControlPlane {
         let frame = self.encode_frame(&response, compress)?;
 
         if streaming {
+            let session_id = self.open_session(node.id, node.ephemeral)?;
             Ok(MapOutcome::Stream {
                 first_frame: frame,
                 keep_alive: request.keep_alive,
                 compress,
+                session_id,
             })
         } else {
             Ok(MapOutcome::FullFrame(frame))

@@ -228,8 +228,9 @@ impl ControlRouter {
                 first_frame,
                 keep_alive,
                 compress,
+                session_id,
             }) => {
-                self.send_stream(respond, first_frame, keep_alive, compress)
+                self.send_stream(respond, first_frame, keep_alive, compress, session_id)
                     .await;
             }
             Err(ControlError::NotFound) => {
@@ -258,6 +259,7 @@ impl ControlRouter {
         first_frame: Vec<u8>,
         keep_alive: bool,
         compress: bool,
+        session_id: i64,
     ) {
         let response = Response::builder()
             .status(StatusCode::OK)
@@ -266,17 +268,22 @@ impl ControlRouter {
             .expect("static response is valid");
         let mut send = match respond.send_response(response, false) {
             Ok(s) => s,
-            Err(_) => return,
+            Err(_) => {
+                let _ = self.control.close_session(session_id);
+                return;
+            }
         };
         if send.send_data(Bytes::from(first_frame), false).is_err() {
+            let _ = self.control.close_session(session_id);
             return;
         }
         if !keep_alive {
             let _ = send.send_data(Bytes::new(), true);
+            let _ = self.control.close_session(session_id);
             return;
         }
         loop {
-            // Spec-NetMap §5: keepalive every 50s plus 0-9s random jitter.
+            // Spec-NetMap section 5: keepalive every 50s plus 0-9s random jitter.
             let jitter = Duration::from_secs(rand::random::<u64>() % 10);
             tokio::time::sleep(KEEPALIVE_INTERVAL + jitter).await;
             let frame = match self.control.keepalive_frame(compress) {
@@ -287,6 +294,7 @@ impl ControlRouter {
                 break;
             }
         }
+        let _ = self.control.close_session(session_id);
     }
 }
 

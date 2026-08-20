@@ -81,6 +81,8 @@ pub trait Store: Send + Sync {
     /// Fetch a node by its machine key.
     fn get_node_by_machine_key(&self, machine_key: &MachineKey)
     -> Result<Option<Node>, StoreError>;
+    /// Fetch a node by its id.
+    fn get_node_by_id(&self, id: i64) -> Result<Option<Node>, StoreError>;
     /// List all registered nodes.
     fn list_nodes(&self) -> Result<Vec<Node>, StoreError>;
     /// Delete a node by its node key.
@@ -375,6 +377,21 @@ impl Store for SqliteStore {
                         cap, tags, machine_authorized, ephemeral
                  FROM nodes WHERE machine_key = ?1",
                 params![machine_key.to_string()],
+                row_to_node,
+            )
+            .optional()?;
+        Ok(node)
+    }
+
+    fn get_node_by_id(&self, id: i64) -> Result<Option<Node>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let node = conn
+            .query_row(
+                "SELECT id, stable_id, name, user_id, node_key, machine_key, disco_key,
+                        addresses, allowed_ips, endpoints, endpoint_types, home_derp, hostinfo, created,
+                        cap, tags, machine_authorized, ephemeral
+                 FROM nodes WHERE id = ?1",
+                params![id],
                 row_to_node,
             )
             .optional()?;

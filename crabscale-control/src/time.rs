@@ -8,11 +8,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Return the current time as an RFC 3339 UTC string.
 pub fn now_rfc3339() -> String {
-    let secs = SystemTime::now()
+    format_unix(now_unix())
+}
+
+/// Return the current time as Unix seconds.
+pub fn now_unix() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    format_unix(secs)
+        .unwrap_or(0)
 }
 
 /// Return the current time plus `secs` seconds as an RFC 3339 UTC string.
