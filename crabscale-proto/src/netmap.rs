@@ -171,6 +171,13 @@ pub struct Node {
     /// ACL tags applied to this node.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    /// Capability map (node attributes) granted to this node.
+    ///
+    /// Keys are attribute names from the policy's `nodeAttrs` and values are
+    /// the optional argument lists (empty for key-only capabilities). The
+    /// control plane emits this for the self node from the compiled policy.
+    #[serde(rename = "CapMap", skip_serializing_if = "BTreeMap::is_empty")]
+    pub cap_map: BTreeMap<String, Vec<serde_json::Value>>,
     /// Subnet routes this node is the primary router for.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub primary_routes: Vec<String>,
@@ -340,6 +347,29 @@ mod tests {
         };
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["PacketFilters"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn cap_map_serializes_as_pascal_case_and_omits_when_empty() {
+        let node = Node {
+            cap_map: BTreeMap::from([(
+                "randomize-client-port".to_string(),
+                Vec::<serde_json::Value>::new(),
+            )]),
+            ..Node::default()
+        };
+        let json = serde_json::to_value(&node).unwrap();
+        assert_eq!(
+            json["CapMap"],
+            serde_json::json!({ "randomize-client-port": [] })
+        );
+
+        let empty = Node::default();
+        let empty_json = serde_json::to_value(&empty).unwrap();
+        assert!(
+            empty_json.get("CapMap").is_none(),
+            "empty CapMap must be omitted"
+        );
     }
 
     #[test]

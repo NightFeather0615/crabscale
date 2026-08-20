@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crabscale_proto::{
-    DerpMap, MIN_SUPPORTED_CAPVER, MachineKey, MapRequest, MapResponse, Node, NodeKey,
+    DerpMap, Hostinfo, MIN_SUPPORTED_CAPVER, MachineKey, MapRequest, MapResponse, Node, NodeKey,
     RegisterRequest, RegisterResponse, UserProfile, encode_map_response_frame,
 };
 
@@ -154,6 +154,11 @@ pub enum ControlError {
     InvalidAuthKey(String),
     /// The `endpoint_types` payload does not match the `endpoints` payload.
     InvalidEndpointTypes,
+    /// A policy check failed (for example a tag is not owned by its creator).
+    Policy(String),
+    /// A node requested tags it is not authorized to hold. Carries the
+    /// rejected tags. The node's state is left unchanged.
+    UnauthorizedTags(Vec<String>),
 }
 
 impl std::fmt::Display for ControlError {
@@ -169,6 +174,10 @@ impl std::fmt::Display for ControlError {
             Self::InvalidAuthKey(e) => write!(f, "invalid auth key: {e}"),
             Self::InvalidEndpointTypes => {
                 write!(f, "endpoint_types length does not match endpoints length")
+            }
+            Self::Policy(e) => write!(f, "policy error: {e}"),
+            Self::UnauthorizedTags(tags) => {
+                write!(f, "requested tags are not permitted: {}", tags.join(", "))
             }
         }
     }
@@ -348,12 +357,26 @@ impl ControlPlane {
                 // Existing node with a matching machine key.
                 if let Some(auth) = &request.auth {
                     if node.machine_authorized {
-                        // Restart relogin: already authorized, do not consume the key.
+                        // Restart relogin: already authorized, do not consume the
+                        // key. Process any RequestTags transition advertised by
+                        // the client (e.g. `tailscale up --advertise-tags`).
+                        let mut updated = node;
+                        let owner = self.node_owner_login(&updated)?;
+                        let requested = Self::requested_tags(request.hostinfo.as_ref());
+                        if self.apply_request_tags(&mut updated, owner.as_deref(), &requested)? {
+                            self.store
+                                .upsert_node(&updated)
+                                .map_err(|e| ControlError::Store(e.to_string()))?;
+                        }
                         return Ok(self.authorized_response());
                     }
                     if let Some(key) = self.validated_auth_key(auth, &now)? {
                         let mut updated = node;
                         updated.machine_authorized = true;
+                        // Tags come from the pre-auth key on re-auth (and from
+                        // the initial key on first registration); client
+                        // RequestTags are not honored for pre-auth keys
+                        // (Spec-Policy §4).
                         updated.tags = key.tags.clone();
                         updated.ephemeral = key.ephemeral;
                         self.store
@@ -368,7 +391,16 @@ impl ControlPlane {
                     }
                     // Invalid auth key: fall through to interactive registration.
                 } else if node.machine_authorized {
-                    // No auth key supplied and already authorized: return current state.
+                    // No auth key supplied and already authorized: process any
+                    // RequestTags transition then return current state.
+                    let mut updated = node;
+                    let owner = self.node_owner_login(&updated)?;
+                    let requested = Self::requested_tags(request.hostinfo.as_ref());
+                    if self.apply_request_tags(&mut updated, owner.as_deref(), &requested)? {
+                        self.store
+                            .upsert_node(&updated)
+                            .map_err(|e| ControlError::Store(e.to_string()))?;
+                    }
                     return Ok(self.authorized_response());
                 }
 
@@ -377,7 +409,18 @@ impl ControlPlane {
             }
 
             // New node registration.
-            if !request.expiry.is_empty() {
+            let key = match &request.auth {
+                Some(auth) => self.validated_auth_key(auth, &now)?,
+                None => None,
+            };
+            let is_tagged_key = key
+                .as_ref()
+                .and_then(|k| k.tags.as_ref())
+                .is_some_and(|t| !t.is_empty());
+
+            // Tagged nodes have no key expiry, so a tagged key bypasses the
+            // expiry gate entirely (Spec-Policy §4).
+            if !is_tagged_key && !request.expiry.is_empty() {
                 if time::is_past(&request.expiry, &now) {
                     return Ok(self.expired_response("node key is expired"));
                 }
@@ -385,30 +428,38 @@ impl ControlPlane {
                     return Ok(self.unauthorized_response("clients may not extend their own key"));
                 }
             }
-            if let Some(auth) = &request.auth {
-                if let Some(key) = self.validated_auth_key(auth, &now)? {
-                    let node = self.create_node_from_request(
-                        machine_key,
-                        &request,
-                        key.user_id,
-                        key.tags.clone(),
-                        key.ephemeral,
-                        &now,
-                    )?;
-                    self.store
-                        .upsert_node(&node)
-                        .map_err(|e| ControlError::Store(e.to_string()))?;
-                    if !key.reusable {
-                        self.store
-                            .mark_pre_auth_key_used(key.id)
-                            .map_err(|e| ControlError::Store(e.to_string()))?;
-                    }
-                    return Ok(self.authorized_response());
+
+            if let Some(key) = key {
+                // Pre-auth key registration: a non-tagged key cannot have the
+                // client claim tags, and a tagged key is authoritative for the
+                // tags (headscale parity; Spec-Policy §4).
+                if key.tags.is_none() && !Self::requested_tags(request.hostinfo.as_ref()).is_empty()
+                {
+                    return Err(ControlError::Policy(
+                        "pre-auth key registrations may not request tags".to_string(),
+                    ));
                 }
-                // Invalid auth key: fall through to interactive registration.
+                let node = self.create_node_from_request(
+                    machine_key,
+                    &request,
+                    key.user_id,
+                    key.tags.clone(),
+                    key.ephemeral,
+                    &now,
+                )?;
+                self.store
+                    .upsert_node(&node)
+                    .map_err(|e| ControlError::Store(e.to_string()))?;
+                if !key.reusable {
+                    self.store
+                        .mark_pre_auth_key_used(key.id)
+                        .map_err(|e| ControlError::Store(e.to_string()))?;
+                }
+                return Ok(self.authorized_response());
             }
 
-            // No valid auth key: start interactive registration.
+            // No valid auth key: start interactive registration. RequestTags
+            // are validated at approval time against the approving user.
             self.start_interactive(machine_key, request, &now)
         })();
         match result {
@@ -533,9 +584,26 @@ impl ControlPlane {
             return Err(ControlError::NotFound);
         }
         let user_id = self.resolve_user_id(user_name)?;
+        // If the client advertised RequestTags, authorize them against the
+        // approving user and carry the approved tags into the verdict so the
+        // resulting node is created tag-owned (Spec-Policy §4).
+        let requested = Self::requested_tags(entry.hostinfo.as_ref());
+        let approved_tags = if requested.is_empty() {
+            None
+        } else {
+            let rejected = crabscale_policy::unauthorized_tags(
+                &self.config.policy,
+                Some(user_name),
+                &requested,
+            );
+            if !rejected.is_empty() {
+                return Err(ControlError::UnauthorizedTags(rejected));
+            }
+            Some(requested)
+        };
         entry.verdict = PendingVerdict::Approved {
             user_id,
-            tags: None,
+            tags: approved_tags,
         };
         self.pending.lock().unwrap().insert(entry.clone());
         self.store
@@ -671,6 +739,13 @@ impl ControlPlane {
             .unwrap_or_else(|| "node".to_string());
 
         let addresses = vec![format!("{ipv4}/32"), format!("{ipv6}/128")];
+        // A tagged node is owned by its tags, not by a user (Spec-Policy §4):
+        // the node carries no owner, and tagged nodes have no key expiry.
+        let user_id = if tags.as_ref().is_some_and(|t| !t.is_empty()) {
+            None
+        } else {
+            Some(user_id)
+        };
         Ok(DomainNode {
             id: 0,
             stable_id: String::new(),
@@ -791,6 +866,90 @@ impl ControlPlane {
         })
     }
 
+    /// The requested tags carried by a request's `Hostinfo`, if any.
+    fn requested_tags(hostinfo: Option<&Hostinfo>) -> Vec<String> {
+        hostinfo
+            .and_then(|h| h.request_tags.clone())
+            .unwrap_or_default()
+    }
+
+    /// Resolve the login name that owns a node, if the node has an owner.
+    /// Tagged nodes carry no owner and therefore resolve to `None`.
+    fn node_owner_login(&self, node: &DomainNode) -> Result<Option<String>, ControlError> {
+        let Some(user_id) = node.user_id else {
+            return Ok(None);
+        };
+        Ok(self
+            .store
+            .get_user(user_id)
+            .map_err(|e| ControlError::Store(e.to_string()))?
+            .map(|u| u.login_name))
+    }
+
+    /// Apply a `RequestTags` transition to a node.
+    ///
+    /// `requested` is the client's `Hostinfo.RequestTags`; an empty slice
+    /// means "no tags". For a node that keeps its existing owner (a
+    /// user-owned node untagging to stay user-owned) this is a no-op; for a
+    /// tag-owned node it returns the node to the user that `auth_user_login`
+    /// identifies. If a tag-owned node presents no authorizing user (as in a
+    /// map update, where `node_owner_login` is `None`), untagging is rejected
+    /// rather than leaving the node ownerless.
+    ///
+    /// Tags are authorized against `auth_user_login`, the identity presenting
+    /// the credential (the node's owner, or the approving user during
+    /// registration). Every requested tag must be listed in the policy's
+    /// `tagOwners` for that user; an unauthorized transition is rejected with
+    /// [`ControlError::UnauthorizedTags`] and the node is left unchanged
+    /// (Spec-Policy §4). Returns `true` when the node changed.
+    fn apply_request_tags(
+        &self,
+        node: &mut DomainNode,
+        auth_user_login: Option<&str>,
+        requested: &[String],
+    ) -> Result<bool, ControlError> {
+        let mut current: Vec<String> = node.tags.clone().unwrap_or_default();
+        current.sort();
+        current.dedup();
+        let mut requested = requested.to_vec();
+        requested.sort();
+        requested.dedup();
+
+        if requested == current {
+            return Ok(false);
+        }
+
+        if requested.is_empty() {
+            // Untag: return the node to user ownership. A tagged node carries
+            // no user, so the authorizing user supplies the ownership.
+            let user_id = match node.user_id {
+                Some(id) => id,
+                None => {
+                    let login = auth_user_login.ok_or_else(|| {
+                        ControlError::Policy(
+                            "cannot return a tagged node to user ownership without a user"
+                                .to_string(),
+                        )
+                    })?;
+                    self.resolve_user_id(login)?
+                }
+            };
+            node.tags = None;
+            node.user_id = Some(user_id);
+            return Ok(true);
+        }
+
+        // Adding or changing tags requires ownership of every requested tag.
+        let rejected =
+            crabscale_policy::unauthorized_tags(&self.config.policy, auth_user_login, &requested);
+        if !rejected.is_empty() {
+            return Err(ControlError::UnauthorizedTags(rejected));
+        }
+        node.tags = Some(requested);
+        node.user_id = None;
+        Ok(true)
+    }
+
     /// Create a pre-auth key and return the full `hskey-auth-...` string.
     pub fn create_pre_auth_key(
         &self,
@@ -805,6 +964,22 @@ impl ControlPlane {
             return Err(ControlError::InvalidAuthKey(
                 "prefix must be non-empty alphanumeric".to_string(),
             ));
+        }
+        // A pre-auth key may only carry tags its creator is allowed to use:
+        // only principals listed in `tagOwners` may approve a tag
+        // (Spec-Policy §4).
+        if let Some(tags) = &tags {
+            let rejected = crabscale_policy::unauthorized_tags(
+                &self.config.policy,
+                Some(&self.config.user_login_name),
+                tags,
+            );
+            if !rejected.is_empty() {
+                return Err(ControlError::Policy(format!(
+                    "creator may not approve tags: {}",
+                    rejected.join(", ")
+                )));
+            }
         }
         let secret = generate_secret();
         let key = PreAuthKey {
@@ -976,6 +1151,15 @@ impl ControlPlane {
             node.endpoints = request.endpoints.clone();
             node.endpoint_types = request.endpoint_types.clone();
         }
+        // Process a RequestTags transition advertised in Hostinfo on an
+        // authorizing (non-read-only) update. Unauthorized changes are
+        // rejected and leave the stored node untouched (Spec-Policy §4). The
+        // single upsert below persists any successful transition.
+        if !read_only && request.hostinfo.is_some() {
+            let owner = self.node_owner_login(&node)?;
+            let requested = Self::requested_tags(request.hostinfo.as_ref());
+            self.apply_request_tags(&mut node, owner.as_deref(), &requested)?;
+        }
         self.store
             .upsert_node(&node)
             .map_err(|e| ControlError::Store(e.to_string()))?;
@@ -1014,8 +1198,21 @@ impl ControlPlane {
         node: &Node,
         _request: &MapRequest,
     ) -> Result<MapResponse, ControlError> {
-        let compiled =
-            crabscale_policy::compile_policy(&self.config.policy, &self.compile_nodes()?);
+        let compile_nodes = self.compile_nodes()?;
+        let compiled = crabscale_policy::compile_policy(&self.config.policy, &compile_nodes);
+
+        // Emit the policy-derived node attributes on the self node's CapMap
+        // (Spec-Policy §6).
+        let mut node = node.clone();
+        if let Some(self_compile) = compile_nodes.iter().find(|n| n.id == node.id) {
+            if !self.config.policy.node_attrs.is_empty() {
+                node.cap_map = crabscale_policy::node_attributes(
+                    &self.config.policy,
+                    self_compile,
+                    &compile_nodes,
+                );
+            }
+        }
 
         // Per-node reduced base filter; empty means deny all.
         let base = compiled
@@ -1053,7 +1250,9 @@ impl ControlPlane {
             if !visible.contains(&(stored.id as u64)) {
                 continue;
             }
-            user_ids.insert(stored.user_id);
+            if let Some(uid) = stored.user_id {
+                user_ids.insert(uid);
+            }
             peers.push(stored.to_proto());
         }
         // Spec-NetMap section 4: keep peer arrays sorted by node ID.
@@ -1096,11 +1295,14 @@ impl ControlPlane {
             .list_nodes()
             .map_err(|e| ControlError::Store(e.to_string()))?
         {
-            let user_login = self
-                .store
-                .get_user(stored.user_id)
-                .map_err(|e| ControlError::Store(e.to_string()))?
-                .map(|u| u.login_name);
+            let user_login = match stored.user_id {
+                Some(user_id) => self
+                    .store
+                    .get_user(user_id)
+                    .map_err(|e| ControlError::Store(e.to_string()))?
+                    .map(|u| u.login_name),
+                None => None,
+            };
             nodes.push(crabscale_policy::CompileNode {
                 id: stored.id as u64,
                 user_login,
@@ -1176,6 +1378,26 @@ mod tests {
     fn test_plane() -> ControlPlane {
         ControlPlane::new(ControlConfig {
             policy: allow_all_policy(),
+            ..ControlConfig::default()
+        })
+    }
+
+    /// A policy that lets the default user (`owner@example.com`) approve
+    /// `tag:server`, used by tag and `RequestTags` tests.
+    fn tagged_policy() -> crabscale_policy::Policy {
+        crabscale_policy::parse_policy(
+            r#"{
+                "tagOwners": { "tag:server": ["owner@example.com"] },
+                "acls": [ { "action": "accept", "src": ["*"], "dst": ["*:*"] } ]
+            }"#,
+        )
+        .expect("tagged policy must parse")
+    }
+
+    /// A control plane whose policy lets the default user approve `tag:server`.
+    fn tagged_plane() -> ControlPlane {
+        ControlPlane::new(ControlConfig {
+            policy: tagged_policy(),
             ..ControlConfig::default()
         })
     }
@@ -1778,7 +2000,7 @@ mod tests {
 
     #[test]
     fn tagged_node_survives_logout() {
-        let plane = test_plane();
+        let plane = tagged_plane();
         let key = plane
             .create_pre_auth_key(
                 "tagged",
@@ -2263,5 +2485,215 @@ mod tests {
         );
         let n3 = map_json(&plane, 3);
         assert_eq!(n3["Peers"], serde_json::json!([]));
+    }
+
+    /// Map as `node` with the given `Hostinfo.RequestTags`, returning the raw
+    /// outcome so tests can assert both success and error paths.
+    fn map_with_request_tags(
+        plane: &ControlPlane,
+        node: &DomainNode,
+        request_tags: Vec<String>,
+    ) -> Result<MapOutcome, ControlError> {
+        let request = MapRequest {
+            version: 130,
+            node_key: node.node_key,
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: false,
+            hostinfo: Some(Hostinfo {
+                request_tags: Some(request_tags),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        plane.handle_map(node.machine_key, request)
+    }
+
+    #[test]
+    fn tagged_pre_auth_key_creates_node_without_user_ownership() {
+        let plane = tagged_plane();
+        let key = plane
+            .create_pre_auth_key(
+                "tm1",
+                true,
+                false,
+                None,
+                Some(vec!["tag:server".to_string()]),
+            )
+            .unwrap();
+        let node_key = NodeKey::from_bytes([0x61; 32]);
+        let response = plane.register(test_machine_key(), request_with(node_key, &key));
+        assert!(response.machine_authorized);
+        let node = plane
+            .store
+            .get_node_by_node_key(&node_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.tags, Some(vec!["tag:server".to_string()]));
+        assert_eq!(node.user_id, None, "tagged nodes carry no user ownership");
+    }
+
+    #[test]
+    fn create_pre_auth_key_rejects_tags_not_owned_by_creator() {
+        let plane = tagged_plane(); // the owner may only approve tag:server
+        let err = plane
+            .create_pre_auth_key(
+                "tm2",
+                true,
+                false,
+                None,
+                Some(vec!["tag:other".to_string()]),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ControlError::Policy(_)),
+            "unowned tags must be rejected at key creation"
+        );
+    }
+
+    #[test]
+    fn tagged_node_has_no_key_expiry_by_default() {
+        let plane = tagged_plane();
+        let key = plane
+            .create_pre_auth_key(
+                "tm3",
+                true,
+                false,
+                None,
+                Some(vec!["tag:server".to_string()]),
+            )
+            .unwrap();
+        let node_key = NodeKey::from_bytes([0x62; 32]);
+
+        // A past expiry in the registration is ignored for a tagged node:
+        // tagged nodes never expire.
+        let mut request = request_with(node_key, &key);
+        request.expiry = "2000-01-01T00:00:00Z".to_string();
+        let response = plane.register(test_machine_key(), request);
+        assert!(response.machine_authorized, "tagged node must not expire");
+
+        // Re-registration with a past expiry keeps the tagged node authorized
+        // (logout is a no-op for tagged nodes).
+        let mut reauth = request_with(node_key, &key);
+        reauth.expiry = "2000-01-01T00:00:00Z".to_string();
+        let response = plane.register(test_machine_key(), reauth);
+        assert!(response.machine_authorized);
+    }
+
+    #[test]
+    fn pre_auth_key_registration_rejects_client_request_tags() {
+        let plane = tagged_plane();
+        let key = plane
+            .create_pre_auth_key("tm4", true, false, None, None)
+            .unwrap();
+        let node_key = NodeKey::from_bytes([0x63; 32]);
+        let mut request = request_with(node_key, &key);
+        request.hostinfo.as_mut().unwrap().request_tags = Some(vec!["tag:server".to_string()]);
+        let response = plane.register(test_machine_key(), request);
+        assert!(!response.machine_authorized);
+        assert!(!response.error.is_empty());
+        assert!(
+            plane
+                .store
+                .get_node_by_node_key(&node_key)
+                .unwrap()
+                .is_none(),
+            "rejected registration must not create a node"
+        );
+    }
+
+    #[test]
+    fn unauthorized_request_tags_transition_fails_and_does_not_change_node() {
+        let plane = tagged_plane();
+        // A user-owned node owned by the default user.
+        plane.register(test_machine_key(), test_register_request());
+        let node = plane.store.list_nodes().unwrap().remove(0);
+
+        let err = map_with_request_tags(&plane, &node, vec!["tag:other".to_string()]).unwrap_err();
+        assert!(matches!(err, ControlError::UnauthorizedTags(_)));
+
+        let after = plane
+            .store
+            .get_node_by_node_key(&node.node_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.tags, node.tags,
+            "unauthorized transition must not change tags"
+        );
+        assert_eq!(
+            after.user_id, node.user_id,
+            "unauthorized transition must not change ownership"
+        );
+    }
+
+    #[test]
+    fn authorized_request_tags_transition_tags_node() {
+        let plane = tagged_plane();
+        plane.register(test_machine_key(), test_register_request());
+        let node = plane.store.list_nodes().unwrap().remove(0);
+
+        // The default user owns tag:server, so the transition is authorized.
+        map_with_request_tags(&plane, &node, vec!["tag:server".to_string()]).unwrap();
+
+        let after = plane
+            .store
+            .get_node_by_node_key(&node.node_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.tags, Some(vec!["tag:server".to_string()]));
+        assert_eq!(after.user_id, None, "tagged nodes carry no user ownership");
+    }
+
+    #[test]
+    fn node_attrs_appear_in_self_node_cap_map() {
+        let mut plane = test_plane();
+        plane.config.policy = crabscale_policy::parse_policy(
+            r#"{
+                "tagOwners": { "tag:server": ["owner@example.com"] },
+                "nodeAttrs": [
+                    { "target": ["autogroup:member"], "attr": ["randomize-client-port"] }
+                ],
+                "acls": [ { "action": "accept", "src": ["*"], "dst": ["*:*"] } ]
+            }"#,
+        )
+        .expect("policy must parse");
+        plane.register(test_machine_key(), test_register_request());
+        let json = map_json(&plane, 1);
+        assert_eq!(
+            json["Node"]["CapMap"],
+            serde_json::json!({ "randomize-client-port": [] }),
+            "nodeAttrs must appear in the self node CapMap"
+        );
+    }
+
+    #[test]
+    fn node_attrs_cap_map_updates_on_policy_change() {
+        let mut plane = test_plane();
+        // Start with a policy that grants no attributes.
+        plane.config.policy = allow_all_policy();
+        plane.register(test_machine_key(), test_register_request());
+        let before = map_json(&plane, 1);
+        assert!(
+            before["Node"].get("CapMap").is_none(),
+            "no attributes configured means no CapMap"
+        );
+
+        // Add an attribute grant and re-map: the self node CapMap must appear.
+        plane.config.policy = crabscale_policy::parse_policy(
+            r#"{
+                "tagOwners": { "tag:server": ["owner@example.com"] },
+                "nodeAttrs": [
+                    { "target": ["autogroup:member"], "attr": ["drive:share"] }
+                ],
+                "acls": [ { "action": "accept", "src": ["*"], "dst": ["*:*"] } ]
+            }"#,
+        )
+        .expect("policy must parse");
+        let after = map_json(&plane, 1);
+        assert_eq!(
+            after["Node"]["CapMap"],
+            serde_json::json!({ "drive:share": [] }),
+            "a policy change must be reflected in the next map's CapMap"
+        );
     }
 }
