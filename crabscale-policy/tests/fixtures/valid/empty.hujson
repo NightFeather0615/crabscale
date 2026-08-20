@@ -1,0 +1,3 @@
+{
+  // A policy with no rules: everything is denied by default.
+}

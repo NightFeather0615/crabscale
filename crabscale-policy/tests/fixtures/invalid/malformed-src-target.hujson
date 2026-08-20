@@ -1,0 +1,5 @@
+{
+  "acls": [
+    { "action": "accept", "src": ["!!not a valid target!!"], "dst": ["*:*"] }
+  ],
+}

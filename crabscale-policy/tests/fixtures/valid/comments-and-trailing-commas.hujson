@@ -1,0 +1,22 @@
+// Leading line comment.
+/* A block comment that
+   spans multiple lines. */
+{
+  "groups": {
+    "dev": ["dev@example.com"], // trailing comma below is intentional
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": [
+        "dev@example.com",
+        "tag:dev",
+      ],
+      "dst": ["*:*",],
+    }, // trailing object comma
+  ],
+  "hosts": {
+    "jump": "100.64.0.1/32",
+  },
+}
+// Trailing comment at end of file.
