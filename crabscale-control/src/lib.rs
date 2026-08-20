@@ -330,6 +330,7 @@ impl ControlPlane {
             addresses: addresses.clone(),
             allowed_ips: Some(addresses),
             endpoints: Vec::new(),
+            endpoint_types: Vec::new(),
             home_derp: 1,
             hostinfo: request.hostinfo.clone(),
             created: now,
@@ -595,23 +596,32 @@ impl ControlPlane {
             .filter(|n| n.machine_key == machine_key)
             .ok_or(ControlError::NotFound)?;
 
-        // The disco key is only carried in MapRequest, not RegisterRequest, so
-        // apply it here so the first MapResponse advertises the client's real
-        // disco key (Spec-NetMap §3).
-        node.disco_key = request.disco_key;
-
         let streaming = request.stream;
         let lite_update = !streaming && request.omit_peers && !request.read_only;
 
-        // Streaming requests (version >= 68) are read-only: ignore hostinfo
-        // and endpoints for state updates.
-        if !streaming {
+        // The disco key is only carried in MapRequest, not RegisterRequest, so
+        // apply it unconditionally: a streaming-first client still needs its
+        // real disco key advertised in the first MapResponse (Spec-NetMap §3).
+        // The read-only rule below is scoped to Hostinfo and Endpoints only.
+        node.disco_key = request.disco_key;
+
+        // Streaming requests (version >= 68) are read-only for Hostinfo and
+        // Endpoints: they must not clear or clobber the state a client already
+        // reported through a non-streaming update. The `version >= 68` clause
+        // is redundant today because handle_map rejects versions below
+        // MIN_SUPPORTED_CAPVER, but it documents the spec rule.
+        let read_only = streaming && request.version >= 68;
+        if !read_only {
             if let Some(hostinfo) = &request.hostinfo {
                 node.hostinfo = Some(hostinfo.clone());
+                if let Some(net_info) = &hostinfo.net_info {
+                    if net_info.preferred_derp != 0 {
+                        node.home_derp = net_info.preferred_derp;
+                    }
+                }
             }
-            if !request.endpoints.is_empty() {
-                node.endpoints = request.endpoints.clone();
-            }
+            node.endpoints = request.endpoints.clone();
+            node.endpoint_types = request.endpoint_types.clone();
         }
         self.store
             .upsert_node(&node)
@@ -707,7 +717,7 @@ impl ControlPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crabscale_proto::{DiscoKey, Hostinfo, MapRequest, NodeKey, RegisterRequest};
+    use crabscale_proto::{DiscoKey, Hostinfo, MapRequest, NetInfo, NodeKey, RegisterRequest};
 
     fn test_plane() -> ControlPlane {
         ControlPlane::new(ControlConfig::default())
@@ -813,6 +823,239 @@ mod tests {
         };
         let outcome = plane.handle_map(test_machine_key(), request).unwrap();
         assert_eq!(outcome, MapOutcome::LiteUpdate);
+    }
+
+    #[test]
+    fn map_merges_endpoint_types_and_preferred_derp() {
+        let plane = test_plane();
+        plane
+            .register(test_machine_key(), test_register_request())
+            .unwrap();
+        let request = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x44; 32]),
+            stream: false,
+            endpoints: vec!["198.51.100.10:41641".to_string()],
+            endpoint_types: vec![2],
+            hostinfo: Some(Hostinfo {
+                hostname: "node1".to_string(),
+                net_info: Some(NetInfo {
+                    preferred_derp: 7,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let outcome = plane.handle_map(test_machine_key(), request).unwrap();
+        assert!(matches!(outcome, MapOutcome::FullFrame(_)));
+
+        let stored = plane
+            .store
+            .get_node_by_node_key(&test_node_key())
+            .unwrap()
+            .expect("node should exist");
+        assert_eq!(stored.endpoints, vec!["198.51.100.10:41641"]);
+        assert_eq!(stored.endpoint_types, vec![2]);
+        assert_eq!(stored.home_derp, 7);
+        assert_eq!(stored.disco_key, DiscoKey::from_bytes([0x44; 32]));
+        assert_eq!(stored.hostinfo.as_ref().unwrap().hostname, "node1");
+    }
+
+    #[test]
+    fn streaming_request_is_read_only_and_does_not_clear_state() {
+        let plane = test_plane();
+        plane
+            .register(test_machine_key(), test_register_request())
+            .unwrap();
+
+        // Establish state through a non-streaming update.
+        let update = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: false,
+            endpoints: vec!["1.2.3.4:41641".to_string()],
+            endpoint_types: vec![2],
+            hostinfo: Some(Hostinfo {
+                hostname: "node1".to_string(),
+                net_info: Some(NetInfo {
+                    preferred_derp: 5,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        plane.handle_map(test_machine_key(), update).unwrap();
+
+        // A streaming request must not clear or clobber endpoints/hostinfo,
+        // but the disco key is still applied (Spec-NetMap §3).
+        let stream = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x99; 32]),
+            stream: true,
+            endpoints: Vec::new(),
+            endpoint_types: Vec::new(),
+            hostinfo: Some(Hostinfo {
+                hostname: "other".to_string(),
+                net_info: Some(NetInfo {
+                    preferred_derp: 9,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let outcome = plane.handle_map(test_machine_key(), stream).unwrap();
+        let MapOutcome::Stream { first_frame, .. } = outcome else {
+            panic!("expected stream");
+        };
+        let (payload, consumed) = crabscale_proto::decode_map_response_frame(&first_frame).unwrap();
+        assert_eq!(consumed, first_frame.len());
+        let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert!(json.get("Node").is_some());
+
+        let stored = plane
+            .store
+            .get_node_by_node_key(&test_node_key())
+            .unwrap()
+            .expect("node should exist");
+        assert_eq!(stored.endpoints, vec!["1.2.3.4:41641"]);
+        assert_eq!(stored.endpoint_types, vec![2]);
+        assert_eq!(stored.home_derp, 5);
+        assert_eq!(stored.disco_key, DiscoKey::from_bytes([0x99; 32]));
+        assert_eq!(stored.hostinfo.as_ref().unwrap().hostname, "node1");
+    }
+
+    #[test]
+    fn streaming_first_request_sets_disco_key_but_not_endpoints_or_hostinfo() {
+        let plane = test_plane();
+        plane
+            .register(test_machine_key(), test_register_request())
+            .unwrap();
+
+        // A real client's first map request is often the streaming long-poll.
+        // The disco key must still be applied, while endpoints/hostinfo stay
+        // read-only for stream=true, version>=68.
+        let stream = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x44; 32]),
+            stream: true,
+            endpoints: vec!["198.51.100.10:41641".to_string()],
+            endpoint_types: vec![2],
+            hostinfo: Some(Hostinfo {
+                hostname: "other".to_string(),
+                net_info: Some(NetInfo {
+                    preferred_derp: 9,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let outcome = plane.handle_map(test_machine_key(), stream).unwrap();
+        let MapOutcome::Stream { first_frame, .. } = outcome else {
+            panic!("expected stream");
+        };
+        let (payload, consumed) = crabscale_proto::decode_map_response_frame(&first_frame).unwrap();
+        assert_eq!(consumed, first_frame.len());
+        let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(
+            json["Node"]["DiscoKey"],
+            serde_json::json!(
+                "discokey:4444444444444444444444444444444444444444444444444444444444444444"
+            )
+        );
+
+        let stored = plane
+            .store
+            .get_node_by_node_key(&test_node_key())
+            .unwrap()
+            .expect("node should exist");
+        assert_eq!(stored.disco_key, DiscoKey::from_bytes([0x44; 32]));
+        assert!(stored.endpoints.is_empty());
+        assert!(stored.endpoint_types.is_empty());
+        assert_eq!(stored.home_derp, 1);
+        assert_eq!(stored.hostinfo.as_ref().unwrap().hostname, "node1");
+    }
+
+    #[test]
+    fn lite_update_changes_endpoints_while_stream_open() {
+        let plane = test_plane();
+        plane
+            .register(test_machine_key(), test_register_request())
+            .unwrap();
+
+        // Establish state and open a long-poll stream.
+        let update = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: false,
+            endpoints: vec!["old.example:41641".to_string()],
+            endpoint_types: vec![1],
+            ..Default::default()
+        };
+        plane.handle_map(test_machine_key(), update).unwrap();
+        let stream = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: true,
+            ..Default::default()
+        };
+        let stream_outcome = plane.handle_map(test_machine_key(), stream).unwrap();
+        let MapOutcome::Stream { first_frame, .. } = stream_outcome else {
+            panic!("expected stream");
+        };
+        let (_payload, consumed) =
+            crabscale_proto::decode_map_response_frame(&first_frame).unwrap();
+        assert_eq!(consumed, first_frame.len());
+
+        // A lite update while the stream is open changes peer endpoints and
+        // returns an empty-body update without disturbing the stream.
+        let lite = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: false,
+            omit_peers: true,
+            endpoints: vec!["new.example:41641".to_string()],
+            endpoint_types: vec![3],
+            ..Default::default()
+        };
+        let outcome = plane.handle_map(test_machine_key(), lite).unwrap();
+        assert_eq!(outcome, MapOutcome::LiteUpdate);
+
+        let stored = plane
+            .store
+            .get_node_by_node_key(&test_node_key())
+            .unwrap()
+            .expect("node should exist");
+        assert_eq!(stored.endpoints, vec!["new.example:41641"]);
+        assert_eq!(stored.endpoint_types, vec![3]);
+    }
+
+    #[test]
+    fn machine_key_mismatch_returns_not_found() {
+        let plane = test_plane();
+        plane
+            .register(test_machine_key(), test_register_request())
+            .unwrap();
+        let request = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            ..Default::default()
+        };
+        assert_eq!(
+            plane.handle_map(MachineKey::from_bytes([0x77; 32]), request),
+            Err(ControlError::NotFound)
+        );
     }
 
     #[test]

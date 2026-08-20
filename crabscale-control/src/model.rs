@@ -39,6 +39,7 @@ pub struct Node {
     pub addresses: Vec<String>,
     pub allowed_ips: Option<Vec<String>>,
     pub endpoints: Vec<String>,
+    pub endpoint_types: Vec<u8>,
     pub home_derp: u64,
     pub hostinfo: Option<Hostinfo>,
     pub created: String,
