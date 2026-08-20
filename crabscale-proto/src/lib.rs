@@ -18,6 +18,7 @@
 pub const MIN_SUPPORTED_CAPVER: u32 = 113;
 
 mod derp;
+mod dns;
 mod early;
 mod frame;
 mod hostinfo;
@@ -28,6 +29,7 @@ mod ping;
 mod register;
 
 pub use derp::{DerpMap, DerpNode, DerpRegion};
+pub use dns::{DnsConfig, DnsRecord, DnsResolver};
 pub use early::EarlyNoise;
 pub use frame::{
     FrameError, MAP_RESPONSE_FRAME_HEADER_LEN, MAX_MAP_RESPONSE_PAYLOAD_LEN,
@@ -60,6 +62,11 @@ pub(crate) mod serde_util {
 
     /// `skip_serializing_if` helper for zero `u32` values.
     pub(crate) fn is_zero_u32(value: &u32) -> bool {
+        *value == 0
+    }
+
+    /// `skip_serializing_if` helper for zero `u16` values.
+    pub(crate) fn is_zero_u16(value: &u16) -> bool {
         *value == 0
     }
 
