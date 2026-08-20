@@ -10,4 +10,4 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo run -p crabscale-harness --bin rust-peer --offline "$@"
+cargo run -p crabscale-harness --bin rust-peer --offline -- "$@"

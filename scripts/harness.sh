@@ -11,4 +11,4 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo run -p crabscale-harness --bin harness --offline "$@"
+cargo run -p crabscale-harness --bin harness --offline -- "$@"
