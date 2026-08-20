@@ -3,7 +3,7 @@
 use std::fmt;
 
 /// Errors produced while parsing, framing, or completing a TS2021 handshake.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
     /// The init message did not have the required 101-byte layout.
     InvalidInitMessage,
@@ -29,6 +29,10 @@ pub enum TransportError {
     InvalidUpgradeRequest,
     /// The WebSocket subprotocol was not supported.
     UnsupportedSubprotocol,
+    /// An HTTP/2 operation failed.
+    Http2(String),
+    /// An inner request body exceeded the protocol limit.
+    BodyTooLarge,
 }
 
 impl fmt::Display for TransportError {
@@ -48,6 +52,8 @@ impl fmt::Display for TransportError {
             Self::InvalidEarlyPayload => write!(f, "early payload is not valid JSON"),
             Self::InvalidUpgradeRequest => write!(f, "invalid TS2021 upgrade request"),
             Self::UnsupportedSubprotocol => write!(f, "unsupported WebSocket subprotocol"),
+            Self::Http2(e) => write!(f, "HTTP/2 error: {e}"),
+            Self::BodyTooLarge => write!(f, "request body exceeds the 1 MiB limit"),
         }
     }
 }
