@@ -88,6 +88,10 @@ pub trait Store: Send + Sync {
     fn get_pre_auth_key(&self, prefix: &str) -> Result<Option<PreAuthKey>, StoreError>;
     /// Mark a pre-auth key as used.
     fn mark_pre_auth_key_used(&self, id: i64) -> Result<(), StoreError>;
+    /// List all pre-auth keys.
+    fn list_pre_auth_keys(&self) -> Result<Vec<PreAuthKey>, StoreError>;
+    /// Revoke a pre-auth key by prefix.
+    fn revoke_pre_auth_key(&self, prefix: &str) -> Result<(), StoreError>;
     /// Save a policy document and return the stored entity.
     fn save_policy(&self, policy: &Policy) -> Result<Policy, StoreError>;
     /// Fetch a policy document by name.
@@ -238,8 +242,8 @@ impl Store for SqliteStore {
             "INSERT INTO nodes (
                 stable_id, name, user_id, node_key, machine_key, disco_key,
                 addresses, allowed_ips, endpoints, home_derp, hostinfo, created,
-                cap, tags, machine_authorized
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                cap, tags, machine_authorized, ephemeral
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             ON CONFLICT(node_key) DO UPDATE SET
                 stable_id = excluded.stable_id,
                 name = excluded.name,
@@ -254,7 +258,8 @@ impl Store for SqliteStore {
                 created = excluded.created,
                 cap = excluded.cap,
                 tags = excluded.tags,
-                machine_authorized = excluded.machine_authorized",
+                machine_authorized = excluded.machine_authorized,
+                ephemeral = excluded.ephemeral",
             params![
                 node.stable_id,
                 node.name,
@@ -271,6 +276,7 @@ impl Store for SqliteStore {
                 node.cap as i64,
                 tags,
                 node.machine_authorized as i64,
+                node.ephemeral as i64,
             ],
         )?;
         let id = if node.id == 0 {
@@ -305,6 +311,7 @@ impl Store for SqliteStore {
             cap: node.cap,
             tags: node.tags.clone(),
             machine_authorized: node.machine_authorized,
+            ephemeral: node.ephemeral,
         })
     }
 
@@ -314,7 +321,7 @@ impl Store for SqliteStore {
             .query_row(
                 "SELECT id, stable_id, name, user_id, node_key, machine_key, disco_key,
                         addresses, allowed_ips, endpoints, home_derp, hostinfo, created,
-                        cap, tags, machine_authorized
+                        cap, tags, machine_authorized, ephemeral
                  FROM nodes WHERE node_key = ?1",
                 params![node_key.to_string()],
                 row_to_node,
@@ -332,7 +339,7 @@ impl Store for SqliteStore {
             .query_row(
                 "SELECT id, stable_id, name, user_id, node_key, machine_key, disco_key,
                         addresses, allowed_ips, endpoints, home_derp, hostinfo, created,
-                        cap, tags, machine_authorized
+                        cap, tags, machine_authorized, ephemeral
                  FROM nodes WHERE machine_key = ?1",
                 params![machine_key.to_string()],
                 row_to_node,
@@ -346,7 +353,7 @@ impl Store for SqliteStore {
         let mut stmt = conn.prepare(
             "SELECT id, stable_id, name, user_id, node_key, machine_key, disco_key,
                     addresses, allowed_ips, endpoints, home_derp, hostinfo, created,
-                    cap, tags, machine_authorized
+                    cap, tags, machine_authorized, ephemeral
              FROM nodes ORDER BY id",
         )?;
         let rows = stmt.query_map([], row_to_node)?;
@@ -450,6 +457,58 @@ impl Store for SqliteStore {
         let changed = conn.execute(
             "UPDATE pre_auth_keys SET used = 1 WHERE id = ?1",
             params![id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn list_pre_auth_keys(&self) -> Result<Vec<PreAuthKey>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, prefix, secret_hash, reusable, ephemeral, expiration, revoked,
+                    used, tags, user_id, created_at
+             FROM pre_auth_keys ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let tags: Option<String> = row.get(8)?;
+            Ok(PreAuthKey {
+                id: row.get(0)?,
+                prefix: row.get(1)?,
+                secret_hash: row.get(2)?,
+                reusable: row.get::<_, i64>(3)? != 0,
+                ephemeral: row.get::<_, i64>(4)? != 0,
+                expiration: row.get(5)?,
+                revoked: row.get::<_, i64>(6)? != 0,
+                used: row.get::<_, i64>(7)? != 0,
+                tags: tags
+                    .map(|s| {
+                        serde_json::from_str(&s).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                8,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })
+                    })
+                    .transpose()?,
+                user_id: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        })?;
+        let mut keys = Vec::new();
+        for row in rows {
+            keys.push(row?);
+        }
+        Ok(keys)
+    }
+
+    fn revoke_pre_auth_key(&self, prefix: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE pre_auth_keys SET revoked = 1 WHERE prefix = ?1",
+            params![prefix],
         )?;
         if changed == 0 {
             return Err(StoreError::NotFound);
@@ -632,12 +691,13 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
                 )
             })?,
         machine_authorized: row.get::<_, i64>(15)? != 0,
+        ephemeral: row.get::<_, i64>(16)? != 0,
     })
 }
 
 /// Apply all pending schema migrations.
 fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let mut version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < 1 {
         conn.execute_batch(
             "BEGIN;
@@ -670,7 +730,8 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
                 created TEXT NOT NULL,
                 cap INTEGER NOT NULL,
                 tags TEXT,
-                machine_authorized INTEGER NOT NULL
+                machine_authorized INTEGER NOT NULL,
+                ephemeral INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_nodes_machine_key ON nodes(machine_key);
             CREATE TABLE IF NOT EXISTS pre_auth_keys (
@@ -700,8 +761,15 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
                 last_seen TEXT NOT NULL,
                 closed_at TEXT
             );
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 2;
             COMMIT;",
+        )?;
+        version = 2;
+    }
+    if version < 2 {
+        conn.execute_batch(
+            "ALTER TABLE nodes ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 0;
+            PRAGMA user_version = 2;",
         )?;
     }
     Ok(())
@@ -743,6 +811,7 @@ mod tests {
             cap: 130,
             tags: None,
             machine_authorized: true,
+            ephemeral: false,
         }
     }
 

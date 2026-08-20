@@ -45,6 +45,7 @@ pub struct Node {
     pub cap: u32,
     pub tags: Option<Vec<String>>,
     pub machine_authorized: bool,
+    pub ephemeral: bool,
 }
 
 impl Node {

@@ -9,7 +9,9 @@
 
 mod ip_allocator;
 mod model;
+mod preauth;
 mod store;
+mod time;
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -17,12 +19,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crabscale_proto::{
-    DerpMap, FilterRule, MachineKey, MapRequest, MapResponse, NetPortRange, Node, RegisterRequest,
-    RegisterResponse, UserProfile, encode_map_response_frame,
+    DerpMap, FilterRule, MachineKey, MapRequest, MapResponse, NetPortRange, Node, NodeKey,
+    RegisterRequest, RegisterResponse, UserProfile, encode_map_response_frame,
 };
 
 pub use ip_allocator::{IpAllocator, IpAllocatorError};
 pub use model::{Login, Node as DomainNode, Policy, PreAuthKey, Session, User};
+pub use preauth::{
+    AUTH_KEY_PREFIX, format_auth_key, generate_secret, hash_secret, parse_auth_key, verify_secret,
+};
 pub use store::{SqliteStore, Store, StoreError};
 
 /// Minimum capability version accepted by the control plane.
@@ -121,6 +126,8 @@ pub enum ControlError {
     Frame,
     /// zstd compression failed.
     Zstd,
+    /// A pre-auth key prefix is invalid.
+    InvalidAuthKey(String),
 }
 
 impl std::fmt::Display for ControlError {
@@ -133,6 +140,7 @@ impl std::fmt::Display for ControlError {
             Self::Json => write!(f, "failed to serialize JSON"),
             Self::Frame => write!(f, "failed to frame MapResponse"),
             Self::Zstd => write!(f, "failed to compress MapResponse"),
+            Self::InvalidAuthKey(e) => write!(f, "invalid auth key: {e}"),
         }
     }
 }
@@ -201,36 +209,77 @@ impl ControlPlane {
         request: RegisterRequest,
     ) -> Result<RegisterResponse, ControlError> {
         self.ensure_default_user()?;
+        self.ensure_bootstrap_key()?;
+        let now = time::now_rfc3339();
 
         if let Some(node) = self
             .store
             .get_node_by_node_key(&request.node_key)
             .map_err(|e| ControlError::Store(e.to_string()))?
         {
-            if node.machine_key == machine_key {
-                // TODO(M1): refresh hostinfo and capability version on
-                // re-registration instead of returning early.
+            if node.machine_key != machine_key {
+                return Ok(
+                    self.unauthorized_response("node key is already registered to another machine")
+                );
+            }
+
+            // A past expiry is a logout; a future expiry is a client trying to
+            // extend its own key, which is rejected (Spec-Registration §5).
+            if !request.expiry.is_empty() {
+                if time::is_past(&request.expiry, &now) {
+                    return self.logout_node(node, true);
+                }
+                if time::is_future(&request.expiry, &now) {
+                    return Ok(self.unauthorized_response("clients may not extend their own key"));
+                }
+            }
+
+            // Existing node with a matching machine key.
+            if let Some(auth) = &request.auth {
+                if node.machine_authorized {
+                    // Restart relogin: already authorized, do not consume the key.
+                    return Ok(self.authorized_response());
+                }
+                if let Some(key) = self.validated_auth_key(auth, &now)? {
+                    let mut updated = node;
+                    updated.machine_authorized = true;
+                    updated.tags = key.tags.clone();
+                    updated.ephemeral = key.ephemeral;
+                    self.store
+                        .upsert_node(&updated)
+                        .map_err(|e| ControlError::Store(e.to_string()))?;
+                    if !key.reusable {
+                        self.store
+                            .mark_pre_auth_key_used(key.id)
+                            .map_err(|e| ControlError::Store(e.to_string()))?;
+                    }
+                    return Ok(self.authorized_response());
+                }
+                return Ok(self.unauthorized_response("invalid or missing auth key"));
+            }
+
+            // No auth key supplied: return the current authorization state.
+            if node.machine_authorized {
                 return Ok(self.authorized_response());
             }
-            return Ok(RegisterResponse {
-                machine_authorized: false,
-                error: "node key is already registered to another machine".to_string(),
-                ..Default::default()
-            });
+            return Ok(self.unauthorized_response("node is logged out"));
         }
 
-        let auth_ok = request
-            .auth
-            .as_ref()
-            .map(|auth| auth.auth_key == self.config.auth_key)
-            .unwrap_or(false);
-        if !auth_ok {
-            return Ok(RegisterResponse {
-                machine_authorized: false,
-                error: "invalid or missing auth key".to_string(),
-                ..Default::default()
-            });
+        // New node registration.
+        if !request.expiry.is_empty() {
+            if time::is_past(&request.expiry, &now) {
+                return Ok(self.expired_response("node key is expired"));
+            }
+            if time::is_future(&request.expiry, &now) {
+                return Ok(self.unauthorized_response("clients may not extend their own key"));
+            }
         }
+        let Some(auth) = &request.auth else {
+            return Ok(self.unauthorized_response("invalid or missing auth key"));
+        };
+        let Some(key) = self.validated_auth_key(auth, &now)? else {
+            return Ok(self.unauthorized_response("invalid or missing auth key"));
+        };
 
         let nodes = self
             .store
@@ -274,7 +323,7 @@ impl ControlPlane {
             id: 0,
             stable_id: String::new(),
             name: format!("{hostname}.{}.", self.config.tailnet_domain),
-            user_id: self.config.user_id as i64,
+            user_id: key.user_id,
             node_key: request.node_key,
             machine_key,
             disco_key: crabscale_proto::DiscoKey::from_bytes([0u8; 32]),
@@ -283,16 +332,213 @@ impl ControlPlane {
             endpoints: Vec::new(),
             home_derp: 1,
             hostinfo: request.hostinfo.clone(),
-            created: CONTROL_TIME.to_string(),
+            created: now,
             cap: request.version,
-            tags: None,
+            tags: key.tags.clone(),
             machine_authorized: true,
+            ephemeral: key.ephemeral,
         };
         self.store
             .upsert_node(&domain_node)
             .map_err(|e| ControlError::Store(e.to_string()))?;
 
+        if !key.reusable {
+            self.store
+                .mark_pre_auth_key_used(key.id)
+                .map_err(|e| ControlError::Store(e.to_string()))?;
+        }
+
         Ok(self.authorized_response())
+    }
+
+    /// Validate a pre-auth key against the store and current time.
+    ///
+    /// Returns `None` when the key is malformed, unknown, revoked, expired,
+    /// or already consumed (for single-use keys).
+    fn validated_auth_key(
+        &self,
+        auth: &crabscale_proto::RegisterAuth,
+        now: &str,
+    ) -> Result<Option<PreAuthKey>, ControlError> {
+        let Some((prefix, secret)) = parse_auth_key(&auth.auth_key) else {
+            return Ok(None);
+        };
+        let Some(key) = self
+            .store
+            .get_pre_auth_key(&prefix)
+            .map_err(|e| ControlError::Store(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if !verify_secret(&secret, &key.secret_hash) {
+            return Ok(None);
+        }
+        if key.revoked {
+            return Ok(None);
+        }
+        if let Some(expiration) = &key.expiration {
+            if time::is_past(expiration, now) {
+                return Ok(None);
+            }
+        }
+        if !key.reusable && key.used {
+            return Ok(None);
+        }
+        Ok(Some(key))
+    }
+
+    /// Log out a node.
+    ///
+    /// Tagged nodes are never logged out (no-expiry). Ephemeral nodes are
+    /// deleted entirely. All other nodes are deauthorized and must re-auth.
+    pub fn logout(&self, node_key: &NodeKey) -> Result<RegisterResponse, ControlError> {
+        let Some(node) = self
+            .store
+            .get_node_by_node_key(node_key)
+            .map_err(|e| ControlError::Store(e.to_string()))?
+        else {
+            return Ok(self.unauthorized_response("node not found"));
+        };
+        self.logout_node(node, false)
+    }
+
+    /// Apply logout semantics to a node.
+    ///
+    /// Tagged nodes are never logged out (no-expiry). Ephemeral nodes are
+    /// deleted entirely. All other nodes are deauthorized and must re-auth.
+    /// When `node_key_expired` is set, the response advertises the expired
+    /// node key so the client re-authenticates.
+    fn logout_node(
+        &self,
+        node: DomainNode,
+        node_key_expired: bool,
+    ) -> Result<RegisterResponse, ControlError> {
+        if node.tags.is_some() {
+            return Ok(self.authorized_response());
+        }
+        if node.ephemeral {
+            self.store
+                .delete_node(&node.node_key)
+                .map_err(|e| ControlError::Store(e.to_string()))?;
+            return Ok(RegisterResponse {
+                machine_authorized: false,
+                node_key_expired,
+                error: "node logged out".to_string(),
+                ..Default::default()
+            });
+        }
+        let mut updated = node;
+        updated.machine_authorized = false;
+        self.store
+            .upsert_node(&updated)
+            .map_err(|e| ControlError::Store(e.to_string()))?;
+        Ok(RegisterResponse {
+            machine_authorized: false,
+            node_key_expired,
+            error: "node logged out".to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// Create a pre-auth key and return the full `hskey-auth-...` string.
+    pub fn create_pre_auth_key(
+        &self,
+        prefix: &str,
+        reusable: bool,
+        ephemeral: bool,
+        expiration: Option<String>,
+        tags: Option<Vec<String>>,
+    ) -> Result<String, ControlError> {
+        self.ensure_default_user()?;
+        if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(ControlError::InvalidAuthKey(
+                "prefix must be non-empty alphanumeric".to_string(),
+            ));
+        }
+        let secret = generate_secret();
+        let key = PreAuthKey {
+            id: 0,
+            prefix: prefix.to_string(),
+            secret_hash: hash_secret(&secret),
+            reusable,
+            ephemeral,
+            expiration,
+            revoked: false,
+            used: false,
+            tags,
+            user_id: self.config.user_id as i64,
+            created_at: time::now_rfc3339(),
+        };
+        self.store
+            .create_pre_auth_key(&key)
+            .map_err(|e| ControlError::Store(e.to_string()))?;
+        Ok(format_auth_key(prefix, &secret))
+    }
+
+    /// List all stored pre-auth keys.
+    pub fn list_pre_auth_keys(&self) -> Result<Vec<PreAuthKey>, ControlError> {
+        self.store
+            .list_pre_auth_keys()
+            .map_err(|e| ControlError::Store(e.to_string()))
+    }
+
+    /// Revoke a pre-auth key by prefix.
+    pub fn revoke_pre_auth_key(&self, prefix: &str) -> Result<(), ControlError> {
+        self.store
+            .revoke_pre_auth_key(prefix)
+            .map_err(|e| ControlError::Store(e.to_string()))
+    }
+
+    /// Seed the configured bootstrap auth key if it is not already present.
+    fn ensure_bootstrap_key(&self) -> Result<(), ControlError> {
+        if self.config.auth_key.is_empty() {
+            return Ok(());
+        }
+        let Some((prefix, secret)) = parse_auth_key(&self.config.auth_key) else {
+            return Ok(());
+        };
+        if self
+            .store
+            .get_pre_auth_key(&prefix)
+            .map_err(|e| ControlError::Store(e.to_string()))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let key = PreAuthKey {
+            id: 0,
+            prefix,
+            secret_hash: hash_secret(&secret),
+            reusable: true,
+            ephemeral: false,
+            expiration: None,
+            revoked: false,
+            used: false,
+            tags: None,
+            user_id: self.config.user_id as i64,
+            created_at: time::now_rfc3339(),
+        };
+        self.store
+            .create_pre_auth_key(&key)
+            .map_err(|e| ControlError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    fn unauthorized_response(&self, error: &str) -> RegisterResponse {
+        RegisterResponse {
+            machine_authorized: false,
+            error: error.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn expired_response(&self, error: &str) -> RegisterResponse {
+        RegisterResponse {
+            machine_authorized: false,
+            node_key_expired: true,
+            error: error.to_string(),
+            ..Default::default()
+        }
     }
 
     fn ensure_default_user(&self) -> Result<(), ControlError> {
@@ -636,5 +882,261 @@ mod tests {
             plane.handle_map(test_machine_key(), request),
             Err(ControlError::NotFound)
         );
+    }
+
+    fn request_with(node_key: NodeKey, auth_key: &str) -> RegisterRequest {
+        RegisterRequest {
+            version: 130,
+            node_key,
+            auth: Some(crabscale_proto::RegisterAuth {
+                auth_key: auth_key.to_string(),
+            }),
+            hostinfo: Some(Hostinfo {
+                hostname: "node".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn one_time_key_cannot_register_two_distinct_nodes() {
+        let plane = test_plane();
+        let key = plane
+            .create_pre_auth_key("single", false, false, None, None)
+            .unwrap();
+        let node1 = NodeKey::from_bytes([0x41; 32]);
+        let node2 = NodeKey::from_bytes([0x42; 32]);
+        let first = plane
+            .register(test_machine_key(), request_with(node1, &key))
+            .unwrap();
+        assert!(first.machine_authorized);
+        let second = plane
+            .register(test_machine_key(), request_with(node2, &key))
+            .unwrap();
+        assert!(!second.machine_authorized);
+    }
+
+    #[test]
+    fn restart_relogin_does_not_consume_one_time_key() {
+        let plane = test_plane();
+        let key = plane
+            .create_pre_auth_key("single2", false, false, None, None)
+            .unwrap();
+        let node = NodeKey::from_bytes([0x43; 32]);
+        let first = plane
+            .register(test_machine_key(), request_with(node, &key))
+            .unwrap();
+        assert!(first.machine_authorized);
+        // Re-register the same node with the same key: still authorized.
+        let second = plane
+            .register(test_machine_key(), request_with(node, &key))
+            .unwrap();
+        assert!(second.machine_authorized);
+    }
+
+    #[test]
+    fn logout_returns_client_to_needs_login() {
+        let plane = test_plane();
+        plane
+            .register(test_machine_key(), test_register_request())
+            .unwrap();
+        let response = plane.logout(&test_node_key()).unwrap();
+        assert!(!response.machine_authorized);
+        // Re-register without auth: still logged out.
+        let mut request = test_register_request();
+        request.auth = None;
+        let response = plane.register(test_machine_key(), request).unwrap();
+        assert!(!response.machine_authorized);
+    }
+
+    #[test]
+    fn tagged_node_survives_logout() {
+        let plane = test_plane();
+        let key = plane
+            .create_pre_auth_key(
+                "tagged",
+                true,
+                false,
+                None,
+                Some(vec!["tag:server".to_string()]),
+            )
+            .unwrap();
+        let node = NodeKey::from_bytes([0x44; 32]);
+        let response = plane
+            .register(test_machine_key(), request_with(node, &key))
+            .unwrap();
+        assert!(response.machine_authorized);
+        let response = plane.logout(&node).unwrap();
+        assert!(response.machine_authorized);
+    }
+
+    #[test]
+    fn ephemeral_node_is_deleted_on_logout() {
+        let plane = test_plane();
+        let key = plane
+            .create_pre_auth_key("eph", true, true, None, None)
+            .unwrap();
+        let node = NodeKey::from_bytes([0x45; 32]);
+        let response = plane
+            .register(test_machine_key(), request_with(node, &key))
+            .unwrap();
+        assert!(response.machine_authorized);
+        let response = plane.logout(&node).unwrap();
+        assert!(!response.machine_authorized);
+        assert!(plane.store.get_node_by_node_key(&node).unwrap().is_none());
+    }
+
+    #[test]
+    fn database_contains_no_plaintext_auth_secret() {
+        let plane = test_plane();
+        let key = plane
+            .create_pre_auth_key("nosecret", true, false, None, None)
+            .unwrap();
+        let (_, secret) = parse_auth_key(&key).unwrap();
+        for stored in plane.list_pre_auth_keys().unwrap() {
+            assert!(!stored.secret_hash.contains(&secret));
+            assert!(!stored.secret_hash.contains("hskey-auth-"));
+        }
+    }
+
+    #[test]
+    fn revoked_key_is_rejected() {
+        let plane = test_plane();
+        let key = plane
+            .create_pre_auth_key("revoked", true, false, None, None)
+            .unwrap();
+        let (prefix, _) = parse_auth_key(&key).unwrap();
+        plane.revoke_pre_auth_key(&prefix).unwrap();
+        let node = NodeKey::from_bytes([0x46; 32]);
+        let response = plane
+            .register(test_machine_key(), request_with(node, &key))
+            .unwrap();
+        assert!(!response.machine_authorized);
+    }
+
+    #[test]
+    fn expired_key_is_rejected() {
+        let plane = test_plane();
+        let key = plane
+            .create_pre_auth_key(
+                "expired",
+                true,
+                false,
+                Some("2000-01-01T00:00:00Z".to_string()),
+                None,
+            )
+            .unwrap();
+        let node = NodeKey::from_bytes([0x47; 32]);
+        let response = plane
+            .register(test_machine_key(), request_with(node, &key))
+            .unwrap();
+        assert!(!response.machine_authorized);
+    }
+
+    #[test]
+    fn reusable_key_registers_multiple_nodes() {
+        let plane = test_plane();
+        let key = plane
+            .create_pre_auth_key("reusable", true, false, None, None)
+            .unwrap();
+        let node1 = NodeKey::from_bytes([0x48; 32]);
+        let node2 = NodeKey::from_bytes([0x49; 32]);
+        let first = plane
+            .register(test_machine_key(), request_with(node1, &key))
+            .unwrap();
+        assert!(first.machine_authorized);
+        let second = plane
+            .register(test_machine_key(), request_with(node2, &key))
+            .unwrap();
+        assert!(second.machine_authorized);
+    }
+
+    #[test]
+    fn single_use_key_is_consumed_on_re_auth() {
+        let plane = test_plane();
+        let first_key = plane
+            .create_pre_auth_key("reauth1", false, false, None, None)
+            .unwrap();
+        let node_a = NodeKey::from_bytes([0x51; 32]);
+        let node_b = NodeKey::from_bytes([0x52; 32]);
+
+        // Register node A with a single-use key.
+        let first = plane
+            .register(test_machine_key(), request_with(node_a, &first_key))
+            .unwrap();
+        assert!(first.machine_authorized);
+
+        // Log out node A, then re-auth with a fresh single-use key.
+        let logout = plane.logout(&node_a).unwrap();
+        assert!(!logout.machine_authorized);
+        let second_key = plane
+            .create_pre_auth_key("reauth2", false, false, None, None)
+            .unwrap();
+        let reauth = plane
+            .register(test_machine_key(), request_with(node_a, &second_key))
+            .unwrap();
+        assert!(reauth.machine_authorized);
+
+        // The same single-use key must not authorize a second distinct node.
+        let second = plane
+            .register(test_machine_key(), request_with(node_b, &second_key))
+            .unwrap();
+        assert!(!second.machine_authorized);
+    }
+
+    #[test]
+    fn past_expiry_logs_out_node() {
+        let plane = test_plane();
+        plane
+            .register(test_machine_key(), test_register_request())
+            .unwrap();
+        let mut request = test_register_request();
+        request.expiry = "2000-01-01T00:00:00Z".to_string();
+        let response = plane.register(test_machine_key(), request).unwrap();
+        assert!(!response.machine_authorized);
+        assert!(response.node_key_expired);
+    }
+
+    #[test]
+    fn future_expiry_is_rejected() {
+        let plane = test_plane();
+        plane
+            .register(test_machine_key(), test_register_request())
+            .unwrap();
+        let mut request = test_register_request();
+        request.expiry = "2999-01-01T00:00:00Z".to_string();
+        let response = plane.register(test_machine_key(), request).unwrap();
+        assert!(!response.machine_authorized);
+        assert!(!response.error.is_empty());
+    }
+
+    #[test]
+    fn new_node_with_past_expiry_is_rejected() {
+        let plane = test_plane();
+        let mut request = test_register_request();
+        request.node_key = NodeKey::from_bytes([0x53; 32]);
+        request.expiry = "2000-01-01T00:00:00Z".to_string();
+        let response = plane.register(test_machine_key(), request).unwrap();
+        assert!(!response.machine_authorized);
+        assert!(response.node_key_expired);
+    }
+
+    #[test]
+    fn new_node_with_future_expiry_is_rejected() {
+        let plane = test_plane();
+        let mut request = test_register_request();
+        request.node_key = NodeKey::from_bytes([0x54; 32]);
+        request.expiry = "2999-01-01T00:00:00Z".to_string();
+        let response = plane.register(test_machine_key(), request).unwrap();
+        assert!(!response.machine_authorized);
+        assert!(!response.error.is_empty());
+    }
+
+    #[test]
+    fn create_pre_auth_key_rejects_non_alphanumeric_prefix() {
+        let plane = test_plane();
+        let result = plane.create_pre_auth_key("bad-prefix", true, false, None, None);
+        assert!(matches!(result, Err(ControlError::InvalidAuthKey(_))));
     }
 }
