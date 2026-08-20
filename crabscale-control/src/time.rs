@@ -44,7 +44,6 @@ pub fn is_past(ts: &str, now: &str) -> bool {
 }
 
 /// True if `ts` is strictly after `now`.
-#[allow(dead_code)]
 pub fn is_future(ts: &str, now: &str) -> bool {
     match (parse_rfc3339(ts), parse_rfc3339(now)) {
         (Some(a), Some(b)) => a > b,

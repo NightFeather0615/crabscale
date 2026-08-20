@@ -36,6 +36,10 @@ pub fn parse_auth_key(key: &str) -> Option<(String, String)> {
 }
 
 /// Hash a secret with a random salt, returning `salt$hexhash`.
+///
+/// A single unsalted-stretching Blake2b512 pass is appropriate for the
+/// high-entropy random secrets used here; do not reuse for low-entropy
+/// passwords.
 pub fn hash_secret(secret: &str) -> String {
     let mut salt = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut salt);
@@ -49,6 +53,9 @@ pub fn hash_secret(secret: &str) -> String {
 }
 
 /// Verify a plaintext secret against a stored `salt$hexhash` value.
+///
+/// The comparison is not constant-time, which is acceptable for 256-bit
+/// random secrets that are never attacker-controlled in bulk.
 pub fn verify_secret(secret: &str, stored: &str) -> bool {
     let Some((salt_hex, hash_hex)) = stored.split_once('$') else {
         return false;
