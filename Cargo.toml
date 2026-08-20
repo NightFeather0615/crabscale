@@ -8,6 +8,7 @@ members = [
     "crabscale-derp",
     "crabscale-server",
     "crabscale-cli",
+    "crabscale-harness",
 ]
 
 [workspace.package]

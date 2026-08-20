@@ -23,6 +23,11 @@ pub struct ServerKey {
 }
 
 impl ServerKey {
+    /// Build a server key from an explicit responder and machine key.
+    pub fn new(responder: NoiseResponder, public: MachineKey) -> Self {
+        Self { responder, public }
+    }
+
     /// The Noise responder used for the TS2021 handshake.
     pub fn responder(&self) -> &NoiseResponder {
         &self.responder

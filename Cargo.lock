@@ -239,6 +239,25 @@ name = "crabscale-derp"
 version = "0.1.0"
 
 [[package]]
+name = "crabscale-harness"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "clap",
+ "crabscale-control",
+ "crabscale-proto",
+ "crabscale-server",
+ "crabscale-transport",
+ "h2",
+ "http",
+ "serde",
+ "serde_json",
+ "tokio",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "crabscale-policy"
 version = "0.1.0"
 
