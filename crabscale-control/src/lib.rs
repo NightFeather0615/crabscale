@@ -633,7 +633,7 @@ impl ControlPlane {
 
         let proto_node = node.to_proto();
         let compress = request.compress == "zstd";
-        let response = self.build_initial_map(&proto_node, &request);
+        let response = self.build_initial_map(&proto_node, &request)?;
         let frame = self.encode_frame(&response, compress)?;
 
         if streaming {
@@ -648,7 +648,15 @@ impl ControlPlane {
     }
 
     /// Build the first complete MapResponse for a node.
-    pub fn build_initial_map(&self, node: &Node, _request: &MapRequest) -> MapResponse {
+    ///
+    /// The peer list is built from every other registered node, sorted by node
+    /// ID, and user profiles are emitted for the requesting user and each peer
+    /// user (Spec-NetMap section 3).
+    pub fn build_initial_map(
+        &self,
+        node: &Node,
+        _request: &MapRequest,
+    ) -> Result<MapResponse, ControlError> {
         let mut packet_filters = BTreeMap::new();
         packet_filters.insert(
             "base".to_string(),
@@ -662,21 +670,50 @@ impl ControlPlane {
             }],
         );
 
-        MapResponse {
+        let mut peers = Vec::new();
+        let mut user_ids = std::collections::BTreeSet::new();
+        user_ids.insert(self.config.user_id as i64);
+        for stored in self
+            .store
+            .list_nodes()
+            .map_err(|e| ControlError::Store(e.to_string()))?
+        {
+            if stored.node_key == node.key {
+                continue;
+            }
+            user_ids.insert(stored.user_id);
+            peers.push(stored.to_proto());
+        }
+        // Spec-NetMap section 4: keep peer arrays sorted by node ID.
+        peers.sort_by_key(|p| p.id);
+
+        let mut user_profiles = Vec::new();
+        for user_id in user_ids {
+            let Some(user) = self
+                .store
+                .get_user(user_id)
+                .map_err(|e| ControlError::Store(e.to_string()))?
+            else {
+                continue;
+            };
+            user_profiles.push(UserProfile {
+                id: user.id as u64,
+                login_name: user.login_name,
+                display_name: user.display_name,
+                ..Default::default()
+            });
+        }
+
+        Ok(MapResponse {
             node: Some(node.clone()),
             derp_map: Some(self.config.derp_map.clone()),
             domain: self.config.tailnet_domain.clone(),
-            peers: Some(Vec::new()),
+            peers: Some(peers),
             packet_filters: Some(packet_filters),
-            user_profiles: vec![UserProfile {
-                id: self.config.user_id,
-                login_name: self.config.user_login_name.clone(),
-                display_name: self.config.user_display_name.clone(),
-                ..Default::default()
-            }],
+            user_profiles,
             control_time: CONTROL_TIME.to_string(),
             ..Default::default()
-        }
+        })
     }
 
     /// Serialize and frame a MapResponse, optionally zstd-compressing the
@@ -805,6 +842,101 @@ mod tests {
             json["Node"]["StableID"],
             serde_json::json!("n00000000000000000000001")
         );
+    }
+
+    #[test]
+    fn initial_map_lists_peers_sorted_and_user_profiles() {
+        let plane = test_plane();
+        plane
+            .register(test_machine_key(), test_register_request())
+            .unwrap();
+
+        // Register a second node with a distinct node and machine key.
+        let second_machine = MachineKey::from_bytes([0x12; 32]);
+        let second_node = NodeKey::from_bytes([0x23; 32]);
+        let mut second_request = test_register_request();
+        second_request.node_key = second_node;
+        let response = plane.register(second_machine, second_request).unwrap();
+        assert!(response.machine_authorized);
+
+        // Map as the first node: the second node must appear as a peer.
+        let request = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: false,
+            ..Default::default()
+        };
+        let outcome = plane.handle_map(test_machine_key(), request).unwrap();
+        let MapOutcome::FullFrame(frame) = outcome else {
+            panic!("expected full frame");
+        };
+        let (payload, consumed) = crabscale_proto::decode_map_response_frame(&frame).unwrap();
+        assert_eq!(consumed, frame.len());
+        let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+
+        let peers = json["Peers"].as_array().expect("Peers must be an array");
+        assert_eq!(peers.len(), 1, "one peer expected");
+        assert_eq!(
+            peers[0]["StableID"],
+            serde_json::json!("n00000000000000000000002")
+        );
+        assert_eq!(
+            peers[0]["Name"],
+            serde_json::json!("node1.tailnet.example.")
+        );
+
+        // User profiles include the requesting user (and the peer's user,
+        // which is the same default user here).
+        let profiles = json["UserProfiles"]
+            .as_array()
+            .expect("UserProfiles must be an array");
+        assert!(!profiles.is_empty());
+        assert_eq!(profiles[0]["ID"], serde_json::json!(1));
+        assert_eq!(
+            profiles[0]["LoginName"],
+            serde_json::json!("owner@example.com")
+        );
+    }
+
+    #[test]
+    fn initial_map_peers_are_sorted_by_node_id() {
+        let plane = test_plane();
+        plane
+            .register(test_machine_key(), test_register_request())
+            .unwrap();
+
+        // Register two more nodes so the requesting node has two peers.
+        let mut req_b = test_register_request();
+        req_b.node_key = NodeKey::from_bytes([0x24; 32]);
+        plane
+            .register(MachineKey::from_bytes([0x13; 32]), req_b)
+            .unwrap();
+        let mut req_c = test_register_request();
+        req_c.node_key = NodeKey::from_bytes([0x25; 32]);
+        plane
+            .register(MachineKey::from_bytes([0x14; 32]), req_c)
+            .unwrap();
+
+        let request = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: false,
+            ..Default::default()
+        };
+        let outcome = plane.handle_map(test_machine_key(), request).unwrap();
+        let MapOutcome::FullFrame(frame) = outcome else {
+            panic!("expected full frame");
+        };
+        let (payload, _) = crabscale_proto::decode_map_response_frame(&frame).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        let peers = json["Peers"].as_array().expect("Peers must be an array");
+        assert_eq!(peers.len(), 2);
+        let ids: Vec<u64> = peers.iter().map(|p| p["ID"].as_u64().unwrap()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "peers must be sorted by node ID");
     }
 
     #[test]
