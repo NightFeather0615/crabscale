@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use crabscale_control::{ControlConfig, ControlError, ControlPlane, MapOutcome};
-use crabscale_proto::{LogoutRequest, MIN_SUPPORTED_CAPVER, MachineKey, MapRequest, RegisterRequest};
+use crabscale_proto::{
+    LogoutRequest, MIN_SUPPORTED_CAPVER, MachineKey, MapRequest, RegisterRequest,
+};
 use crabscale_transport::{
     MAX_INNER_BODY_LEN, NoiseStream, TransportError, random_challenge, read_body_limited,
     serve_http2,
@@ -108,10 +110,7 @@ impl ControlRouter {
                 return plain_response(StatusCode::NOT_FOUND, "pending registration not found");
             }
             Err(_) => {
-                return plain_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal error",
-                );
+                return plain_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
             }
         };
         let hostname = pending

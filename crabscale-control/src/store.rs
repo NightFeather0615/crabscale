@@ -727,7 +727,6 @@ impl Store for SqliteStore {
         )?;
         Ok(())
     }
-
 }
 
 fn row_to_pending(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingRegistration> {
@@ -1128,6 +1127,9 @@ mod tests {
     #[test]
     fn restart_preserves_registered_node() {
         let dir = std::env::temp_dir().join(format!("crabscale-test-{}", std::process::id()));
+        // Remove any stale directory left by an interrupted previous run so a
+        // leftover database cannot trip the UNIQUE constraint on create_user.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("restart.sqlite");
 
@@ -1143,13 +1145,15 @@ mod tests {
         }
 
         // Reopen the same database file: the node must still be there.
-        let store = SqliteStore::open(&db_path).unwrap();
-        let node = store
-            .get_node_by_node_key(&node_key)
-            .unwrap()
-            .expect("node should survive restart");
-        assert_eq!(node.machine_key, machine_key);
+        {
+            let store = SqliteStore::open(&db_path).unwrap();
+            let node = store
+                .get_node_by_node_key(&node_key)
+                .unwrap()
+                .expect("node should survive restart");
+            assert_eq!(node.machine_key, machine_key);
+        } // store dropped here, releasing the SQLite handle before cleanup.
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
