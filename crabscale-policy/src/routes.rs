@@ -185,6 +185,7 @@ mod tests {
     fn node(id: u64, login: Option<&str>, tags: &[&str]) -> CompileNode {
         CompileNode {
             id,
+            stable_id: format!("n{id:023}"),
             user_login: login.map(|s| s.to_string()),
             addresses: vec![
                 "100.64.0.1/32".to_string(),

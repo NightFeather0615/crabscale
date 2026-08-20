@@ -164,6 +164,9 @@ impl ControlRouter {
             }
         };
 
+        // Parse the SSH action path once; the guard and the dispatch arm use
+        // the same computed value.
+        let ssh_action_path = parse_ssh_action_path(&path);
         match (method.as_str(), path.as_str()) {
             ("GET", "/machine/whoami") => {
                 let body = serde_json::json!({
@@ -184,8 +187,8 @@ impl ControlRouter {
                 self.handle_logout(&mut respond, machine_key, &body_bytes)
                     .await;
             }
-            ("GET", path) if parse_ssh_action_path(path).is_some() => {
-                let (src, dst) = parse_ssh_action_path(path).expect("just checked");
+            ("GET", _) if ssh_action_path.is_some() => {
+                let (src, dst) = ssh_action_path.expect("guarded as some");
                 self.handle_ssh_action(&mut respond, machine_key, &parts.uri, src, dst)
                     .await;
             }
@@ -224,7 +227,14 @@ impl ControlRouter {
 
         match self
             .control
-            .handle_ssh_action(machine_key, src_node_id, dst_node_id, auth_id, &ssh_user, &local_user)
+            .handle_ssh_action(
+                machine_key,
+                src_node_id,
+                dst_node_id,
+                auth_id,
+                &ssh_user,
+                &local_user,
+            )
             .await
         {
             Ok(action) => {
@@ -241,10 +251,18 @@ impl ControlRouter {
                 send_plain(respond, StatusCode::BAD_REQUEST, b"ssh binding mismatch");
             }
             Err(ControlError::Timeout) => {
-                send_plain(respond, StatusCode::REQUEST_TIMEOUT, b"ssh approval timed out");
+                send_plain(
+                    respond,
+                    StatusCode::REQUEST_TIMEOUT,
+                    b"ssh approval timed out",
+                );
             }
             Err(_) => {
-                send_plain(respond, StatusCode::INTERNAL_SERVER_ERROR, b"internal error");
+                send_plain(
+                    respond,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"internal error",
+                );
             }
         }
     }

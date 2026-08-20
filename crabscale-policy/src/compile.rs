@@ -41,6 +41,10 @@ use crate::model::Policy;
 pub struct CompileNode {
     /// Unique node id.
     pub id: u64,
+    /// Stable node id string (e.g. `n00000000000000000000001`), used to emit
+    /// concrete `Node` SSH principals on the wire. May be empty for
+    /// synthetic/test nodes.
+    pub stable_id: String,
     /// Owning user's login name (e.g. `alice@example.com`), when known.
     pub user_login: Option<String>,
     /// The node's tailnet addresses as CIDR strings.
@@ -54,6 +58,7 @@ impl CompileNode {
     pub fn with_addresses(id: u64, addresses: Vec<String>) -> Self {
         CompileNode {
             id,
+            stable_id: String::new(),
             user_login: None,
             addresses,
             tags: Vec::new(),
@@ -773,6 +778,7 @@ mod tests {
     fn node(id: u64, login: Option<&str>, addresses: &[&str]) -> CompileNode {
         CompileNode {
             id,
+            stable_id: format!("n{id:023}"),
             user_login: login.map(|s| s.to_string()),
             addresses: addresses.iter().map(|s| s.to_string()).collect(),
             tags: Vec::new(),
@@ -958,6 +964,7 @@ mod tests {
     fn tagged_node(id: u64, addresses: &[&str], tags: &[&str]) -> CompileNode {
         CompileNode {
             id,
+            stable_id: format!("n{id:023}"),
             user_login: None,
             addresses: addresses.iter().map(|s| s.to_string()).collect(),
             tags: tags.iter().map(|s| s.to_string()).collect(),

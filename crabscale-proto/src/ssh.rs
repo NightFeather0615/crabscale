@@ -2,9 +2,9 @@
 //!
 //! These types mirror the SSH check-mode protocol described by
 //! [Spec-Control-API] and the `SSHPolicy` delivered inside a MapResponse.
-//! The control plane compiles the policy's `ssh` rules into a per-node
-//! [`SshPolicy`] and serves `/machine/ssh/action/{src}/to/{dst}` verdicts as
-//! [`SshAction`] JSON values.
+//! Field names use the camelCase wire vocabulary the Tailscale clients
+//! ship (see the `tailcfg.SSH*` types), so a compatible client can decode
+//! them without case-insensitive matching.
 //!
 //! [Spec-Control-API]: https://github.com/NightFeather0615/crabscale/wiki/Spec-Control-API.md
 
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 /// A Tailscale SSH policy delivered to a node in its MapResponse.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase", default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct SshPolicy {
     /// Ordered rules to evaluate for an incoming SSH connection. The first
     /// matching rule wins and processing stops.
@@ -25,7 +25,7 @@ pub struct SshPolicy {
 /// One rule of an [`SshPolicy`]: which principals may connect, as which
 /// users, and what action the candidate connection receives.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase", default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct SshRule {
     /// Principals that match an incoming connection.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -33,7 +33,7 @@ pub struct SshRule {
     /// Map of requested SSH user to local user. An empty value means the
     /// rule does not match that user; the value `"="` means the SSH user maps
     /// directly to the local user.
-    #[serde(rename = "SSHUsers", skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub ssh_users: BTreeMap<String, String>,
     /// The action to take when this rule matches.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,29 +41,34 @@ pub struct SshRule {
 }
 
 /// A principal that may match an incoming SSH connection.
+///
+/// Matching any one field yields a match. Selectors such as `tag:...`,
+/// `group:...`, or `autogroup:...` are resolved by the control plane into
+/// concrete [`SshPrincipal::node`]/[`SshPrincipal::user_login`] values;
+/// `*` (or `autogroup:self`) becomes [`SshPrincipal::any`] = true.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase", default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct SshPrincipal {
-    /// A specific node id that is allowed to connect.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node: Option<u64>,
-    /// A user login (`user@example.com`) that is allowed to connect.
+    /// Stable node id (e.g. `n00000000000000000000001`) allowed to connect.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub node: String,
+    /// A user login (`user@example.com`) allowed to connect from any of its
+    /// nodes.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub user_login: String,
-    /// Opaque selectors (`tag:server`, `autogroup:member`, `*`) that match
-    /// the connecting node's identity.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub any: Vec<String>,
+    /// If true, this principal matches any connection.
+    #[serde(skip_serializing_if = "crate::serde_util::is_false")]
+    pub any: bool,
 }
 
 /// The outcome of evaluating an SSH rule for a connection.
 ///
-/// `Accept` admits the connection immediately, `Reject` closes it, and
-/// `HoldAndDelegate`, when set, defers the verdict to the given URL (the
+/// `accept` admits the connection immediately, `reject` closes it, and
+/// `holdAndDelegate`, when set, defers the verdict to the given URL (the
 /// SSH check-mode endpoint), which the client polls until a terminal
 /// action arrives.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase", default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct SshAction {
     /// A message shown to the user before the action happens.
     #[serde(skip_serializing_if = "String::is_empty")]

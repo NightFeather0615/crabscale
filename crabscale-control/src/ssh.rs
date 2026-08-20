@@ -111,7 +111,16 @@ impl ControlPlane {
             .ok_or(ControlError::NotFound)?;
 
         if let Some(auth_id) = auth_id {
-            return self.respond_ssh_followup(machine_key, src_node_id, dst_node_id, auth_id, ssh_user, local_user).await;
+            return self
+                .respond_ssh_followup(
+                    machine_key,
+                    src_node_id,
+                    dst_node_id,
+                    auth_id,
+                    ssh_user,
+                    local_user,
+                )
+                .await;
         }
 
         self.respond_ssh_initial(machine_key, src_node_id, dst_node_id, ssh_user, local_user)
@@ -130,9 +139,7 @@ impl ControlPlane {
                 .map_err(|e| ControlError::Store(e.to_string()))?;
             return Err(ControlError::NotFound);
         }
-        entry.verdict = SshVerdict::Accepted {
-            last_auth_at: now,
-        };
+        entry.verdict = SshVerdict::Accepted { last_auth_at: now };
         self.store
             .save_ssh_auth(&entry)
             .map_err(|e| ControlError::Store(e.to_string()))?;
@@ -199,8 +206,7 @@ impl ControlPlane {
         local_user: &str,
     ) -> Result<SshAction, ControlError> {
         let compile_nodes = self.compile_nodes()?;
-        let ssh_policy =
-            crabscale_policy::compile_ssh_policy(&self.config.policy, &compile_nodes);
+        let ssh_policy = crabscale_policy::compile_ssh_policy(&self.config.policy, &compile_nodes);
         let rule = crabscale_policy::first_matching_ssh_rule(
             &ssh_policy,
             src_node_id,
@@ -314,8 +320,17 @@ impl ControlPlane {
             }
             match self.get_ssh_auth(auth_id)? {
                 None => return Err(ControlError::NotFound),
-                Some(entry) if !entry.verdict.is_pending() => return Ok(entry.verdict),
-                Some(_) => {}
+                Some(entry) => {
+                    if time::is_past(&entry.expires_at, &time::now_rfc3339()) {
+                        self.store
+                            .delete_ssh_auth(auth_id)
+                            .map_err(|e| ControlError::Store(e.to_string()))?;
+                        return Err(ControlError::NotFound);
+                    }
+                    if !entry.verdict.is_pending() {
+                        return Ok(entry.verdict);
+                    }
+                }
             }
             tokio::select! {
                 _ = tokio::time::sleep(SSH_WAIT_POLL) => continue,
@@ -438,11 +453,15 @@ fn reject_action(message: &str) -> SshAction {
     }
 }
 
-/// Percent-encode a string for use in a URL query component.
+/// Percent-encode a string for use in a URL query component (form style:
+/// space becomes `+`, other non-unreserved bytes become `%XX`). This is the
+/// inverse of the router's `percent_decode`, so values round-trip cleanly.
 fn url_query_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+        if byte == b' ' {
+            out.push('+');
+        } else if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             out.push(byte as char);
         } else {
             out.push_str(&format!("%{byte:02X}"));
@@ -451,12 +470,11 @@ fn url_query_escape(input: &str) -> String {
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crabscale_proto::{Hostinfo, MachineKey, NodeKey, RegisterAuth, RegisterRequest};
     use crate::{ControlConfig, ControlPlane};
+    use crabscale_proto::{Hostinfo, MachineKey, NodeKey, RegisterAuth, RegisterRequest};
 
     fn test_policy() -> crabscale_policy::Policy {
         crabscale_policy::parse_policy(
@@ -492,12 +510,22 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(plane.register(MachineKey::from_bytes(machine), request).machine_authorized);
+        assert!(
+            plane
+                .register(MachineKey::from_bytes(machine), request)
+                .machine_authorized
+        );
     }
 
     fn register_tagged_node(plane: &ControlPlane, machine: [u8; 32], node: [u8; 32]) {
         let key = plane
-            .create_pre_auth_key("m2ssh", true, false, None, Some(vec!["tag:web".to_string()]))
+            .create_pre_auth_key(
+                "m2ssh",
+                true,
+                false,
+                None,
+                Some(vec!["tag:web".to_string()]),
+            )
             .expect("tagged key");
         let request = RegisterRequest {
             version: 130,
@@ -509,7 +537,11 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(plane.register(MachineKey::from_bytes(machine), request).machine_authorized);
+        assert!(
+            plane
+                .register(MachineKey::from_bytes(machine), request)
+                .machine_authorized
+        );
     }
 
     /// Register a user-owned source node and a tagged destination node,
@@ -518,8 +550,14 @@ mod tests {
         register_user_node(plane, [0x11; 32], [0x21; 32]);
         register_tagged_node(plane, [0x99; 32], [0x29; 32]);
         let nodes = plane.store.list_nodes().unwrap();
-        let src = nodes.iter().find(|n| n.machine_key == MachineKey::from_bytes([0x11; 32])).unwrap();
-        let dst = nodes.iter().find(|n| n.machine_key == MachineKey::from_bytes([0x99; 32])).unwrap();
+        let src = nodes
+            .iter()
+            .find(|n| n.machine_key == MachineKey::from_bytes([0x11; 32]))
+            .unwrap();
+        let dst = nodes
+            .iter()
+            .find(|n| n.machine_key == MachineKey::from_bytes([0x99; 32]))
+            .unwrap();
         (src.id as u64, dst.id as u64, dst.machine_key)
     }
 
@@ -675,14 +713,26 @@ mod tests {
         register_user_node(&plane, [0x11; 32], [0x21; 32]);
         register_tagged_node(&plane, [0x99; 32], [0x29; 32]);
         let nodes = plane.store.list_nodes().unwrap();
-        let src = nodes.iter().find(|n| n.machine_key == MachineKey::from_bytes([0x11; 32])).unwrap();
-        let dst = nodes.iter().find(|n| n.machine_key == MachineKey::from_bytes([0x99; 32])).unwrap();
+        let src = nodes
+            .iter()
+            .find(|n| n.machine_key == MachineKey::from_bytes([0x11; 32]))
+            .unwrap();
+        let dst = nodes
+            .iter()
+            .find(|n| n.machine_key == MachineKey::from_bytes([0x99; 32]))
+            .unwrap();
         let action = plane
-            .handle_ssh_action(dst.machine_key, src.id as u64, dst.id as u64, None, "root", "root")
+            .handle_ssh_action(
+                dst.machine_key,
+                src.id as u64,
+                dst.id as u64,
+                None,
+                "root",
+                "root",
+            )
             .await
             .unwrap();
         assert!(action.accept);
         assert!(action.hold_and_delegate.is_empty());
     }
 }
-

@@ -35,6 +35,11 @@ fn build_nodes(value: &JsonValue) -> Vec<CompileNode> {
         .iter()
         .map(|n| CompileNode {
             id: n["id"].as_u64().expect("node id"),
+            stable_id: n
+                .get("stableId")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_default(),
             user_login: n
                 .get("userLogin")
                 .and_then(|v| v.as_str())

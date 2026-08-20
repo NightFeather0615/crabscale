@@ -803,10 +803,7 @@ impl Store for SqliteStore {
 
     fn delete_ssh_auth(&self, auth_id: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM ssh_auths WHERE auth_id = ?1",
-            params![auth_id],
-        )?;
+        conn.execute("DELETE FROM ssh_auths WHERE auth_id = ?1", params![auth_id])?;
         Ok(())
     }
 }

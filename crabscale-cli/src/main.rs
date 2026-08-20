@@ -205,8 +205,10 @@ fn run_ssh_command(plane: &ControlPlane, command: SshCommand) -> Result<String, 
                     auth.auth_id, auth.src_node_id, auth.dst_node_id
                 ));
             }
-            Ok(lines.join("
-"))
+            Ok(lines.join(
+                "
+",
+            ))
         }
     }
 }
@@ -523,8 +525,8 @@ mod tests {
 
     #[test]
     fn parses_ssh_commands() {
-        let cli = Cli::try_parse_from(["crabscale", "ssh", "approve", "--auth-id", "abc123"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["crabscale", "ssh", "approve", "--auth-id", "abc123"]).unwrap();
         match cli.command {
             Command::Ssh { command } => assert!(matches!(
                 command,

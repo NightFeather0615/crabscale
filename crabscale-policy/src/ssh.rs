@@ -21,8 +21,8 @@ use crabscale_proto::SshPolicy as WireSshPolicy;
 use crabscale_proto::SshPrincipal as WireSshPrincipal;
 use crabscale_proto::SshRule as WireSshRule;
 
-use crate::model::Policy;
 use crate::compile::{CompileNode, Ctx};
+use crate::model::Policy;
 
 /// Default `checkPeriod` (12h) applied when an SSH `check` rule omits it.
 ///
@@ -139,8 +139,7 @@ pub fn first_matching_ssh_rule<'a>(
 ) -> Option<&'a CompiledSshRule> {
     for rule in policy.node_rules.get(&dst_id)? {
         let src_ok = rule.src_all || rule.src_nodes.contains(&src_id);
-        let user_ok = rule.users.is_empty()
-            || rule.users.iter().any(|u| u == ssh_user || u == "*");
+        let user_ok = rule.users.is_empty() || rule.users.iter().any(|u| u == ssh_user || u == "*");
         if src_ok && user_ok {
             return Some(rule);
         }
@@ -151,14 +150,21 @@ pub fn first_matching_ssh_rule<'a>(
 /// Build the wire [`WireSshPolicy`] for destination node `dst_id`, using
 /// `server_url` as the base for check-mode `holdAndDelegate` URLs.
 ///
-/// Returns `None` when the node has no applicable SSH rules. The check-mode
-/// URL keeps the `$SRC_NODE_ID`/`$DST_NODE_ID`/`$SSH_USER`/`$LOCAL_USER`
-/// placeholders that a compatible client expands before fetching the
-/// endpoint (the endpoint itself fills them in concrete responses).
+/// Source selectors are resolved to concrete wire principals: `*` /
+/// `autogroup:self` become `Any: true`, `user@host` becomes a `UserLogin`
+/// principal, and `tag:`/`group:`/`autogroup:`/IP selectors become one
+/// `Node` principal per currently-matching node (by stable id). Returns
+/// `None` when the node has no applicable SSH rules.
+///
+/// The check-mode URL keeps the `$SRC_NODE_ID`/`$DST_NODE_ID`/`$SSH_USER`/
+/// `$LOCAL_USER` placeholders that a compatible client expands before
+/// fetching the endpoint (the endpoint itself fills them in concrete
+/// responses).
 pub fn build_wire_ssh_policy(
     compiled: &CompiledSshPolicy,
     dst_id: u64,
     server_url: &str,
+    nodes: &[CompileNode],
 ) -> Option<WireSshPolicy> {
     let rules = compiled.node_rules.get(&dst_id)?;
     if rules.is_empty() {
@@ -166,23 +172,7 @@ pub fn build_wire_ssh_policy(
     }
     let mut wire_rules = Vec::with_capacity(rules.len());
     for rule in rules {
-        let principals: Vec<WireSshPrincipal> = rule
-            .src
-            .iter()
-            .map(|principal| {
-                if principal.contains('@') {
-                    WireSshPrincipal {
-                        user_login: principal.clone(),
-                        ..Default::default()
-                    }
-                } else {
-                    WireSshPrincipal {
-                        any: vec![principal.clone()],
-                        ..Default::default()
-                    }
-                }
-            })
-            .collect();
+        let principals = role_principals(rule, nodes);
         let mut ssh_users = BTreeMap::new();
         for user in &rule.users {
             // `=` means the requested SSH user maps directly to the local
@@ -218,6 +208,51 @@ pub fn build_wire_ssh_policy(
     Some(WireSshPolicy { rules: wire_rules })
 }
 
+/// Resolve a compiled SSH rule's source into wire [`WireSshPrincipal`]s.
+fn role_principals(rule: &CompiledSshRule, nodes: &[CompileNode]) -> Vec<WireSshPrincipal> {
+    let mut principals = Vec::new();
+    // A wildcard / self source matches any connection. Explicit user-login
+    // selectors are still surfaced alongside `Any` so the rule text is
+    // reflected on the wire (they are redundant but harmless).
+    if rule.src_all {
+        principals.push(WireSshPrincipal {
+            any: true,
+            ..Default::default()
+        });
+        for selector in &rule.src {
+            if selector.contains('@') && !principals.iter().any(|p| p.user_login == *selector) {
+                principals.push(WireSshPrincipal {
+                    user_login: selector.clone(),
+                    ..Default::default()
+                });
+            }
+        }
+        return principals;
+    }
+    // Concrete node principals for every resolved source node (by stable id).
+    let mut seen_nodes = std::collections::BTreeSet::new();
+    for id in &rule.src_nodes {
+        if let Some(node) = nodes.iter().find(|n| n.id == *id) {
+            if !node.stable_id.is_empty() && seen_nodes.insert(node.stable_id.clone()) {
+                principals.push(WireSshPrincipal {
+                    node: node.stable_id.clone(),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    // Explicit user-login principals (`user@host`).
+    for selector in &rule.src {
+        if selector.contains('@') && !principals.iter().any(|p| p.user_login == *selector) {
+            principals.push(WireSshPrincipal {
+                user_login: selector.clone(),
+                ..Default::default()
+            });
+        }
+    }
+    principals
+}
+
 /// Parse a `checkPeriod` string (`"30m"`, `"12h"`, `"1h30m"`, `"2d"`) into a
 /// [`Duration`]. Returns `None` for empty or malformed values.
 pub fn parse_ssh_duration(input: &str) -> Option<Duration> {
@@ -249,7 +284,6 @@ pub fn parse_ssh_duration(input: &str) -> Option<Duration> {
     Some(Duration::from_secs(total))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +292,7 @@ mod tests {
     fn node(id: u64, login: Option<&str>, tags: &[&str]) -> CompileNode {
         CompileNode {
             id,
+            stable_id: format!("n{id:023}"),
             user_login: login.map(|s| s.to_string()),
             addresses: vec![format!("100.64.0.{id}/32")],
             tags: tags.iter().map(|s| s.to_string()).collect(),
@@ -283,7 +318,10 @@ mod tests {
             parse_ssh_duration("1h30m"),
             Some(Duration::from_secs(90 * 60))
         );
-        assert_eq!(parse_ssh_duration("2d"), Some(Duration::from_secs(2 * 86400)));
+        assert_eq!(
+            parse_ssh_duration("2d"),
+            Some(Duration::from_secs(2 * 86400))
+        );
         assert_eq!(parse_ssh_duration(""), None);
         assert_eq!(parse_ssh_duration("12"), None);
         assert_eq!(parse_ssh_duration("1x"), None);
@@ -306,8 +344,7 @@ mod tests {
         assert!(compiled.node_rules.get(&3).unwrap().is_empty());
         assert!(compiled.node_rules.get(&1).unwrap().is_empty());
         // The rule applies to untagged source nodes.
-        let rule = first_matching_ssh_rule(&compiled, 1, 2, "root")
-            .expect("alice matches");
+        let rule = first_matching_ssh_rule(&compiled, 1, 2, "root").expect("alice matches");
         assert_eq!(
             rule.action,
             SshRuleAction::Check {
@@ -347,17 +384,14 @@ mod tests {
             r#"{ "ssh": [ { "action": "check", "src": ["autogroup:tagged"],
                 "dst": ["tag:web"], "checkPeriod": "1h" } ] }"#,
         );
-        let nodes = vec![
-            node(1, None, &["tag:client"]),
-            node(10, None, &["tag:web"]),
-        ];
+        let nodes = vec![node(1, None, &["tag:client"]), node(10, None, &["tag:web"])];
         let compiled = compile_ssh_policy(&policy, &nodes);
         let rule = first_matching_ssh_rule(&compiled, 1, 10, "anything").expect("any user");
         assert!(matches!(rule.action, SshRuleAction::Check { .. }));
     }
 
     #[test]
-    fn wire_policy_uses_check_period_and_placeholder_url() {
+    fn wire_policy_resolves_selectors_and_uses_check_period_url() {
         let policy = parse(
             r#"{ "ssh": [ { "action": "check", "src": ["autogroup:member"],
                 "dst": ["tag:web"], "users": ["root"], "checkPeriod": "12h" } ] }"#,
@@ -367,19 +401,56 @@ mod tests {
             node(10, None, &["tag:web"]),
         ];
         let compiled = compile_ssh_policy(&policy, &nodes);
-        let wire = build_wire_ssh_policy(&compiled, 10, "https://control.example.com")
+        let wire = build_wire_ssh_policy(&compiled, 10, "https://control.example.com", &nodes)
             .expect("web node has a policy");
         let rule = &wire.rules[0];
-        assert!(rule.principals[0].any.contains(&"autogroup:member".to_string()));
+        // The autogroup:member selector resolves to the untagged node's
+        // stable id as a concrete Node principal.
+        assert_eq!(rule.principals[0].node, format!("n{:023}", 1));
+        assert!(
+            !rule.principals[0].any,
+            "resolved principals must not be Any"
+        );
         assert_eq!(rule.ssh_users["root"], "=");
         let action = rule.action.as_ref().unwrap();
-        assert!(action
-            .hold_and_delegate
-            .contains("/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID"));
+        assert!(
+            action
+                .hold_and_delegate
+                .contains("/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID")
+        );
         assert!(action.hold_and_delegate.contains("ssh_user=$SSH_USER"));
         assert!(action.hold_and_delegate.contains("local_user=$LOCAL_USER"));
         // A node with no rules gets no wire policy.
-        assert!(build_wire_ssh_policy(&compiled, 1, "https://control.example.com").is_none());
+        assert!(
+            build_wire_ssh_policy(&compiled, 1, "https://control.example.com", &nodes).is_none()
+        );
+    }
+
+    #[test]
+    fn wire_policy_wildcard_becomes_any_and_user_login_is_kept() {
+        let policy = parse(
+            r#"{ "ssh": [ { "action": "accept", "src": ["*", "bob@example.com"],
+                "dst": ["tag:web"], "users": ["root"] } ] }"#,
+        );
+        let nodes = vec![
+            node(1, Some("alice@example.com"), &[]),
+            node(10, None, &["tag:web"]),
+        ];
+        let compiled = compile_ssh_policy(&policy, &nodes);
+        let wire = build_wire_ssh_policy(&compiled, 10, "https://control.example.com", &nodes)
+            .expect("web node has a policy");
+        let rule = &wire.rules[0];
+        // A wildcard/self source becomes a single Any principal.
+        assert!(rule.principals.iter().any(|p| p.any));
+        // Explicit user selectors stay as UserLogin principals.
+        assert!(
+            rule.principals
+                .iter()
+                .any(|p| p.user_login == "bob@example.com")
+        );
+        assert!(
+            rule.action.as_ref().unwrap().accept,
+            "an accept rule maps to an accepting action"
+        );
     }
 }
-

@@ -38,9 +38,7 @@ pub use preauth::{
     AUTH_KEY_PREFIX, format_auth_key, generate_secret, hash_secret, parse_auth_key, verify_secret,
 };
 pub use session::{DEFAULT_RECONNECT_GRACE_SECONDS, SessionEvent, SessionRegistry};
-pub use ssh::{
-    DEFAULT_SSH_AUTH_TTL_SECONDS, DEFAULT_SSH_WAIT_TIMEOUT, SshAuth, SshVerdict,
-};
+pub use ssh::{DEFAULT_SSH_AUTH_TTL_SECONDS, DEFAULT_SSH_WAIT_TIMEOUT, SshAuth, SshVerdict};
 pub use store::{SqliteStore, Store, StoreError};
 
 /// Default IPv4 tailnet prefix.
@@ -1349,6 +1347,7 @@ impl ControlPlane {
                 &ssh_compiled,
                 node.id as u64,
                 &self.config.server_url,
+                &compile_nodes,
             )
         };
 
@@ -1481,6 +1480,7 @@ impl ControlPlane {
         };
         Ok(crabscale_policy::CompileNode {
             id: node.id as u64,
+            stable_id: node.stable_id.clone(),
             user_login,
             addresses: node.addresses.clone(),
             tags: node.tags.clone().unwrap_or_default(),
@@ -3047,16 +3047,24 @@ mod tests {
         // The tagged node receives its per-node SSHPolicy.
         let web = map_json(&plane, 2);
         let policy = web.get("SSHPolicy").expect("tagged node carries SSHPolicy");
-        assert_eq!(policy["Rules"][0]["SSHUsers"]["root"], "=");
-        let action = &policy["Rules"][0]["Action"];
-        assert_eq!(action["Message"], "approval required");
+        // Wire field names are the camelCase client vocabulary.
+        assert_eq!(policy["rules"][0]["sshUsers"]["root"], "=");
+        let action = &policy["rules"][0]["action"];
+        assert_eq!(action["message"], "approval required");
         assert!(
-            action["HoldAndDelegate"]
+            action["holdAndDelegate"]
                 .as_str()
                 .unwrap()
                 .contains("/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID"),
             "check-mode rules carry a delegate URL with placeholders"
         );
+        // The autogroup:member source resolves to the plain node's stable id.
+        assert_eq!(
+            policy["rules"][0]["principals"][0]["node"],
+            serde_json::json!("n00000000000000000000001")
+        );
+        // `any` is omitted for a concrete node principal (omitzero semantics).
+        assert!(policy["rules"][0]["principals"][0]["any"].is_null());
     }
 
     /// Register a node whose Hostinfo advertises `routable_ips`.
