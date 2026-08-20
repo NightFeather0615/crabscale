@@ -23,6 +23,19 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// The protocol version reported by `/machine/whoami`.
 pub const PROTOCOL_VERSION: u16 = 130;
 
+/// JSON body for `POST /machine/register/approve`.
+#[derive(serde::Deserialize)]
+struct RegisterApprovalRequest {
+    auth_id: String,
+    user: String,
+}
+
+/// JSON body for `POST /machine/register/reject`.
+#[derive(serde::Deserialize)]
+struct RegisterRejectRequest {
+    auth_id: String,
+}
+
 /// Default keepalive interval for streaming map sessions.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(50);
 
@@ -76,6 +89,36 @@ impl ControlRouter {
             .expect("static response is valid")
     }
 
+    /// Handle an outer `GET /register/{id}` approval page.
+    ///
+    /// Returns a minimal HTML page describing the pending registration, or a
+    /// `404` when the auth id is unknown or has expired.
+    pub fn handle_register_page(&self, auth_id: &str) -> Response<Bytes> {
+        let Some(pending) = self.control.pending_info(auth_id) else {
+            return plain_response(StatusCode::NOT_FOUND, "pending registration not found");
+        };
+        let hostname = pending
+            .hostinfo
+            .as_ref()
+            .map(|h| h.hostname.as_str())
+            .unwrap_or("unknown");
+        let html = format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Pending registration</title></head>\
+             <body><h1>Pending registration</h1>\
+             <p>Auth id: <code>{auth_id}</code></p>\
+             <p>Hostname: <code>{hostname}</code></p>\
+             <p>Expires: <code>{}</code></p>\
+             <p>Approve or reject this registration with the <code>crabscale auth</code> CLI.</p>\
+             </body></html>",
+            pending.expires_at
+        );
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .body(Bytes::from(html))
+            .expect("static response is valid")
+    }
+
     /// Handle an inner `/machine/*` request.
     pub async fn handle_inner(
         &self,
@@ -118,6 +161,12 @@ impl ControlRouter {
             ("POST", "/machine/register") => {
                 self.handle_register(&mut respond, machine_key, &body_bytes)
                     .await;
+            }
+            ("POST", "/machine/register/approve") => {
+                self.handle_register_approve(&mut respond, &body_bytes);
+            }
+            ("POST", "/machine/register/reject") => {
+                self.handle_register_reject(&mut respond, &body_bytes);
             }
             ("POST", "/machine/map") => {
                 self.handle_map(&mut respond, machine_key, &body_bytes)
@@ -163,6 +212,73 @@ impl ControlRouter {
             Ok(response) => {
                 let body = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
                 send_json(respond, StatusCode::OK, body);
+            }
+            Err(_) => {
+                send_plain(
+                    respond,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"internal error",
+                );
+            }
+        }
+    }
+
+    fn handle_register_approve(&self, respond: &mut SendResponse<Bytes>, body: &[u8]) {
+        let request: RegisterApprovalRequest = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(_) => {
+                send_plain(
+                    respond,
+                    StatusCode::BAD_REQUEST,
+                    b"invalid approval request",
+                );
+                return;
+            }
+        };
+        match self
+            .control
+            .approve_pending(&request.auth_id, &request.user)
+        {
+            Ok(()) => {
+                let body = serde_json::json!({ "approved": true }).to_string();
+                send_json(respond, StatusCode::OK, body.into_bytes());
+            }
+            Err(ControlError::NotFound) => {
+                send_plain(
+                    respond,
+                    StatusCode::NOT_FOUND,
+                    b"pending registration not found",
+                );
+            }
+            Err(_) => {
+                send_plain(
+                    respond,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"internal error",
+                );
+            }
+        }
+    }
+
+    fn handle_register_reject(&self, respond: &mut SendResponse<Bytes>, body: &[u8]) {
+        let request: RegisterRejectRequest = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(_) => {
+                send_plain(respond, StatusCode::BAD_REQUEST, b"invalid reject request");
+                return;
+            }
+        };
+        match self.control.reject_pending(&request.auth_id) {
+            Ok(()) => {
+                let body = serde_json::json!({ "rejected": true }).to_string();
+                send_json(respond, StatusCode::OK, body.into_bytes());
+            }
+            Err(ControlError::NotFound) => {
+                send_plain(
+                    respond,
+                    StatusCode::NOT_FOUND,
+                    b"pending registration not found",
+                );
             }
             Err(_) => {
                 send_plain(

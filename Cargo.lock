@@ -119,6 +119,10 @@ dependencies = [
 [[package]]
 name = "crabscale-cli"
 version = "0.1.0"
+dependencies = [
+ "crabscale-control",
+ "crabscale-proto",
+]
 
 [[package]]
 name = "crabscale-control"
@@ -160,6 +164,7 @@ dependencies = [
  "h2",
  "http",
  "rand",
+ "serde",
  "serde_json",
  "tokio",
  "x25519-dalek",

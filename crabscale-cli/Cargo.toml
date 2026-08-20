@@ -5,3 +5,5 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+crabscale-control = { path = "../crabscale-control" }
+crabscale-proto = { path = "../crabscale-proto" }

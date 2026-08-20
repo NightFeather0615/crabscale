@@ -67,6 +67,8 @@ pub trait Store: Send + Sync {
     fn create_user(&self, user: &User) -> Result<User, StoreError>;
     /// Fetch a user by id.
     fn get_user(&self, id: i64) -> Result<Option<User>, StoreError>;
+    /// Fetch a user by login name.
+    fn get_user_by_login_name(&self, login_name: &str) -> Result<Option<User>, StoreError>;
     /// Create a login and return the stored entity with its assigned id.
     fn create_login(&self, login: &Login) -> Result<Login, StoreError>;
     /// Fetch a login by id.
@@ -163,6 +165,25 @@ impl Store for SqliteStore {
             .query_row(
                 "SELECT id, login_name, display_name, created_at FROM users WHERE id = ?1",
                 params![id],
+                |row| {
+                    Ok(User {
+                        id: row.get(0)?,
+                        login_name: row.get(1)?,
+                        display_name: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(user)
+    }
+
+    fn get_user_by_login_name(&self, login_name: &str) -> Result<Option<User>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let user = conn
+            .query_row(
+                "SELECT id, login_name, display_name, created_at FROM users WHERE login_name = ?1",
+                params![login_name],
                 |row| {
                     Ok(User {
                         id: row.get(0)?,
