@@ -13,6 +13,7 @@ use crabscale_proto::{DiscoKey, MachineKey, NodeKey};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::model::{Login, Node, Policy, PreAuthKey, Session, User};
+use crate::pending::PendingRegistration;
 
 /// Errors returned by a [`Store`] implementation.
 #[derive(Debug)]
@@ -104,6 +105,14 @@ pub trait Store: Send + Sync {
     fn get_session(&self, id: i64) -> Result<Option<Session>, StoreError>;
     /// Delete a session by id.
     fn delete_session(&self, id: i64) -> Result<(), StoreError>;
+    /// Insert or update a pending interactive registration.
+    fn save_pending(&self, pending: &PendingRegistration) -> Result<(), StoreError>;
+    /// Fetch a pending interactive registration by auth id.
+    fn get_pending(&self, auth_id: &str) -> Result<Option<PendingRegistration>, StoreError>;
+    /// Delete a pending interactive registration by auth id.
+    fn delete_pending(&self, auth_id: &str) -> Result<(), StoreError>;
+    /// List all pending interactive registrations.
+    fn list_pending(&self) -> Result<Vec<PendingRegistration>, StoreError>;
 }
 
 /// A [`Store`] backed by SQLite.
@@ -641,6 +650,121 @@ impl Store for SqliteStore {
         }
         Ok(())
     }
+
+    fn save_pending(&self, pending: &PendingRegistration) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let hostinfo = pending
+            .hostinfo
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let verdict = serde_json::to_string(&pending.verdict)?;
+        conn.execute(
+            "INSERT INTO pending_registrations (
+                auth_id, machine_key, node_key, hostinfo, expiry, version, ephemeral,
+                created_at, expires_at, verdict
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(auth_id) DO UPDATE SET
+                machine_key = excluded.machine_key,
+                node_key = excluded.node_key,
+                hostinfo = excluded.hostinfo,
+                expiry = excluded.expiry,
+                version = excluded.version,
+                ephemeral = excluded.ephemeral,
+                created_at = excluded.created_at,
+                expires_at = excluded.expires_at,
+                verdict = excluded.verdict",
+            params![
+                pending.auth_id,
+                pending.machine_key.to_string(),
+                pending.node_key.to_string(),
+                hostinfo,
+                pending.expiry,
+                pending.version as i64,
+                pending.ephemeral as i64,
+                pending.created_at,
+                pending.expires_at,
+                verdict,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_pending(&self, auth_id: &str) -> Result<Option<PendingRegistration>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let pending = conn
+            .query_row(
+                "SELECT auth_id, machine_key, node_key, hostinfo, expiry, version, ephemeral,
+                        created_at, expires_at, verdict
+                 FROM pending_registrations WHERE auth_id = ?1",
+                params![auth_id],
+                row_to_pending,
+            )
+            .optional()?;
+        Ok(pending)
+    }
+
+    fn delete_pending(&self, auth_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM pending_registrations WHERE auth_id = ?1",
+            params![auth_id],
+        )?;
+        Ok(())
+    }
+
+    fn list_pending(&self) -> Result<Vec<PendingRegistration>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT auth_id, machine_key, node_key, hostinfo, expiry, version, ephemeral,
+                    created_at, expires_at, verdict
+             FROM pending_registrations",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_pending)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
+fn row_to_pending(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingRegistration> {
+    let hostinfo: Option<String> = row.get(3)?;
+    let verdict: String = row.get(9)?;
+    Ok(PendingRegistration {
+        auth_id: row.get(0)?,
+        machine_key: MachineKey::from_str(&row.get::<_, String>(1)?).map_err(|_| {
+            rusqlite::Error::InvalidColumnType(
+                1,
+                "machine key".to_string(),
+                rusqlite::types::Type::Text,
+            )
+        })?,
+        node_key: NodeKey::from_str(&row.get::<_, String>(2)?).map_err(|_| {
+            rusqlite::Error::InvalidColumnType(
+                2,
+                "node key".to_string(),
+                rusqlite::types::Type::Text,
+            )
+        })?,
+        hostinfo: hostinfo
+            .map(|s| serde_json::from_str(&s))
+            .transpose()
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
+        expiry: row.get(4)?,
+        version: row.get::<_, i64>(5)? as u32,
+        ephemeral: row.get::<_, i64>(6)? != 0,
+        created_at: row.get(7)?,
+        expires_at: row.get(8)?,
+        verdict: serde_json::from_str(&verdict).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+    })
 }
 
 fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
@@ -805,6 +929,23 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         conn.execute_batch(
             "ALTER TABLE nodes ADD COLUMN endpoint_types TEXT NOT NULL DEFAULT '[]';
             PRAGMA user_version = 3;",
+        )?;
+    }
+    if version < 4 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pending_registrations (
+                auth_id TEXT PRIMARY KEY,
+                machine_key TEXT NOT NULL,
+                node_key TEXT NOT NULL,
+                hostinfo TEXT,
+                expiry TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                ephemeral INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                verdict TEXT NOT NULL
+            );
+            PRAGMA user_version = 4;",
         )?;
     }
     Ok(())

@@ -9,6 +9,7 @@
 //! crabscale auth reject --auth-id <id>
 //! ```
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -18,6 +19,10 @@ use crabscale_control::{ControlConfig, ControlError, ControlPlane};
 #[derive(Parser)]
 #[command(name = "crabscale", about = "crabscale admin CLI")]
 struct Cli {
+    /// Path to the SQLite database file used by the control server.
+    #[arg(long, global = true)]
+    store: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -69,7 +74,16 @@ fn run_auth_command(plane: &ControlPlane, command: AuthCommand) -> Result<String
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let Command::Auth { command } = cli.command;
-    let plane = ControlPlane::new(ControlConfig::default());
+    let plane = match &cli.store {
+        Some(path) => match ControlPlane::open_sqlite(ControlConfig::default(), path) {
+            Ok(plane) => plane,
+            Err(e) => {
+                eprintln!("error: failed to open store {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => ControlPlane::new(ControlConfig::default()),
+    };
     match run_auth_command(&plane, command) {
         Ok(message) => {
             println!("{message}");
@@ -209,5 +223,42 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ControlError::NotFound));
+    }
+
+    #[test]
+    fn separate_process_can_approve_via_shared_sqlite_file() {
+        // A pending registration started by one control plane (the server)
+        // must be approvable by a second plane (the CLI) opening the same
+        // SQLite database file.
+        let dir = std::env::temp_dir();
+        let db_path = dir.join(format!("crabscale-cli-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+
+        let server = ControlPlane::open_sqlite(ControlConfig::default(), &db_path).unwrap();
+        let auth_id = start_pending(&server);
+
+        let cli = ControlPlane::open_sqlite(ControlConfig::default(), &db_path).unwrap();
+        run_auth_command(
+            &cli,
+            AuthCommand::Approve {
+                auth_id: auth_id.clone(),
+                user: "alice".to_string(),
+            },
+        )
+        .unwrap();
+
+        // The server now sees the approval from the separate process.
+        let followup = RegisterRequest {
+            version: 130,
+            node_key: NodeKey::from_bytes([0x22; 32]),
+            followup: format!("https://tailnet.example/register/{auth_id}"),
+            ..Default::default()
+        };
+        let response = server
+            .register(MachineKey::from_bytes([0x11; 32]), followup)
+            .unwrap();
+        assert!(response.machine_authorized);
+
+        let _ = std::fs::remove_file(&db_path);
     }
 }

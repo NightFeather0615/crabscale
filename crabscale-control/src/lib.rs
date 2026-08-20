@@ -185,6 +185,14 @@ pub struct ControlPlane {
     pending: Mutex<pending::PendingCache>,
 }
 
+impl Clone for ControlPlane {
+    fn clone(&self) -> Self {
+        // The store is shared via `Arc`; the pending cache is a read-through
+        // cache backed by the store, so a fresh cache is created on clone.
+        Self::with_store(self.config.clone(), self.store.clone())
+    }
+}
+
 impl ControlPlane {
     /// Create a control plane with an in-memory SQLite store.
     ///
@@ -345,7 +353,10 @@ impl ControlPlane {
             expires_at: time::now_plus_seconds(self.config.pending_ttl_seconds),
             verdict: PendingVerdict::Pending,
         };
-        self.pending.lock().unwrap().insert(entry);
+        self.pending.lock().unwrap().insert(entry.clone());
+        self.store
+            .save_pending(&entry)
+            .map_err(|e| ControlError::Store(e.to_string()))?;
         Ok(RegisterResponse {
             machine_authorized: false,
             auth_url: format!("{}/register/{auth_id}", self.config.server_url),
@@ -367,15 +378,14 @@ impl ControlPlane {
         let Some(auth_id) = auth_id_from_followup(&request.followup) else {
             return Ok(self.unauthorized_response("invalid followup URL"));
         };
-        let mut cache = self.pending.lock().unwrap();
-        let Some(entry) = cache.get(&auth_id).cloned() else {
+        let Some(entry) = self.get_pending_entry(&auth_id)? else {
             return Ok(self.unauthorized_response("registration expired; start a new registration"));
         };
         if entry.machine_key != machine_key {
             return Ok(self.unauthorized_response("auth id does not match machine key"));
         }
         if time::is_past(&entry.expires_at, now) {
-            cache.remove(&auth_id);
+            self.remove_pending_entry(&auth_id);
             return Ok(self.unauthorized_response("registration expired; start a new registration"));
         }
         match entry.verdict {
@@ -385,11 +395,11 @@ impl ControlPlane {
                 ..Default::default()
             }),
             PendingVerdict::Rejected => {
-                cache.remove(&auth_id);
+                self.remove_pending_entry(&auth_id);
                 Ok(self.unauthorized_response("registration rejected"))
             }
             PendingVerdict::Approved { user_id, tags } => {
-                cache.remove(&auth_id);
+                self.remove_pending_entry(&auth_id);
                 // A duplicate followup after approval must still succeed.
                 if let Some(node) = self
                     .store
@@ -427,12 +437,11 @@ impl ControlPlane {
     /// Approve a pending interactive registration for the given user.
     pub fn approve_pending(&self, auth_id: &str, user_name: &str) -> Result<(), ControlError> {
         let now = time::now_rfc3339();
-        let mut cache = self.pending.lock().unwrap();
-        let Some(entry) = cache.get_mut(auth_id) else {
+        let Some(mut entry) = self.get_pending_entry(auth_id)? else {
             return Err(ControlError::NotFound);
         };
         if time::is_past(&entry.expires_at, &now) {
-            cache.remove(auth_id);
+            self.remove_pending_entry(auth_id);
             return Err(ControlError::NotFound);
         }
         let user_id = self.resolve_user_id(user_name)?;
@@ -440,34 +449,65 @@ impl ControlPlane {
             user_id,
             tags: None,
         };
+        self.pending.lock().unwrap().insert(entry.clone());
+        self.store
+            .save_pending(&entry)
+            .map_err(|e| ControlError::Store(e.to_string()))?;
         Ok(())
     }
 
     /// Reject a pending interactive registration.
     pub fn reject_pending(&self, auth_id: &str) -> Result<(), ControlError> {
         let now = time::now_rfc3339();
-        let mut cache = self.pending.lock().unwrap();
-        let Some(entry) = cache.get_mut(auth_id) else {
+        let Some(mut entry) = self.get_pending_entry(auth_id)? else {
             return Err(ControlError::NotFound);
         };
         if time::is_past(&entry.expires_at, &now) {
-            cache.remove(auth_id);
+            self.remove_pending_entry(auth_id);
             return Err(ControlError::NotFound);
         }
         entry.verdict = PendingVerdict::Rejected;
+        self.pending.lock().unwrap().insert(entry.clone());
+        self.store
+            .save_pending(&entry)
+            .map_err(|e| ControlError::Store(e.to_string()))?;
         Ok(())
     }
 
     /// Return a copy of a pending registration for the approval page.
     pub fn pending_info(&self, auth_id: &str) -> Option<PendingRegistration> {
         let now = time::now_rfc3339();
-        let mut cache = self.pending.lock().unwrap();
-        let entry = cache.get(auth_id)?.clone();
+        let entry = self.get_pending_entry(auth_id).ok()??;
         if time::is_past(&entry.expires_at, &now) {
-            cache.remove(auth_id);
+            self.remove_pending_entry(auth_id);
             return None;
         }
         Some(entry)
+    }
+
+    /// Fetch a pending registration from the durable store, which is the
+    /// source of truth so that a separate process (e.g. the CLI opening the
+    /// same database) can approve it. The in-memory cache is updated as a
+    /// side effect for bounded LRU bookkeeping.
+    fn get_pending_entry(
+        &self,
+        auth_id: &str,
+    ) -> Result<Option<PendingRegistration>, ControlError> {
+        let entry = self
+            .store
+            .get_pending(auth_id)
+            .map_err(|e| ControlError::Store(e.to_string()))?;
+        if let Some(entry) = &entry {
+            self.pending.lock().unwrap().insert(entry.clone());
+        }
+        Ok(entry)
+    }
+
+    /// Remove a pending registration from both the in-memory cache and the
+    /// durable store.
+    fn remove_pending_entry(&self, auth_id: &str) {
+        self.pending.lock().unwrap().remove(auth_id);
+        let _ = self.store.delete_pending(auth_id);
     }
 
     /// Resolve a user by login name, creating the user on first approval.

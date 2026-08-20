@@ -201,7 +201,11 @@ async fn register_and_map_over_noise() {
 async fn interactive_register_approve_followup_authorizes() {
     let server = NoiseResponder::random();
     let machine_key = MachineKey::from_bytes(server.public_key().to_bytes());
-    let router = ControlRouter::new(machine_key);
+    // The control plane is shared with the router so the test can approve the
+    // pending registration locally (the admin API is intentionally not exposed
+    // over the Noise channel).
+    let control = crabscale_control::ControlPlane::new(crabscale_control::ControlConfig::default());
+    let router = ControlRouter::with_control(machine_key, control.clone());
     let (mut client_stream, server_stream) =
         loopback_handshake(&server, StaticSecret::random(), 113)
             .await
@@ -253,25 +257,8 @@ async fn interactive_register_approve_followup_authorizes() {
     let auth_url = reg_json["AuthURL"].as_str().unwrap().to_string();
     let auth_id = crabscale_control::auth_id_from_followup(&auth_url).unwrap();
 
-    // 2. Approve the pending registration via the admin API.
-    let approve = serde_json::json!({ "auth_id": auth_id, "user": "alice" });
-    let approve_body = serde_json::to_vec(&approve).unwrap();
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/machine/register/approve")
-        .body(())
-        .unwrap();
-    let (response, mut send_stream) = client.send_request(request, false).unwrap();
-    send_stream.send_data(approve_body.into(), true).unwrap();
-    let response = response.await.unwrap();
-    assert_eq!(response.status(), 200);
-    let mut body = response.into_body();
-    let mut buf = Vec::new();
-    while let Some(chunk) = body.data().await {
-        buf.extend_from_slice(&chunk.unwrap());
-    }
-    let approve_json: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-    assert_eq!(approve_json["approved"], true);
+    // 2. Approve the pending registration via the local control plane.
+    control.approve_pending(&auth_id, "alice").unwrap();
 
     // 3. Followup with the same machine key -> authorized.
     let followup = crabscale_proto::RegisterRequest {

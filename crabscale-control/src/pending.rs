@@ -17,7 +17,7 @@ pub const DEFAULT_PENDING_TTL_SECONDS: i64 = 15 * 60;
 pub const DEFAULT_PENDING_CACHE_LIMIT: usize = 1024;
 
 /// A pending interactive registration awaiting an admin verdict.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PendingRegistration {
     /// Unguessable identifier embedded in the AuthURL.
     pub auth_id: String,
@@ -42,7 +42,7 @@ pub struct PendingRegistration {
 }
 
 /// The admin verdict for a pending registration.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PendingVerdict {
     /// No decision has been made yet.
     Pending,
@@ -93,6 +93,7 @@ impl PendingCache {
     }
 
     /// Look up a pending registration, marking it most-recently-used.
+    #[allow(dead_code)]
     pub fn get(&mut self, auth_id: &str) -> Option<&PendingRegistration> {
         if self.entries.contains_key(auth_id) {
             self.touch(auth_id);
@@ -101,6 +102,7 @@ impl PendingCache {
     }
 
     /// Look up a pending registration mutably, marking it most-recently-used.
+    #[allow(dead_code)]
     pub fn get_mut(&mut self, auth_id: &str) -> Option<&mut PendingRegistration> {
         if self.entries.contains_key(auth_id) {
             self.touch(auth_id);
