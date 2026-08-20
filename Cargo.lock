@@ -265,6 +265,7 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "chrono",
+ "crabscale-policy",
  "crabscale-proto",
  "hex",
  "rand",
@@ -301,6 +302,7 @@ dependencies = [
 name = "crabscale-policy"
 version = "0.1.0"
 dependencies = [
+ "crabscale-proto",
  "serde",
  "serde_json",
 ]

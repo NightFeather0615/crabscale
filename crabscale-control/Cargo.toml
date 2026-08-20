@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+crabscale-policy = { path = "../crabscale-policy" }
 crabscale-proto = { path = "../crabscale-proto" }
 blake2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

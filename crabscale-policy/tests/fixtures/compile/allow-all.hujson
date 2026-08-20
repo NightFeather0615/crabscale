@@ -1,0 +1,6 @@
+{
+  // Accept all node-to-node traffic.
+  "acls": [
+    { "action": "accept", "src": ["*"], "dst": ["*:*"] }
+  ]
+}

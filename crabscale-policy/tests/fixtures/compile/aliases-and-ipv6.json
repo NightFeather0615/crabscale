@@ -1,0 +1,15 @@
+{
+  "nodes": [
+    { "id": 1, "addresses": ["100.64.0.1/32", "2001:db8::1/128"] },
+    { "id": 2, "addresses": ["100.64.0.2/32", "2001:db8::2/128"] }
+  ],
+  "globalFilter": [
+    { "SrcIPs": ["100.64.0.0/10"], "DstPorts": [{ "First": 5432, "Last": 5432 }] },
+    { "SrcIPs": ["2001:db8::/32"], "DstPorts": [{ "First": 443, "Last": 443 }] }
+  ],
+  "nodeFilters": {
+    "1": [ { "SrcIPs": ["2001:db8::/32"], "DstPorts": [{ "First": 443, "Last": 443 }] } ],
+    "2": []
+  },
+  "peerVisibility": { "1": [2], "2": [1] }
+}

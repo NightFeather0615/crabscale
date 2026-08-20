@@ -1,20 +1,22 @@
-//! HUJSON parser, typed policy model, and policy validation.
+//! HUJSON parser, typed policy model, policy validation, and the ACL/grants
+//! compiler.
 //!
 //! This crate owns the access-control policy layer: parsing a HUJSON policy
-//! file (JSON plus comments and trailing commas) into a typed model, and
+//! file (JSON plus comments and trailing commas) into a typed model,
 //! validating that model so malformed policies are rejected with
-//! line-numbered errors. Packet filter compilation and SSH behavior are
-//! deliberately out of scope for the current milestone and will live in later
-//! modules.
+//! line-numbered errors, and compiling ACLs/grants into per-node packet
+//! filters, peer visibility, and capability grants.
 //!
 //! Grammar and schema are documented in the project wiki:
 //! [Spec-Policy](https://github.com/NightFeather0615/crabscale/wiki/Spec-Policy.md).
 
+mod compile;
 mod error;
 mod hujson;
 mod model;
 mod validate;
 
+pub use compile::{CompileNode, CompiledPolicy, compile_policy};
 pub use error::HujsonError;
 pub use hujson::parse as parse_hujson;
 pub use model::{Acl, AutoApprovers, Grant, NodeAttrGrant, Policy, PolicyTest, SshRule, SshTest};

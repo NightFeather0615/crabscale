@@ -1,0 +1,8 @@
+{
+  "nodes": [
+    { "id": 1, "addresses": ["100.64.0.1/32"] }
+  ],
+  "globalFilter": [],
+  "nodeFilters": { "1": [] },
+  "peerVisibility": { "1": [] }
+}
