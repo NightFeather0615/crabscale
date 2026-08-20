@@ -9,6 +9,7 @@ crabscale-control = { path = "../crabscale-control" }
 crabscale-proto = { path = "../crabscale-proto" }
 crabscale-transport = { path = "../crabscale-transport" }
 bytes = "1"
+clap = { version = "4", features = ["derive"] }
 h2 = "0.4"
 http = "1"
 rand = "0.8"

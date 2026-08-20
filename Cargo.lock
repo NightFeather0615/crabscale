@@ -316,6 +316,7 @@ name = "crabscale-server"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "clap",
  "crabscale-control",
  "crabscale-proto",
  "crabscale-transport",

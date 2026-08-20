@@ -6,22 +6,46 @@
 
 use std::path::PathBuf;
 
+use clap::Parser;
 use crabscale_server::{DEFAULT_KEY_FILE, load_or_create_machine_key};
 
-fn main() {
-    let key_file = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_KEY_FILE));
+/// crabscale control server.
+#[derive(Parser)]
+#[command(name = "crabscale-server", about = "crabscale control server")]
+struct Args {
+    /// Path to the server machine key file.
+    #[arg(default_value = DEFAULT_KEY_FILE)]
+    key_file: PathBuf,
+}
 
-    match load_or_create_machine_key(&key_file) {
+fn main() {
+    let args = Args::parse();
+
+    match load_or_create_machine_key(&args.key_file) {
         Ok(key) => {
             println!("server machine key: {}", key.public_key());
-            println!("key file: {}", key_file.display());
+            println!("key file: {}", args.key_file.display());
         }
         Err(e) => {
             eprintln!("failed to load or create machine key: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_default_key_file() {
+        let args = Args::try_parse_from(["crabscale-server"]).unwrap();
+        assert_eq!(args.key_file, PathBuf::from(DEFAULT_KEY_FILE));
+    }
+
+    #[test]
+    fn accepts_positional_key_file() {
+        let args = Args::try_parse_from(["crabscale-server", "custom.key"]).unwrap();
+        assert_eq!(args.key_file, PathBuf::from("custom.key"));
     }
 }
