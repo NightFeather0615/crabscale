@@ -212,6 +212,21 @@ impl std::fmt::Display for ControlError {
 
 impl std::error::Error for ControlError {}
 
+/// A user profile extracted from a verified OpenID Connect ID token.
+///
+/// The server hands these claims to the control plane so the identity is
+/// upserted into the durable store before the pending registration is
+/// approved through the same auth cache the CLI uses (Spec-Registration §7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OidcProfile {
+    /// The provider's stable subject identifier (`sub` claim).
+    pub subject: String,
+    /// The email used as the user's login name when present.
+    pub email: String,
+    /// Display name shown in user profiles.
+    pub display_name: String,
+}
+
 /// The result of handling a MapRequest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MapOutcome {
@@ -737,6 +752,58 @@ impl ControlPlane {
                 created_at: time::now_rfc3339(),
             })
             .map_err(|e| ControlError::Store(e.to_string()))?;
+        Ok(user.id)
+    }
+
+    /// Upsert a user from verified OIDC claims and return the user id.
+    ///
+    /// The user is keyed by the provider email (used as the unique login
+    /// name) and the login identity is recorded as an `oidc` login under the
+    /// provider subject, so the same subject always maps back to the same
+    /// user. Re-authentication updates the display name in place
+    /// (Spec-Registration §7).
+    pub fn upsert_oidc_user(&self, profile: &OidcProfile) -> Result<i64, ControlError> {
+        let now = time::now_rfc3339();
+        let user = match self
+            .store
+            .get_user_by_login_name(&profile.email)
+            .map_err(|e| ControlError::Store(e.to_string()))?
+        {
+            Some(mut user) => {
+                if user.display_name != profile.display_name {
+                    self.store
+                        .update_user_display_name(user.id, &profile.display_name)
+                        .map_err(|e| ControlError::Store(e.to_string()))?;
+                    user.display_name = profile.display_name.clone();
+                }
+                user
+            }
+            None => self
+                .store
+                .create_user(&User {
+                    id: 0,
+                    login_name: profile.email.clone(),
+                    display_name: profile.display_name.clone(),
+                    created_at: now.clone(),
+                })
+                .map_err(|e| ControlError::Store(e.to_string()))?,
+        };
+        if self
+            .store
+            .get_login_by_provider_subject("oidc", &profile.subject)
+            .map_err(|e| ControlError::Store(e.to_string()))?
+            .is_none()
+        {
+            self.store
+                .create_login(&Login {
+                    id: 0,
+                    user_id: user.id,
+                    provider: "oidc".to_string(),
+                    login_name: profile.subject.clone(),
+                    created_at: now.clone(),
+                })
+                .map_err(|e| ControlError::Store(e.to_string()))?;
+        }
         Ok(user.id)
     }
 
@@ -2538,6 +2605,86 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn oidc_user_upsert_creates_user_and_login() {
+        let plane = test_plane();
+        let user_id = plane
+            .upsert_oidc_user(&OidcProfile {
+                subject: "sub-123".to_string(),
+                email: "alice@example.com".to_string(),
+                display_name: "Alice".to_string(),
+            })
+            .unwrap();
+        let user = plane.store.get_user(user_id).unwrap().unwrap();
+        assert_eq!(user.login_name, "alice@example.com");
+        assert_eq!(user.display_name, "Alice");
+        let login = plane
+            .store
+            .get_login_by_provider_subject("oidc", "sub-123")
+            .unwrap()
+            .expect("oidc login must exist");
+        assert_eq!(login.user_id, user_id);
+        // The second callback for the same subject must be idempotent.
+        let again = plane
+            .upsert_oidc_user(&OidcProfile {
+                subject: "sub-123".to_string(),
+                email: "alice@example.com".to_string(),
+                display_name: "Alice Renamed".to_string(),
+            })
+            .unwrap();
+        assert_eq!(again, user_id);
+        assert_eq!(
+            plane.store.get_user(user_id).unwrap().unwrap().display_name,
+            "Alice Renamed"
+        );
+        assert_eq!(
+            plane
+                .store
+                .get_login_by_provider_subject("oidc", "sub-123")
+                .unwrap()
+                .unwrap()
+                .user_id,
+            user_id
+        );
+    }
+
+    #[test]
+    fn oidc_approved_pending_authorizes_followup() {
+        let plane = test_plane();
+        let mut request = test_register_request();
+        request.auth = None;
+        let pending = plane.register(test_machine_key(), request);
+        let auth_id = auth_id_from_followup(&pending.auth_url).unwrap();
+
+        plane
+            .upsert_oidc_user(&OidcProfile {
+                subject: "sub-456".to_string(),
+                email: "bob@example.com".to_string(),
+                display_name: "Bob".to_string(),
+            })
+            .unwrap();
+        // Approval flows through the same auth cache the CLI uses.
+        plane.approve_pending(&auth_id, "bob@example.com").unwrap();
+
+        let mut followup = test_register_request();
+        followup.auth = None;
+        followup.followup = pending.auth_url.clone();
+        let response = plane.register(test_machine_key(), followup);
+        assert!(response.machine_authorized);
+        let node = plane
+            .store
+            .get_node_by_node_key(&test_node_key())
+            .unwrap()
+            .unwrap();
+        let user = plane
+            .store
+            .get_user(node.user_id.unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(user.login_name, "bob@example.com");
+        assert_eq!(user.display_name, "Bob");
     }
 
     #[test]
