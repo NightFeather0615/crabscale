@@ -1,0 +1,13 @@
+{
+  "grants": [
+    {
+      "src": ["alice@example.com"],
+      "dst": ["bob@example.com"],
+      "app": {
+        "tailscale.com/cap/kubernetes": [
+          { "impersonate": { "groups": ["ts:ops"] } }
+        ]
+      }
+    }
+  ]
+}

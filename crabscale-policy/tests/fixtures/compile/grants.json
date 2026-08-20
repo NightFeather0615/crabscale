@@ -1,0 +1,26 @@
+{
+  "nodes": [
+    { "id": 1, "userLogin": "alice@example.com", "addresses": ["100.64.0.1/32"] },
+    { "id": 2, "userLogin": "bob@example.com", "addresses": ["100.64.0.2/32"] }
+  ],
+  "globalFilter": [],
+  "nodeFilters": {
+    "1": [],
+    "2": [
+      {
+        "SrcIPs": ["100.64.0.1/32"],
+        "CapGrant": [
+          {
+            "Dsts": ["100.64.0.2/32"],
+            "CapMap": {
+              "tailscale.com/cap/kubernetes": [
+                { "impersonate": { "groups": ["ts:ops"] } }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "peerVisibility": { "1": [], "2": [] }
+}

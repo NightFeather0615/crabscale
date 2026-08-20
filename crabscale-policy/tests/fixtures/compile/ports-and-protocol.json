@@ -1,0 +1,30 @@
+{
+  "nodes": [
+    { "id": 1, "addresses": ["100.64.0.1/32"] },
+    { "id": 2, "addresses": ["100.64.0.2/32"] }
+  ],
+  "globalFilter": [
+    {
+      "SrcIPs": ["100.64.0.0/10"],
+      "DstPorts": [
+        { "First": 22, "Last": 22 },
+        { "First": 443, "Last": 443 }
+      ],
+      "IPProto": [6]
+    }
+  ],
+  "nodeFilters": {
+    "1": [],
+    "2": [
+      {
+        "SrcIPs": ["100.64.0.0/10"],
+        "DstPorts": [
+          { "First": 22, "Last": 22 },
+          { "First": 443, "Last": 443 }
+        ],
+        "IPProto": [6]
+      }
+    ]
+  },
+  "peerVisibility": { "1": [2], "2": [1] }
+}
