@@ -1,0 +1,6 @@
+[package]
+name = "crabscale-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -1,2 +1,24 @@
+# Build artifacts
 /target
-/crabscale.wiki
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Secrets and key material
+*.key
+*.pem
+*.crt
+.env
+.env.*
+
+# Local reference checkouts (not part of the workspace)
+/headscale/
+/tailscale/
+/tailscale-rs/
+
+# Local wiki clone (hosted as a separate GitHub wiki repository)
+/crabscale.wiki/

@@ -1,0 +1,6 @@
+[package]
+name = "crabscale-derp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -1,0 +1,6 @@
+[package]
+name = "crabscale-transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

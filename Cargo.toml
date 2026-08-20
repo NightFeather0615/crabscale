@@ -1,6 +1,17 @@
-[package]
-name = "crabscale"
+[workspace]
+resolver = "2"
+members = [
+    "crabscale-proto",
+    "crabscale-transport",
+    "crabscale-control",
+    "crabscale-policy",
+    "crabscale-derp",
+    "crabscale-server",
+    "crabscale-cli",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]

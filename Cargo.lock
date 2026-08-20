@@ -3,5 +3,29 @@
 version = 4
 
 [[package]]
-name = "crabscale"
+name = "crabscale-cli"
+version = "0.1.0"
+
+[[package]]
+name = "crabscale-control"
+version = "0.1.0"
+
+[[package]]
+name = "crabscale-derp"
+version = "0.1.0"
+
+[[package]]
+name = "crabscale-policy"
+version = "0.1.0"
+
+[[package]]
+name = "crabscale-proto"
+version = "0.1.0"
+
+[[package]]
+name = "crabscale-server"
+version = "0.1.0"
+
+[[package]]
+name = "crabscale-transport"
 version = "0.1.0"
