@@ -1,0 +1,5 @@
+{
+  "hosts": {
+    "web": "definitely-not-an-ip",
+  },
+}

@@ -1,0 +1,73 @@
+{
+  // Human-friendly group and host aliases.
+  "groups": {
+    "eng": ["alice@example.com", "bob@example.com"],
+    "ops": ["carol@example.com", "tag:bots",],
+  },
+  "hosts": {
+    "db-primary": "10.0.0.5",
+    "web-fleet": "10.0.0.0/24",
+    "ipv6-router": "2001:db8::1",
+  },
+
+  /* Network ACLs: allow traffic from eng to the web and database hosts. */
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["group:eng", "autogroup:self", "100.64.0.10/32"],
+      "dst": ["group:ops:443", "tag:web:80,443", "10.0.0.0/24:22", "[2001:db8::1]:443"],
+    },
+    {
+      "action": "accept",
+      "src": ["100.64.0.0/10"],
+      "dst": ["*"],
+    },
+  ],
+
+  "grants": [
+    {
+      "src": ["tag:bots"],
+      "dst": ["tag:web"],
+      "app": { "tailscale.com/cap/kubernetes": [{ "impersonate": { "groups": ["ts:ops"] } }] },
+    },
+  ],
+
+  "tagOwners": {
+    "tag:web": ["alice@example.com"],
+    "tag:bots": ["tag:web"],
+  },
+
+  "autoApprovers": {
+    "routes": {
+      "10.20.0.0/16": ["group:ops"],
+    },
+    "exitNode": {
+      "0.0.0.0/0": ["tag:exit"],
+    },
+  },
+
+  "ssh": [
+    {
+      "action": "check",
+      "src": ["autogroup:member"],
+      "dst": ["tag:web"],
+      "users": ["root", "ubuntu"],
+      "checkPeriod": "12h",
+    },
+  ],
+
+  "nodeAttrs": [
+    {
+      "target": ["tag:web"],
+      "attr": ["randomizeClientPort"],
+    },
+  ],
+
+  "tests": [
+    { "src": "alice@example.com", "accept": ["tag:web:443"], "deny": ["10.0.0.99:22"] },
+  ],
+
+  "sshTests": [
+    { "action": "check", "src": "alice@example.com", "dst": "tag:web", "users": ["root"] },
+  ],
+}
