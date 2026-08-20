@@ -28,6 +28,7 @@ mod netmap;
 mod ping;
 mod register;
 mod ssh;
+mod verify;
 
 pub use derp::{DerpMap, DerpNode, DerpRegion};
 pub use dns::{DnsConfig, DnsRecord, DnsResolver};
@@ -45,6 +46,7 @@ pub use netmap::{
 pub use ping::PingRequest;
 pub use register::{RegisterAuth, RegisterRequest, RegisterResponse};
 pub use ssh::{SshAction, SshPolicy, SshPrincipal, SshRule};
+pub use verify::{VerifyRequest, VerifyResponse};
 
 pub(crate) mod serde_util {
     /// `skip_serializing_if` helper for `false` booleans.
