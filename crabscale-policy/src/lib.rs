@@ -14,12 +14,14 @@ mod compile;
 mod error;
 mod hujson;
 mod model;
+mod tags;
 mod validate;
 
-pub use compile::{CompileNode, CompiledPolicy, compile_policy};
+pub use compile::{CompileNode, CompiledPolicy, compile_policy, node_attributes};
 pub use error::HujsonError;
 pub use hujson::parse as parse_hujson;
 pub use model::{Acl, AutoApprovers, Grant, NodeAttrGrant, Policy, PolicyTest, SshRule, SshTest};
+pub use tags::{is_valid_tag, tag_owned_by_tags, unauthorized_tags, user_can_use_tag};
 pub use validate::{validate_policy, validate_unknown_keys};
 
 /// Parse a HUJSON policy document into a typed, validated [`Policy`].

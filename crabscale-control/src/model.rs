@@ -32,7 +32,9 @@ pub struct Node {
     pub id: i64,
     pub stable_id: String,
     pub name: String,
-    pub user_id: i64,
+    /// Owning user id. `None` for tagged nodes, which are owned by their
+    /// tags rather than by a user (Spec-Policy §4).
+    pub user_id: Option<i64>,
     pub node_key: NodeKey,
     pub machine_key: MachineKey,
     pub disco_key: DiscoKey,
@@ -57,7 +59,7 @@ impl Node {
             id: self.id as u64,
             stable_id: self.stable_id.clone(),
             name: self.name.clone(),
-            user: self.user_id as u64,
+            user: self.user_id.unwrap_or(0) as u64,
             key: self.node_key,
             machine: self.machine_key,
             disco_key: self.disco_key,

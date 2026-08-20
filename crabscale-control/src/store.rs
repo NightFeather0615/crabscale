@@ -780,7 +780,7 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
         id: row.get(0)?,
         stable_id: row.get(1)?,
         name: row.get(2)?,
-        user_id: row.get(3)?,
+        user_id: row.get::<_, Option<i64>>(3)?,
         node_key: NodeKey::from_str(&row.get::<_, String>(4)?).map_err(|_| {
             rusqlite::Error::InvalidColumnType(
                 4,
@@ -872,7 +872,7 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
                 id INTEGER PRIMARY KEY,
                 stable_id TEXT NOT NULL UNIQUE,
                 name TEXT NOT NULL,
-                user_id INTEGER NOT NULL REFERENCES users(id),
+                user_id INTEGER REFERENCES users(id),
                 node_key TEXT NOT NULL UNIQUE,
                 machine_key TEXT NOT NULL,
                 disco_key TEXT NOT NULL,
@@ -949,6 +949,50 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
             );
             PRAGMA user_version = 4;",
         )?;
+        version = 4;
+    }
+    if version < 5 {
+        // Tagged nodes are owned by their tags, not by a user, so `user_id`
+        // must be nullable (Spec-Policy §4). SQLite cannot drop a NOT NULL
+        // constraint in place, so recreate the nodes table.
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+            BEGIN;
+            CREATE TABLE nodes_v5 (
+                id INTEGER PRIMARY KEY,
+                stable_id TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                user_id INTEGER REFERENCES users(id),
+                node_key TEXT NOT NULL UNIQUE,
+                machine_key TEXT NOT NULL,
+                disco_key TEXT NOT NULL,
+                addresses TEXT NOT NULL,
+                allowed_ips TEXT,
+                endpoints TEXT NOT NULL,
+                endpoint_types TEXT NOT NULL DEFAULT '[]',
+                home_derp INTEGER NOT NULL,
+                hostinfo TEXT,
+                created TEXT NOT NULL,
+                cap INTEGER NOT NULL,
+                tags TEXT,
+                machine_authorized INTEGER NOT NULL,
+                ephemeral INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO nodes_v5 (
+                id, stable_id, name, user_id, node_key, machine_key, disco_key,
+                addresses, allowed_ips, endpoints, endpoint_types, home_derp,
+                hostinfo, created, cap, tags, machine_authorized, ephemeral
+            ) SELECT
+                id, stable_id, name, user_id, node_key, machine_key, disco_key,
+                addresses, allowed_ips, endpoints, endpoint_types, home_derp,
+                hostinfo, created, cap, tags, machine_authorized, ephemeral
+            FROM nodes;
+            DROP TABLE nodes;
+            ALTER TABLE nodes_v5 RENAME TO nodes;
+            CREATE INDEX IF NOT EXISTS idx_nodes_machine_key ON nodes(machine_key);
+            PRAGMA user_version = 5;
+            COMMIT;",
+        )?;
     }
     Ok(())
 }
@@ -976,7 +1020,7 @@ mod tests {
             id: 0,
             stable_id: "n00000000000000000000001".to_string(),
             name: "node1.tailnet.example.".to_string(),
-            user_id,
+            user_id: Some(user_id),
             node_key: NodeKey::from_bytes([0x22; 32]),
             machine_key: MachineKey::from_bytes([0x11; 32]),
             disco_key: DiscoKey::from_bytes([0x33; 32]),

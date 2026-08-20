@@ -14,10 +14,14 @@
 //! - `grants` compile into application-level filter rules (carrying
 //!   `CapGrant`) delivered to the destination node, mirroring how the wire
 //!   format encodes peer capabilities.
+//! - Tags match nodes carrying the same `tag:` value.
+//! - Supported autogroups resolve as follows: `autogroup:self` matches every
+//!   node (each node is, from its own point of view, "self"),
+//!   `autogroup:member` matches untagged (user-owned) nodes, and
+//!   `autogroup:tagged` matches tagged nodes.
 //!
-//! Tags and autogroups are intentionally out of scope for the current
-//! milestone: `tag:` and `autogroup:` targets resolve to nothing until the
-//! follow-up issue lands.
+//! [`node_attributes`] resolves the policy's `nodeAttrs` into the per-node
+//! `CapMap` the control plane emits on the self node.
 //!
 //! [Spec-Policy]: https://github.com/NightFeather0615/crabscale/wiki/Spec-Policy.md
 
@@ -206,6 +210,77 @@ pub fn compile_policy(policy: &Policy, nodes: &[CompileNode]) -> CompiledPolicy 
     compiled
 }
 
+/// Resolve the policy's `nodeAttrs` into the node's `CapMap`.
+///
+/// Each `nodeAttrs` grant whose target matches `node` contributes its `attr`
+/// names as capability keys whose value is an empty JSON array (the
+/// wire shape for a key-only capability). Matching grants are merged, so a
+/// node targeted by several grants accumulates every attribute. Unsupported
+/// or undefined targets simply match nothing.
+///
+/// The returned map is what the control plane puts in the self node's
+/// [`crabscale_proto::Node::cap_map`] (Spec-Policy §6).
+pub fn node_attributes(
+    policy: &Policy,
+    node: &CompileNode,
+    nodes: &[CompileNode],
+) -> BTreeMap<String, Vec<JsonValue>> {
+    let mut attrs = BTreeSet::new();
+    for grant in &policy.node_attrs {
+        if grant
+            .target
+            .iter()
+            .any(|t| node_attr_target_matches(policy, t, node, nodes))
+        {
+            attrs.extend(grant.attr.iter().cloned());
+        }
+    }
+    attrs.into_iter().map(|attr| (attr, Vec::new())).collect()
+}
+
+/// Whether a `nodeAttrs` target principal matches `node`.
+///
+/// Supported targets are `*`, user logins, `tag:` values, `group:` members,
+/// `autogroup:self` (the node itself), `autogroup:member` (untagged nodes),
+/// and `autogroup:tagged` (tagged nodes).
+fn node_attr_target_matches(
+    policy: &Policy,
+    target: &str,
+    node: &CompileNode,
+    _nodes: &[CompileNode],
+) -> bool {
+    if target == "*" {
+        return true;
+    }
+    if let Some(rest) = target.strip_prefix("autogroup:") {
+        return match rest {
+            "self" => true,
+            "member" => node.tags.is_empty(),
+            "tagged" => !node.tags.is_empty(),
+            _ => false,
+        };
+    }
+    if let Some(tag) = target.strip_prefix("tag:") {
+        if tag.is_empty() {
+            return false;
+        }
+        return node.tags.iter().any(|t| t == target);
+    }
+    if let Some(group) = target.strip_prefix("group:") {
+        return policy.groups.get(group).is_some_and(|members| {
+            members
+                .iter()
+                .any(|m| m == node.user_login.as_deref().unwrap_or(""))
+        });
+    }
+    if let Some(login) = &node.user_login {
+        if login == target {
+            return true;
+        }
+    }
+    false
+}
+
 /// A snapshot of the compile context sufficient for destination matching.
 struct Ctx<'a> {
     policy: &'a Policy,
@@ -222,10 +297,26 @@ struct NodeMatchCtx<'a> {
 }
 
 /// A fully or partially resolved address/identity target.
+///
+/// In addition to static networks and identities, a target may carry
+/// autogroup markers. The supported autogroups (Spec-Policy §5) expand to:
+///
+/// - `autogroup:self` ([`ResolvedTarget::self_match`]): every node. Each
+///   node is, from its own point of view, "self", so the rule applies to
+///   every node in both source and destination position.
+/// - `autogroup:member` ([`ResolvedTarget::member_match`]): untagged
+///   (user-owned) nodes.
+/// - `autogroup:tagged` ([`ResolvedTarget::tagged_match`]): tagged nodes.
 #[derive(Debug, Clone, Default)]
 struct ResolvedTarget {
     /// `true` when the target is `*` and matches every node.
     wildcard: bool,
+    /// `true` when the target contains `autogroup:self`; matches every node.
+    self_match: bool,
+    /// `true` when the target contains `autogroup:member`; matches untagged nodes.
+    member_match: bool,
+    /// `true` when the target contains `autogroup:tagged`; matches tagged nodes.
+    tagged_match: bool,
     /// IP networks (CIDR or bare IP, kept as input strings).
     nets: Vec<String>,
     /// Identities (user logins or tags) matched against node credentials.
@@ -235,7 +326,7 @@ struct ResolvedTarget {
 impl ResolvedTarget {
     /// Whether this target matches the given node.
     fn matches_node(&self, node: &CompileNode) -> bool {
-        if self.wildcard {
+        if self.wildcard || self.self_match {
             return true;
         }
         if node
@@ -248,19 +339,40 @@ impl ResolvedTarget {
         if node.tags.iter().any(|tag| self.identities.contains(tag)) {
             return true;
         }
+        if self.member_match && node.tags.is_empty() {
+            return true;
+        }
+        if self.tagged_match && !node.tags.is_empty() {
+            return true;
+        }
         self.nets
             .iter()
             .any(|net| node.addresses.iter().any(|addr| addr_in_cidr(addr, net)))
     }
 
-    /// The `SrcIPs` list to emit for this target, expanding identities to the
-    /// addresses of the matching nodes. Empty means the target matched no
-    /// node, so no rule should be produced.
+    /// Collect the addresses of every node matched by an autogroup marker.
+    fn autogroup_ips(&self, nodes: &[CompileNode]) -> Vec<String> {
+        let mut ips = Vec::new();
+        for node in nodes {
+            if self.self_match
+                || (self.member_match && node.tags.is_empty())
+                || (self.tagged_match && !node.tags.is_empty())
+            {
+                ips.extend(node.addresses.iter().cloned());
+            }
+        }
+        ips
+    }
+
+    /// The `SrcIPs` list to emit for this target, expanding identities and
+    /// autogroups to the addresses of the matching nodes. Empty means the
+    /// target matched no node, so no rule should be produced.
     fn to_src_ips(&self, nodes: &[CompileNode]) -> Vec<String> {
         if self.wildcard {
             return vec!["*".to_string()];
         }
         let mut ips = self.nets.clone();
+        ips.extend(self.autogroup_ips(nodes));
         for node in nodes {
             if node
                 .user_login
@@ -306,6 +418,9 @@ impl<'a> Ctx<'a> {
         for target in targets {
             let single = self.resolve_single(target);
             resolved.wildcard |= single.wildcard;
+            resolved.self_match |= single.self_match;
+            resolved.member_match |= single.member_match;
+            resolved.tagged_match |= single.tagged_match;
             resolved.nets.extend(single.nets);
             resolved.identities.extend(single.identities);
         }
@@ -320,9 +435,14 @@ impl<'a> Ctx<'a> {
             resolved.wildcard = true;
             return resolved;
         }
-        if let Some(_rest) = target.strip_prefix("autogroup:") {
-            // Autogroups are handled by the follow-up issue; match nothing
-            // for now so the rest of the policy still compiles.
+        if let Some(rest) = target.strip_prefix("autogroup:") {
+            match rest {
+                "self" => resolved.self_match = true,
+                "member" => resolved.member_match = true,
+                "tagged" => resolved.tagged_match = true,
+                // Unsupported autogroups (admin, owner, internet) match nothing.
+                _ => {}
+            }
             return resolved;
         }
         if let Some(group) = target.strip_prefix("group:") {
@@ -398,8 +518,14 @@ impl<'a> Ctx<'a> {
         let mut resolved = ResolvedTarget::default();
         if host == "*" {
             resolved.wildcard = true;
-        } else if host.starts_with("autogroup:") {
-            // out of scope
+        } else if let Some(rest) = host.strip_prefix("autogroup:") {
+            match rest {
+                "self" => resolved.self_match = true,
+                "member" => resolved.member_match = true,
+                "tagged" => resolved.tagged_match = true,
+                // Unsupported autogroups (admin, owner, internet) match nothing.
+                _ => {}
+            }
         } else if host.starts_with("tag:") {
             resolved.identities.insert(host.to_string());
         } else if host.starts_with("group:") {
@@ -496,6 +622,7 @@ fn split_ports_literal(target: &str) -> Option<(String, String)> {
         || is_host_ident(host)
         || host.starts_with("tag:")
         || host.starts_with("group:")
+        || host.starts_with("autogroup:")
         || is_user_ident(host)
     {
         return Some((host.to_string(), ports.to_string()));
@@ -816,5 +943,188 @@ mod tests {
         assert_eq!(compiled.node_filters.get(&1).unwrap(), &vec![expected]);
         // Both source nodes may reach bob's node.
         assert_eq!(compiled.peer_visibility[&1], BTreeSet::from([2]));
+    }
+
+    /// Build a node with tags; used by tag and autogroup tests.
+    fn tagged_node(id: u64, addresses: &[&str], tags: &[&str]) -> CompileNode {
+        CompileNode {
+            id,
+            user_login: None,
+            addresses: addresses.iter().map(|s| s.to_string()).collect(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn autogroup_tagged_matches_only_tagged_nodes() {
+        let policy: Policy = crate::parse_policy(
+            r#"{
+              "acls": [
+                { "action": "accept", "src": ["autogroup:tagged"], "dst": ["autogroup:tagged:*"] }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let nodes = vec![
+            node(1, Some("alice@example.com"), &["100.64.0.1/32"]),
+            tagged_node(2, &["100.64.0.2/32"], &["tag:server"]),
+            tagged_node(3, &["100.64.0.3/32"], &["tag:server"]),
+        ];
+        let compiled = compile_policy(&policy, &nodes);
+        let expected = filter_rule(&["100.64.0.2/32", "100.64.0.3/32"], &[(0, 65535)]);
+        assert_eq!(compiled.global_filter, vec![expected.clone()]);
+        // Only tagged nodes are destinations, so they alone carry the rule.
+        assert_eq!(compiled.node_filters.get(&1).unwrap(), &Vec::new());
+        assert_eq!(
+            compiled.node_filters.get(&2).unwrap(),
+            &vec![expected.clone()]
+        );
+        assert_eq!(compiled.node_filters.get(&3).unwrap(), &vec![expected]);
+        // Tagged nodes see each other; the untagged node is invisible.
+        assert_eq!(compiled.peer_visibility[&2], BTreeSet::from([3]));
+        assert_eq!(compiled.peer_visibility[&3], BTreeSet::from([2]));
+        assert!(compiled.peer_visibility[&1].is_empty());
+    }
+
+    #[test]
+    fn autogroup_member_matches_only_untagged_nodes() {
+        let policy: Policy = crate::parse_policy(
+            r#"{
+              "acls": [
+                { "action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:member:*"] }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let nodes = vec![
+            node(1, Some("alice@example.com"), &["100.64.0.1/32"]),
+            node(2, Some("bob@example.com"), &["100.64.0.2/32"]),
+            tagged_node(3, &["100.64.0.3/32"], &["tag:server"]),
+        ];
+        let compiled = compile_policy(&policy, &nodes);
+        let expected = filter_rule(&["100.64.0.1/32", "100.64.0.2/32"], &[(0, 65535)]);
+        assert_eq!(compiled.global_filter, vec![expected.clone()]);
+        assert_eq!(compiled.node_filters.get(&3).unwrap(), &Vec::new());
+        assert_eq!(
+            compiled.node_filters.get(&1).unwrap(),
+            &vec![expected.clone()]
+        );
+        assert_eq!(compiled.node_filters.get(&2).unwrap(), &vec![expected]);
+        assert_eq!(compiled.peer_visibility[&1], BTreeSet::from([2]));
+        assert_eq!(compiled.peer_visibility[&2], BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn autogroup_self_matches_every_node_as_source_and_destination() {
+        // Each node is its own "self", so autogroup:self in both positions
+        // expands to all nodes.
+        let policy: Policy = crate::parse_policy(
+            r#"{
+              "acls": [
+                { "action": "accept", "src": ["autogroup:self"], "dst": ["autogroup:self:443"] }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let nodes = vec![
+            node(1, Some("alice@example.com"), &["100.64.0.1/32"]),
+            tagged_node(2, &["100.64.0.2/32"], &["tag:server"]),
+        ];
+        let compiled = compile_policy(&policy, &nodes);
+        let expected = filter_rule(&["100.64.0.1/32", "100.64.0.2/32"], &[(443, 443)]);
+        assert_eq!(compiled.global_filter, vec![expected.clone()]);
+        assert_eq!(
+            compiled.node_filters.get(&1).unwrap(),
+            &vec![expected.clone()]
+        );
+        assert_eq!(compiled.node_filters.get(&2).unwrap(), &vec![expected]);
+        assert_eq!(compiled.peer_visibility[&1], BTreeSet::from([2]));
+        assert_eq!(compiled.peer_visibility[&2], BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn tag_sources_expand_to_tagged_node_addresses() {
+        let policy: Policy = crate::parse_policy(
+            r#"{
+              "acls": [
+                { "action": "accept", "src": ["tag:web"], "dst": ["tag:web:443"] }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let nodes = vec![
+            node(1, Some("alice@example.com"), &["100.64.0.1/32"]),
+            tagged_node(2, &["100.64.0.2/32"], &["tag:web"]),
+            tagged_node(3, &["100.64.0.3/32"], &["tag:db"]),
+        ];
+        let compiled = compile_policy(&policy, &nodes);
+        let expected = filter_rule(&["100.64.0.2/32"], &[(443, 443)]);
+        assert_eq!(compiled.global_filter, vec![expected.clone()]);
+        // Only the tag:web node is a destination, so only it carries the rule.
+        assert_eq!(compiled.node_filters.get(&3).unwrap(), &Vec::new());
+        assert_eq!(compiled.node_filters.get(&2).unwrap(), &vec![expected]);
+        // tag:db (node 3) is neither source nor destination, so it is absent.
+        assert!(compiled.peer_visibility[&3].is_empty());
+        // tag:web node 2 is not visible to the untagged node 1.
+        assert!(compiled.peer_visibility[&1].is_empty());
+    }
+
+    #[test]
+    fn node_attrs_resolve_into_cap_map() {
+        let policy: Policy = crate::parse_policy(
+            r#"{
+              "tagOwners": { "tag:server": ["alice@example.com"] },
+              "nodeAttrs": [
+                { "target": ["tag:server"], "attr": ["randomize-client-port"] },
+                { "target": ["alice@example.com"], "attr": ["drive:share"] }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let nodes = vec![
+            node(1, Some("alice@example.com"), &["100.64.0.1/32"]),
+            tagged_node(2, &["100.64.0.2/32"], &["tag:server"]),
+        ];
+        let alice_attrs = node_attributes(&policy, &nodes[0], &nodes);
+        assert_eq!(
+            alice_attrs,
+            BTreeMap::from([("drive:share".to_string(), Vec::<serde_json::Value>::new())])
+        );
+        let server_attrs = node_attributes(&policy, &nodes[1], &nodes);
+        assert_eq!(
+            server_attrs,
+            BTreeMap::from([(
+                "randomize-client-port".to_string(),
+                Vec::<serde_json::Value>::new()
+            )])
+        );
+    }
+
+    #[test]
+    fn node_attrs_support_autogroup_targets() {
+        let policy: Policy = crate::parse_policy(
+            r#"{
+              "tagOwners": { "tag:server": ["alice@example.com"] },
+              "nodeAttrs": [
+                { "target": ["autogroup:tagged"], "attr": ["disable-captive-portal-detection"] }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let nodes = vec![
+            node(1, Some("alice@example.com"), &["100.64.0.1/32"]),
+            tagged_node(2, &["100.64.0.2/32"], &["tag:server"]),
+        ];
+        assert!(
+            node_attributes(&policy, &nodes[0], &nodes).is_empty(),
+            "untagged node is not in autogroup:tagged"
+        );
+        assert_eq!(
+            node_attributes(&policy, &nodes[1], &nodes)
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["disable-captive-portal-detection".to_string()]
+        );
     }
 }
