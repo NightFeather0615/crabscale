@@ -7,7 +7,7 @@ Crabscale is a self-hosted control server for Tailscale-compatible clients, writ
 Developer documentation (architecture, protocol specs, roadmap, and testing strategy) lives in the project wiki:
 
 - GitHub wiki: <https://github.com/NightFeather0615/crabscale/wiki>
-- Local wiki clone: `crabscale.wiki/` (path on GitHub: `wiki/`)
+- Local wiki clone: `crabscale.wiki/` (separate GitHub wiki repository)
 
 ## Workspace
 

@@ -9,9 +9,10 @@
 *.sqlite3
 
 # Secrets and key material
-*.key
-*.pem
-*.crt
+/certs/
+*.local.key
+*.local.pem
+*.local.crt
 .env
 .env.*
 
