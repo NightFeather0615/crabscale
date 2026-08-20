@@ -7,8 +7,10 @@
 //! trait, assigns tailnet IPs with a random allocator, and builds the first
 //! complete MapResponse frame.
 
+mod delta;
 mod derp;
 mod dns;
+mod events;
 mod ip_allocator;
 mod model;
 mod pending;
@@ -29,7 +31,11 @@ use crabscale_proto::{
     RegisterRequest, RegisterResponse, UserProfile, encode_map_response_frame,
 };
 
+pub use delta::SessionPeers;
 pub use dns::{DnsError, DnsSettings};
+pub use events::{
+    ChangeBatch, ChangeBus, ChangeEvent, DEFAULT_CHANGE_BATCH_MAX, DEFAULT_CHANGE_BATCH_WINDOW,
+};
 pub use ip_allocator::{IpAllocator, IpAllocatorError};
 pub use model::{Login, Node as DomainNode, Policy, PreAuthKey, Session, User};
 pub use pending::{
@@ -96,6 +102,12 @@ pub struct ControlConfig {
     /// DNS configuration (MagicDNS, split DNS, search domains, extra records)
     /// delivered to clients in the MapResponse `DNS` field.
     pub dns: DnsSettings,
+    /// How long node/policy/DNS/DERP changes are coalesced before a single
+    /// delta batch is pushed to live map sessions (M3-03).
+    pub change_batch_window: std::time::Duration,
+    /// Maximum number of distinct coalesced changes in one batch before an
+    /// early flush (M3-03).
+    pub change_batch_max: usize,
 }
 
 impl Default for ControlConfig {
@@ -138,6 +150,8 @@ impl Default for ControlConfig {
             pending_cache_limit: DEFAULT_PENDING_CACHE_LIMIT,
             reconnect_grace_seconds: DEFAULT_RECONNECT_GRACE_SECONDS,
             dns: DnsSettings::default(),
+            change_batch_window: DEFAULT_CHANGE_BATCH_WINDOW,
+            change_batch_max: DEFAULT_CHANGE_BATCH_MAX,
         }
     }
 }
@@ -229,7 +243,7 @@ pub struct OidcProfile {
 }
 
 /// The result of handling a MapRequest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MapOutcome {
     /// A lite update: respond `200` with an empty body.
     LiteUpdate,
@@ -245,6 +259,11 @@ pub enum MapOutcome {
         compress: bool,
         /// The live map session id to close when the stream ends.
         session_id: i64,
+        /// The id of the node the stream belongs to; used to derive deltas.
+        node_id: i64,
+        /// The peer snapshots delivered in the complete first frame, so the
+        /// first delta only carries changes since then.
+        initial_peers: SessionPeers,
     },
 }
 
@@ -257,6 +276,9 @@ pub struct ControlPlane {
     reaper_started: AtomicBool,
     dns_state: Arc<dns::DnsState>,
     derp_state: Arc<derp::DerpMapState>,
+    /// The change bus that coalesces node/policy/DNS/DERP changes and fans
+    /// delta batches out to live map sessions (shared across clones).
+    events: Arc<ChangeBus>,
     /// Broadcast channel that wakes SSH followup waiters when an auth id
     /// resolves. Clones of a plane share the channel so an approval on any
     /// clone notifies waiters on every clone.
@@ -276,6 +298,7 @@ impl Clone for ControlPlane {
             reaper_started: AtomicBool::new(false),
             dns_state: self.dns_state.clone(),
             derp_state: self.derp_state.clone(),
+            events: self.events.clone(),
             ssh_waiters: self.ssh_waiters.clone(),
         }
     }
@@ -308,6 +331,8 @@ impl ControlPlane {
         let derp_map = config.derp_map.clone();
         let pending = Mutex::new(pending::PendingCache::new(config.pending_cache_limit));
         let sessions = Mutex::new(SessionRegistry::new(config.reconnect_grace_seconds));
+        let change_batch_window = config.change_batch_window;
+        let change_batch_max = config.change_batch_max;
         let plane = Self {
             config,
             store,
@@ -316,6 +341,7 @@ impl ControlPlane {
             reaper_started: AtomicBool::new(false),
             dns_state: Arc::new(dns::DnsState::new(Vec::new())),
             derp_state: Arc::new(derp::DerpMapState::new(derp_map)),
+            events: Arc::new(ChangeBus::new(change_batch_window, change_batch_max)),
             ssh_waiters: tokio::sync::broadcast::channel(128).0,
         };
         if plane.config.dns.extra_records_path.is_some() {
@@ -333,7 +359,16 @@ impl ControlPlane {
     pub fn open_session(&self, node_id: i64, ephemeral: bool) -> i64 {
         let now = time::now_unix();
         let mut sessions = self.sessions.lock().unwrap();
-        let (session_id, _events) = sessions.open(node_id, ephemeral, now);
+        let (session_id, events) = sessions.open(node_id, ephemeral, now);
+        drop(sessions);
+        for event in events {
+            if let SessionEvent::Online(id) = event {
+                self.publish_change(ChangeEvent::OnlineChanged {
+                    node_id: id,
+                    online: true,
+                });
+            }
+        }
         session_id
     }
 
@@ -363,10 +398,20 @@ impl ControlPlane {
     fn reap_sessions_at(&self, now: i64) -> Vec<SessionEvent> {
         let events = self.sessions.lock().unwrap().tick(now);
         for event in &events {
-            if let SessionEvent::EphemeralExpired(node_id) = event {
-                if let Ok(Some(node)) = self.store.get_node_by_id(*node_id) {
-                    let _ = self.store.delete_node(&node.node_key);
+            match event {
+                SessionEvent::Offline(node_id) => {
+                    self.publish_change(ChangeEvent::OnlineChanged {
+                        node_id: *node_id,
+                        online: false,
+                    });
                 }
+                SessionEvent::EphemeralExpired(node_id) => {
+                    if let Ok(Some(node)) = self.store.get_node_by_id(*node_id) {
+                        let _ = self.store.delete_node(&node.node_key);
+                    }
+                    self.publish_change(ChangeEvent::NodeRemoved(*node_id));
+                }
+                SessionEvent::Online(_) => {}
             }
         }
         events
@@ -436,6 +481,8 @@ impl ControlPlane {
                             self.store
                                 .upsert_node(&updated)
                                 .map_err(|e| ControlError::Store(e.to_string()))?;
+                            // Other peers must see the tag/ownership transition.
+                            self.publish_change(ChangeEvent::NodeChanged(updated.id));
                         }
                         return Ok(self.authorized_response());
                     }
@@ -451,6 +498,7 @@ impl ControlPlane {
                         self.store
                             .upsert_node(&updated)
                             .map_err(|e| ControlError::Store(e.to_string()))?;
+                        self.publish_change(ChangeEvent::NodeChanged(updated.id));
                         if !key.reusable {
                             self.store
                                 .mark_pre_auth_key_used(key.id)
@@ -469,6 +517,8 @@ impl ControlPlane {
                         self.store
                             .upsert_node(&updated)
                             .map_err(|e| ControlError::Store(e.to_string()))?;
+                        // Other peers must see the tag/ownership transition.
+                        self.publish_change(ChangeEvent::NodeChanged(updated.id));
                     }
                     return Ok(self.authorized_response());
                 }
@@ -508,7 +558,7 @@ impl ControlPlane {
                         "pre-auth key registrations may not request tags".to_string(),
                     ));
                 }
-                let node = self.create_node_from_request(
+                let mut node = self.create_node_from_request(
                     machine_key,
                     &request,
                     key.user_id,
@@ -516,9 +566,12 @@ impl ControlPlane {
                     key.ephemeral,
                     &now,
                 )?;
-                self.store
+                node = self
+                    .store
                     .upsert_node(&node)
                     .map_err(|e| ControlError::Store(e.to_string()))?;
+                // Existing peers must learn about the new node.
+                self.publish_change(ChangeEvent::NodeChanged(node.id));
                 if !key.reusable {
                     self.store
                         .mark_pre_auth_key_used(key.id)
@@ -626,7 +679,7 @@ impl ControlPlane {
                     ephemeral: entry.ephemeral,
                     ..Default::default()
                 };
-                let node = self.create_node_from_request(
+                let mut node = self.create_node_from_request(
                     machine_key,
                     &pending_request,
                     user_id,
@@ -634,9 +687,12 @@ impl ControlPlane {
                     entry.ephemeral,
                     now,
                 )?;
-                self.store
+                node = self
+                    .store
                     .upsert_node(&node)
                     .map_err(|e| ControlError::Store(e.to_string()))?;
+                // Existing peers must learn about the new node.
+                self.publish_change(ChangeEvent::NodeChanged(node.id));
                 Ok(self.authorized_response())
             }
         }
@@ -888,6 +944,11 @@ impl ControlPlane {
             approved_routes: Vec::new(),
             machine_authorized: true,
             ephemeral,
+            // A freshly registered node is deemed seen at creation. Key
+            // expiry is administratively granted (never set by clients,
+            // Spec-Registration §5), so default nodes carry no expiry.
+            last_seen: Some(now.to_string()),
+            key_expiry: None,
         })
     }
 
@@ -969,6 +1030,7 @@ impl ControlPlane {
             self.store
                 .delete_node(&node.node_key)
                 .map_err(|e| ControlError::Store(e.to_string()))?;
+            self.publish_change(ChangeEvent::NodeRemoved(node.id));
             return Ok(RegisterResponse {
                 machine_authorized: false,
                 node_key_expired,
@@ -978,9 +1040,12 @@ impl ControlPlane {
         }
         let mut updated = node;
         updated.machine_authorized = false;
-        self.store
+        let updated = self
+            .store
             .upsert_node(&updated)
             .map_err(|e| ControlError::Store(e.to_string()))?;
+        // A deauthorized node disappears from peers' maps.
+        self.publish_change(ChangeEvent::NodeChanged(updated.id));
         Ok(RegisterResponse {
             machine_authorized: false,
             node_key_expired,
@@ -1164,9 +1229,12 @@ impl ControlPlane {
             node.approved_routes.push(canonical);
             node.approved_routes.sort();
             node.approved_routes.dedup();
-            self.store
+            let updated = self
+                .store
                 .upsert_node(&node)
                 .map_err(|e| ControlError::Store(e.to_string()))?;
+            // Peers' routed AllowedIPs change.
+            self.publish_change(ChangeEvent::NodeChanged(updated.id));
         }
         Ok(())
     }
@@ -1184,9 +1252,12 @@ impl ControlPlane {
         let before = node.approved_routes.len();
         node.approved_routes.retain(|r| r != &canonical);
         if node.approved_routes.len() != before {
-            self.store
+            let updated = self
+                .store
                 .upsert_node(&node)
                 .map_err(|e| ControlError::Store(e.to_string()))?;
+            // Peers' routed AllowedIPs change.
+            self.publish_change(ChangeEvent::NodeChanged(updated.id));
         }
         Ok(())
     }
@@ -1321,6 +1392,7 @@ impl ControlPlane {
             .map_err(|e| ControlError::Store(e.to_string()))?
             .filter(|n| n.machine_key == machine_key)
             .ok_or(ControlError::NotFound)?;
+        let before = node.clone();
 
         let streaming = request.stream;
         let lite_update = !streaming && request.omit_peers && !request.read_only;
@@ -1330,6 +1402,10 @@ impl ControlPlane {
         // real disco key advertised in the first MapResponse (Spec-NetMap §3).
         // The read-only rule below is scoped to Hostinfo and Endpoints only.
         node.disco_key = request.disco_key;
+
+        // Mark the node seen: any map request observes the node, which peers
+        // observe as a last-seen/peer-seen delta.
+        node.last_seen = Some(time::now_rfc3339());
 
         // Streaming requests (version >= 68) are read-only for Hostinfo and
         // Endpoints: they must not clear or clobber the state a client already
@@ -1363,6 +1439,14 @@ impl ControlPlane {
             .upsert_node(&node)
             .map_err(|e| ControlError::Store(e.to_string()))?;
 
+        // Peers observe both the peer-visible state change and the fact that
+        // this node was seen. The change bus coalesces duplicates within the
+        // batch window before any session builds a delta.
+        if node != before {
+            self.publish_change(ChangeEvent::NodeChanged(node.id));
+        }
+        self.publish_change(ChangeEvent::PeerSeen(node.id));
+
         if lite_update {
             return Ok(MapOutcome::LiteUpdate);
         }
@@ -1373,11 +1457,16 @@ impl ControlPlane {
 
         if streaming {
             let session_id = self.open_session(node.id, node.ephemeral);
+            // Track the peers that were just sent so the first delta only
+            // carries changes since this complete frame.
+            let initial_peers = SessionPeers::from_peers(response.peers.iter().flatten());
             Ok(MapOutcome::Stream {
                 first_frame: frame,
                 keep_alive: request.keep_alive,
                 compress,
                 session_id,
+                node_id: node.id,
+                initial_peers,
             })
         } else {
             Ok(MapOutcome::FullFrame(frame))
@@ -1478,16 +1567,9 @@ impl ControlPlane {
             if let Some(uid) = stored.user_id {
                 user_ids.insert(uid);
             }
-            let mut peer = stored.to_proto();
-            let routes = self.effective_approved_routes(&stored)?;
-            if !routes.is_empty() {
-                let mut allowed = stored.addresses.clone();
-                allowed.extend(routes.iter().cloned());
-                allowed.sort();
-                allowed.dedup();
-                peer.allowed_ips = Some(allowed);
-                peer.primary_routes = Self::non_address_routes(&routes, &stored.addresses);
-            }
+            // Build the peer with its live online/last-seen state and the
+            // effective routed AllowedIPs, matching the shape used by deltas.
+            let peer = self.peer_node(&stored)?;
             peers.push(peer);
         }
         // Spec-NetMap section 4: keep peer arrays sorted by node ID.
@@ -1639,6 +1721,8 @@ impl ControlPlane {
             dns::load_extra_records(path).map_err(|e| ControlError::ExtraRecords(e.to_string()))?;
         let count = records.len();
         self.dns_state.set_extra_records(records);
+        // Push a DNS delta to every live map session (Spec-NetMap section 7.3).
+        self.publish_change(ChangeEvent::DnsChanged);
         Ok(count)
     }
 
@@ -1726,7 +1810,10 @@ impl ControlPlane {
     /// streaming map session, which pushes a `DERPMap` delta frame
     /// (Spec-DERP-STUN §7). Returns the new revision number.
     pub fn set_derp_map(&self, map: DerpMap) -> u64 {
-        self.derp_state.set_map(map)
+        let revision = self.derp_state.set_map(map);
+        // Push a DERP map delta to every live map session (Spec-DERP-STUN §7).
+        self.publish_change(ChangeEvent::DerpMapChanged);
+        revision
     }
 
     /// Subscribe to DERP map changes. The receiver yields a new revision for
@@ -1765,6 +1852,54 @@ impl ControlPlane {
             Ok(Some(node)) => node.machine_authorized,
             _ => false,
         }
+    }
+
+    /// Publish a single change to the shared change bus.
+    ///
+    /// The bus coalesces events per node within the configured batch window
+    /// and broadcasts a [`ChangeBatch`] to every live map session (M3-03).
+    pub fn publish_change(&self, event: ChangeEvent) {
+        self.events.publish(event);
+    }
+
+    /// Subscribe to coalesced change batches for live map sessions.
+    ///
+    /// The receiver yields one [`ChangeBatch`] per flush; a lagged receiver
+    /// observes `Lagged` and should fall back to a full refresh.
+    pub fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<ChangeBatch> {
+        self.events.subscribe()
+    }
+
+    /// Flush any pending changes now, broadcasting a batch if any are queued.
+    ///
+    /// The background sweep normally flushes on the configured window; callers
+    /// (tests, shutdown paths) can force a flush directly.
+    pub fn flush_changes(&self) {
+        self.events.flush();
+    }
+
+    /// Number of distinct changes currently awaiting a batch flush.
+    pub fn pending_change_count(&self) -> usize {
+        self.events.pending_count()
+    }
+
+    /// Spawn the background change-batch sweeper for this control plane, if
+    /// one is not already running. Must be called from inside a Tokio runtime.
+    ///
+    /// Returns `None` when a sweeper is already active (like
+    /// [`Self::claim_reaper`], only the first caller wins).
+    pub fn spawn_change_batcher(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.events.spawn_sweeper()
+    }
+
+    /// Signal that the access-control policy changed so live map sessions
+    /// re-derive peer visibility, filters, and SSH policy.
+    ///
+    /// The caller owns the policy snapshot and swaps it (e.g. through a
+    /// mutable config); this only fans the typed `PolicyChanged` event out to
+    /// sessions through the change bus.
+    pub fn publish_policy_changed(&self) {
+        self.publish_change(ChangeEvent::PolicyChanged);
     }
 
     fn authorized_response(&self) -> RegisterResponse {
@@ -3900,5 +4035,153 @@ mod tests {
         assert_eq!(plane.dns_extra_records().len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Open a streaming map session for node 1 (with node 2 as a peer),
+    /// returning the session node id and the session's last-sent tracking.
+    fn open_stream_with_peer() -> (ControlPlane, i64, SessionPeers) {
+        let plane = test_plane();
+        plane.register(test_machine_key(), test_register_request());
+        register_extra_node(&plane, [0x13; 32], [0x24; 32]);
+        let request = MapRequest {
+            version: 130,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: true,
+            ..Default::default()
+        };
+        let outcome = plane.handle_map(test_machine_key(), request).unwrap();
+        let MapOutcome::Stream {
+            node_id,
+            first_frame,
+            initial_peers,
+            ..
+        } = outcome
+        else {
+            panic!("expected a streaming outcome");
+        };
+        // The complete first frame must already exist: deltas only ever come
+        // after it (Spec-NetMap section 4).
+        assert!(!first_frame.is_empty());
+        assert_eq!(initial_peers.len(), 1, "node 2 is the only peer");
+        (plane, node_id, initial_peers)
+    }
+
+    #[test]
+    fn endpoint_change_produces_a_patch_not_a_full_peer_list() {
+        let (plane, node_id, mut last_sent) = open_stream_with_peer();
+        let mut rx = plane.subscribe_changes();
+
+        // Node 2 reports a new endpoint via a lite (non-streaming) update.
+        let lite = MapRequest {
+            version: 130,
+            node_key: NodeKey::from_bytes([0x24; 32]),
+            disco_key: DiscoKey::from_bytes([0x44; 32]),
+            stream: false,
+            omit_peers: true,
+            endpoints: vec!["203.0.113.10:41641".to_string()],
+            endpoint_types: vec![3],
+            ..Default::default()
+        };
+        assert_eq!(
+            plane
+                .handle_map(MachineKey::from_bytes([0x13; 32]), lite)
+                .unwrap(),
+            MapOutcome::LiteUpdate
+        );
+        plane.flush_changes();
+        let batch = rx.try_recv().expect("a batch after the endpoint change");
+
+        let delta = plane
+            .build_delta(node_id, &batch, &mut last_sent)
+            .unwrap()
+            .expect("a delta frame");
+        assert!(
+            delta.peers_changed.is_none(),
+            "an endpoint change must never resend the full peer list"
+        );
+        assert!(delta.peers_removed.is_none());
+        assert!(delta.peers.is_none());
+
+        let patches = delta
+            .peers_changed_patch
+            .expect("a PeersChangedPatch must be generated");
+        assert_eq!(patches.len(), 1);
+        assert_eq!(
+            patches[0].endpoints.as_deref(),
+            Some(&["203.0.113.10:41641".to_string()][..])
+        );
+        // The seen signal and the endpoint patch coalesce into one ordered
+        // frame, so the client receives no duplicate/conflicting deltas.
+        assert_eq!(
+            delta.peer_seen_change.as_ref().and_then(|m| m.get(&2)),
+            Some(&true)
+        );
+        assert!(!delta.keep_alive);
+    }
+
+    #[test]
+    fn peer_disappearance_produces_peers_removed_delta() {
+        let (plane, node_id, mut last_sent) = open_stream_with_peer();
+        let mut rx = plane.subscribe_changes();
+
+        // Logging out node 2 deauthorizes it, so it disappears from peer maps.
+        let response = plane
+            .logout(
+                MachineKey::from_bytes([0x13; 32]),
+                &NodeKey::from_bytes([0x24; 32]),
+            )
+            .unwrap();
+        assert!(!response.machine_authorized);
+        plane.flush_changes();
+        let batch = rx.try_recv().expect("a batch after the logout");
+
+        let delta = plane
+            .build_delta(node_id, &batch, &mut last_sent)
+            .unwrap()
+            .expect("a delta frame");
+        assert_eq!(delta.peers_removed.as_deref(), Some(&[2u64][..]));
+        assert!(delta.peers_changed.is_none());
+        assert!(delta.peers_changed_patch.is_none());
+        assert!(last_sent.is_empty(), "the removed peer leaves tracking");
+    }
+
+    #[test]
+    fn online_transition_produces_online_change_delta() {
+        let (plane, node_id, mut last_sent) = open_stream_with_peer();
+        let mut rx = plane.subscribe_changes();
+
+        // Node 2 starts a streaming session of its own: it goes online.
+        let request = MapRequest {
+            version: 130,
+            node_key: NodeKey::from_bytes([0x24; 32]),
+            disco_key: DiscoKey::from_bytes([0x44; 32]),
+            stream: true,
+            ..Default::default()
+        };
+        let outcome = plane
+            .handle_map(MachineKey::from_bytes([0x13; 32]), request)
+            .unwrap();
+        assert!(matches!(outcome, MapOutcome::Stream { .. }));
+        plane.flush_changes();
+        let batch = rx.try_recv().expect("a batch after the online transition");
+
+        let delta = plane
+            .build_delta(node_id, &batch, &mut last_sent)
+            .unwrap()
+            .expect("a delta frame");
+        assert_eq!(
+            delta.online_change.as_ref().and_then(|m| m.get(&2)),
+            Some(&true),
+            "the stream session sees its peer come online"
+        );
+    }
+
+    #[test]
+    fn empty_batch_produces_no_delta_frame() {
+        let (plane, node_id, mut last_sent) = open_stream_with_peer();
+        let empty = ChangeBatch::default();
+        let delta = plane.build_delta(node_id, &empty, &mut last_sent).unwrap();
+        assert!(delta.is_none(), "no changes means no delta frame");
     }
 }

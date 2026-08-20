@@ -13,7 +13,7 @@ use crate::oidc::{
     DEFAULT_OIDC_FLOW_LIMIT, DEFAULT_OIDC_FLOW_TTL_SECONDS, OidcClient, OidcFlowStore, now_unix,
 };
 use bytes::Bytes;
-use crabscale_control::{ControlConfig, ControlError, ControlPlane, MapOutcome};
+use crabscale_control::{ControlConfig, ControlError, ControlPlane, MapOutcome, SessionPeers};
 use crabscale_proto::{
     LogoutRequest, MIN_SUPPORTED_CAPVER, MachineKey, MapRequest, RegisterRequest, VerifyRequest,
     VerifyResponse,
@@ -32,6 +32,17 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// The limit is 4 KiB; the HTTP layer enforces it before the body reaches the
 /// router, which re-checks it as defense in depth.
 pub const VERIFY_MAX_BODY_LEN: usize = 4096;
+
+/// A live streaming map session handed off from `handle_map` to the per-connection
+/// writer task.
+struct StreamSession {
+    first_frame: Vec<u8>,
+    keep_alive: bool,
+    compress: bool,
+    session_id: i64,
+    node_id: i64,
+    last_sent: SessionPeers,
+}
 
 /// Default keepalive interval for streaming map sessions.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(50);
@@ -125,6 +136,9 @@ impl ControlRouter {
                 control.reap_sessions();
             }
         });
+        // One change-batcher sweeper per plane: it coalesces node/policy/DNS/
+        // DERP changes into ordered delta batches for live map sessions.
+        self.control.spawn_change_batcher();
     }
 
     /// Handle an outer `GET /key` request.
@@ -531,9 +545,21 @@ impl ControlRouter {
                 keep_alive,
                 compress,
                 session_id,
+                node_id,
+                initial_peers,
             }) => {
-                self.send_stream(respond, first_frame, keep_alive, compress, session_id)
-                    .await;
+                self.send_stream(
+                    respond,
+                    StreamSession {
+                        first_frame,
+                        keep_alive,
+                        compress,
+                        session_id,
+                        node_id,
+                        last_sent: initial_peers,
+                    },
+                )
+                .await;
             }
             Err(ControlError::NotFound) => {
                 send_plain(respond, StatusCode::NOT_FOUND, b"node not found");
@@ -562,14 +588,15 @@ impl ControlRouter {
         }
     }
 
-    async fn send_stream(
-        &self,
-        respond: &mut SendResponse<Bytes>,
-        first_frame: Vec<u8>,
-        keep_alive: bool,
-        compress: bool,
-        session_id: i64,
-    ) {
+    async fn send_stream(&self, respond: &mut SendResponse<Bytes>, session: StreamSession) {
+        let StreamSession {
+            first_frame,
+            keep_alive,
+            compress,
+            session_id,
+            node_id,
+            mut last_sent,
+        } = session;
         let response = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/octet-stream")
@@ -592,16 +619,16 @@ impl ControlRouter {
             return;
         }
 
-        // Subscribe to DNS and DERP map changes so a hot reload pushes a
-        // delta frame to every live map session (Spec-NetMap section 7 and
-        // Spec-DERP-STUN section 7).
-        let mut dns_changes = self.control.subscribe_dns_changes();
-        let mut derp_changes = self.control.subscribe_derp_map_changes();
+        // Subscribe to the unified change bus. Node, policy, DNS, and DERP
+        // changes are coalesced per node within a short batch window and
+        // delivered to this session as one ordered ChangeBatch; the control
+        // plane diff-s them against this session's last-sent peer set so an
+        // endpoint change produces a patch rather than a full peer list.
+        let mut changes = self.control.subscribe_changes();
 
         loop {
             // Spec-NetMap section 5: keepalive every 50s plus 0-9s random
-            // jitter; a DNS or DERP map change interrupts the wait and
-            // pushes a delta.
+            // jitter; a change batch interrupts the wait and pushes a delta.
             let jitter = Duration::from_secs(rand::random::<u64>() % 10);
             let sleep = std::pin::pin!(tokio::time::sleep(KEEPALIVE_INTERVAL + jitter));
             tokio::select! {
@@ -614,40 +641,32 @@ impl ControlRouter {
                         break;
                     }
                 }
-                dns_change = dns_changes.recv() => {
-                    match dns_change {
-                        Ok(_revision) => {
-                            let frame = match self.control.build_dns_delta_frame(compress) {
+                batch = changes.recv() => {
+                    match batch {
+                        Ok(batch) => {
+                            if batch.is_empty() {
+                                continue;
+                            }
+                            let response = match self.control.build_delta(
+                                node_id, &batch, &mut last_sent,
+                            ) {
+                                Ok(Some(response)) => response,
+                                // Nothing for this session (e.g. an unrelated
+                                // node changed, or DNS with nothing to push).
+                                Ok(None) => continue,
+                                Err(_) => continue,
+                            };
+                            let frame = match self.control.encode_frame(&response, compress) {
                                 Ok(f) => f,
-                                // Nothing meaningful to push (e.g. MagicDNS was
-                                // disabled with no other DNS settings).
                                 Err(_) => continue,
                             };
                             if send.send_data(Bytes::from(frame), false).is_err() {
                                 break;
                             }
                         }
-                        // Lagged: missed revisions; the next map picks up the
-                        // latest config anyway.
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        // The control plane is gone; stop streaming.
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-                derp_change = derp_changes.recv() => {
-                    match derp_change {
-                        Ok(_revision) => {
-                            let frame =
-                                match self.control.build_derp_map_delta_frame(compress) {
-                                    Ok(f) => f,
-                                    Err(_) => continue,
-                                };
-                            if send.send_data(Bytes::from(frame), false).is_err() {
-                                break;
-                            }
-                        }
-                        // Lagged: missed revisions; the next map picks up the
-                        // latest config anyway.
+                        // Lagged: a batch was missed; the next one re-derives
+                        // against the session's actual last-sent peer set, and
+                        // a full-map fallback remains available to clients.
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         // The control plane is gone; stop streaming.
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
