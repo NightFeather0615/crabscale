@@ -152,3 +152,22 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Run M4-02 fuzz smoke
         run: ./scripts/fuzz-smoke.sh
+
+  reverse-proxy-smoke:
+    name: Reverse-proxy smoke (M4-03)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Run M4-03 reverse-proxy smoke
+        run: ./scripts/reverse-proxy-smoke.sh
+
+  docker-smoke:
+    name: Docker image smoke (M4-03)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run M4-03 container smoke
+        run: ./scripts/docker-smoke.sh

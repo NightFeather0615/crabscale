@@ -1,6 +1,6 @@
 //! Outer HTTP/1.1 control server built on tokio's `net` feature and hyper.
 //!
-//! This module serves the two outer endpoints required by Spec-Transport:
+//! This module serves the outer endpoints required by the control protocol:
 //!
 //! - `GET /key?v=<capability_version>` returns the server machine key.
 //! - `POST /ts2021` upgrades the connection to the TS2021 Noise transport and
@@ -10,12 +10,19 @@
 //! parsing instead of a hand-rolled parser. See the wiki `Architecture` page
 //! for the decision and the limitations that no longer apply.
 //!
-//! Since M4-02 (security hardening), `POST /ts2021` is rate-limited per client
-//! IP with HTTP `429` and `Retry-After`, and the Noise handshake is bounded by
-//! the documented 10-second handshake timeout.
+//! ## M4-03 (deployment, #26)
+//!
+//! - TLS is terminated here (rustls) when configured, so `/key` stays
+//!   TLS-protected and the `/ts2021` and `/derp` HTTP upgrades pass through the
+//!   TLS layer unchanged.
+//! - A separate plain-HTTP listener can redirect browsers to HTTPS while the
+//!   upgrade endpoints remain on the TLS listener.
+//! - Trusted proxy CIDRs are honored when resolving the client IP for the
+//!   `/ts2021` rate limiter (see [`crate::proxy`]).
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use crabscale_transport::{
@@ -28,16 +35,23 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 
 use crate::key::ServerKey;
+use crate::proxy::TrustedProxies;
 use crate::router::{ControlRouter, VERIFY_MAX_BODY_LEN, serve_control_as};
+use crate::tls::TlsAcceptor;
+
+/// Minimal object-safe supertrait so TLS and plain sockets share one boxed type.
+trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 
 /// A handle to a running outer control server, used to request shutdown.
 #[derive(Clone)]
 pub struct ServerHandle {
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl ServerHandle {
@@ -47,32 +61,75 @@ impl ServerHandle {
     }
 }
 
-/// Bind `addr` and serve the outer control endpoints until shutdown is
-/// requested. Returns the actual bound address (useful when `addr` uses port
-/// 0) and a handle that can be used to stop the server.
+/// Extra deployment options for the outer HTTP server (M4-03, #26).
+///
+/// The plain [`serve_on_addr`] / [`serve`] entry points use the `Default`
+/// (plain HTTP, no trusted proxies) so existing tests and the harness keep
+/// working unchanged.
+#[derive(Clone, Debug, Default)]
+pub struct ServerOptions {
+    /// Trusted proxy networks whose `X-Forwarded-For` is honored. `None`
+    /// means the peer address is always authoritative.
+    pub trusted_proxies: Option<Arc<TrustedProxies>>,
+    /// Optional TLS acceptor. When present every accepted connection is
+    /// upgraded to TLS before hyper parses the request.
+    pub tls: Option<Arc<TlsAcceptor>>,
+}
+
+/// Bind `addr` with default options and serve until shutdown. Returns the
+/// actual bound address (useful when `addr` uses port 0) and a handle.
 pub async fn serve_on_addr(
     addr: SocketAddr,
     router: ControlRouter,
     server_key: ServerKey,
 ) -> io::Result<(SocketAddr, ServerHandle)> {
+    serve_on_addr_with_options(addr, router, server_key, ServerOptions::default()).await
+}
+
+/// Bind `addr` with explicit deployment [`ServerOptions`] (TLS + proxies).
+pub async fn serve_on_addr_with_options(
+    addr: SocketAddr,
+    router: ControlRouter,
+    server_key: ServerKey,
+    options: ServerOptions,
+) -> io::Result<(SocketAddr, ServerHandle)> {
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let handle = ServerHandle { shutdown_tx };
     tokio::spawn(async move {
-        let _ = serve(listener, router, server_key, shutdown_rx).await;
+        let _ = serve_with_options(listener, router, server_key, shutdown_rx, options).await;
     });
     Ok((local, handle))
 }
 
-/// Accept connections and serve the outer control endpoints until shutdown is
-/// requested.
+/// Accept connections with default options and serve until shutdown.
 pub async fn serve(
     listener: TcpListener,
     router: ControlRouter,
     server_key: ServerKey,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
+    serve_with_options(
+        listener,
+        router,
+        server_key,
+        shutdown,
+        ServerOptions::default(),
+    )
+    .await
+}
+
+/// Accept connections with explicit deployment [`ServerOptions`] and serve
+/// until shutdown is requested.
+pub async fn serve_with_options(
+    listener: TcpListener,
+    router: ControlRouter,
+    server_key: ServerKey,
+    mut shutdown: watch::Receiver<bool>,
+    options: ServerOptions,
+) -> io::Result<()> {
+    let options = Arc::new(options);
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -82,8 +139,90 @@ pub async fn serve(
                 let (stream, peer_addr) = res?;
                 let router = router.clone();
                 let server_key = server_key.clone();
+                let options = options.clone();
                 tokio::spawn(async move {
-                    let _ = handle_connection(stream, peer_addr, router, server_key).await;
+                    let _ =
+                        handle_connection(stream, peer_addr, router, server_key, options).await;
+                });
+            }
+        }
+    }
+}
+
+/// Build a `301 Moved Permanently` response pointing at the HTTPS URL for the
+/// same authority and path.
+fn redirect_response(req: Request<()>, fallback_host: String) -> Response<Full<Bytes>> {
+    let host = req
+        .headers()
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or(fallback_host);
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let location = format!("https://{host}{path}");
+
+    let mut response = Response::new(Full::new(Bytes::new()));
+    *response.status_mut() = StatusCode::MOVED_PERMANENTLY;
+    response.headers_mut().insert(
+        http::header::LOCATION,
+        HeaderValue::from_str(&location).unwrap_or_else(|_| HeaderValue::from_static("https://")),
+    );
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("max-age=3600"),
+    );
+    response
+        .headers_mut()
+        .insert(http::header::CONNECTION, HeaderValue::from_static("close"));
+    response
+}
+
+/// Bind a plain-HTTP listener that redirects every request to HTTPS (M4-03).
+///
+/// The `fallback_host` (e.g. `control.example.com`) is used when the request
+/// carries no `Host` header. Upgrade requests are intentionally *not*
+/// redirected here: when the server terminates TLS itself the whole redirect
+/// listener is plain HTTP, so an upgrade cannot be tunneled; the operator
+/// configures the proxy to forward upgrades to the TLS listener instead.
+pub async fn serve_redirect_on_addr(
+    addr: SocketAddr,
+    fallback_host: String,
+) -> io::Result<(SocketAddr, ServerHandle)> {
+    let listener = TcpListener::bind(addr).await?;
+    let local = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = ServerHandle { shutdown_tx };
+    tokio::spawn(async move {
+        let _ = serve_redirect(listener, fallback_host, shutdown_rx).await;
+    });
+    Ok((local, handle))
+}
+
+async fn serve_redirect(
+    listener: TcpListener,
+    fallback_host: String,
+    mut shutdown: watch::Receiver<bool>,
+) -> io::Result<()> {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return Ok(()),
+            res = listener.accept() => {
+                let (stream, _peer) = res?;
+                let fallback_host = fallback_host.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req| {
+                        let fallback_host = fallback_host.clone();
+                        async move {
+                            Ok::<_, hyper::Error>(redirect_response(req.map(|_| ()), fallback_host))
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
                 });
             }
         }
@@ -95,11 +234,28 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     router: ControlRouter,
     server_key: ServerKey,
+    options: Arc<ServerOptions>,
 ) -> io::Result<()> {
-    let service =
-        service_fn(move |req| handle_request(req, peer_addr, router.clone(), server_key.clone()));
+    // TLS and plain sockets have different concrete types; box them behind
+    // the same trait object so hyper sees one I/O abstraction.
+    let io: TokioIo<Box<dyn IoStream>> = if let Some(acceptor) = &options.tls {
+        let tls = acceptor.accept(stream).await?;
+        TokioIo::new(Box::new(tls))
+    } else {
+        TokioIo::new(Box::new(stream))
+    };
+
+    let service = service_fn(move |req| {
+        handle_request(
+            req,
+            peer_addr,
+            router.clone(),
+            server_key.clone(),
+            options.clone(),
+        )
+    });
     http1::Builder::new()
-        .serve_connection(TokioIo::new(stream), service)
+        .serve_connection(io, service)
         .with_upgrades()
         .await
         .map_err(|e| io::Error::other(e.to_string()))
@@ -110,9 +266,18 @@ async fn handle_request(
     peer_addr: SocketAddr,
     router: ControlRouter,
     server_key: ServerKey,
+    options: Arc<ServerOptions>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+
+    // Resolve the real client IP once per request: when the peer is a trusted
+    // proxy, `X-Forwarded-For`/`X-Real-IP` are honored (M4-03).
+    let client_ip = options
+        .trusted_proxies
+        .as_deref()
+        .map(|proxies| proxies.resolve_client_ip(peer_addr.ip(), req.headers()))
+        .unwrap_or(peer_addr.ip());
 
     if method == http::Method::GET && path == "/key" {
         let capver = query_param(req.uri().query(), "v");
@@ -122,9 +287,9 @@ async fn handle_request(
 
     // `POST /ts2021` is rate-limited per client IP (M4-02). The limiter is
     // consulted before the upgrade request is parsed so a limited peer cannot
-    // even feed the handshake parser.
+    // even feed the handshake parser. M4-03 uses the proxy-resolved client IP.
     if method == http::Method::POST && path == "/ts2021" {
-        if let Some(retry_after) = router.check_ts2021_rate(peer_addr.ip()) {
+        if let Some(retry_after) = router.check_ts2021_rate(client_ip) {
             return Ok(rate_limited_response(retry_after));
         }
         return Ok(handle_ts2021(req, router, server_key).await);
@@ -376,5 +541,21 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), b"rate limit exceeded");
+    }
+
+    #[test]
+    fn redirect_response_points_at_https() {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/key?v=130")
+            .header("Host", "control.example.com")
+            .body(())
+            .unwrap();
+        let res = redirect_response(req, "fallback.example".to_string());
+        assert_eq!(res.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            res.headers().get("location").unwrap().to_str().unwrap(),
+            "https://control.example.com/key?v=130"
+        );
     }
 }
