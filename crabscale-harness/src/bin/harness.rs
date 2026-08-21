@@ -30,6 +30,9 @@ struct Args {
     /// Tailnet domain advertised by the server.
     #[arg(long, default_value = "tailnet.example")]
     tailnet: String,
+    /// Capability version the Rust peer advertises (Spec-Compatibility §3).
+    #[arg(long, default_value_t = crabscale_harness::client::DEFAULT_CAPABILITY_VERSION)]
+    capability_version: u16,
 }
 
 #[tokio::main]
@@ -40,6 +43,7 @@ async fn main() -> ExitCode {
     config.tailnet = args.tailnet;
     config.tailscale_binary = args.tailscale_binary.clone();
     config.report_path = args.report.clone();
+    config.capability_version = args.capability_version;
 
     let server = match start_server(&config).await {
         Ok(server) => server,
@@ -54,6 +58,7 @@ async fn main() -> ExitCode {
         control_url: config.control_url.clone(),
         tailnet: config.tailnet.clone(),
         auth_key: config.auth_key.clone(),
+        capability_version: args.capability_version,
         ..Default::default()
     };
 

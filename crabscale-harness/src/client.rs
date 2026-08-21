@@ -24,7 +24,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::config::HarnessConfig;
 
 /// The capability version this peer advertises.
-pub const CAPABILITY_VERSION: u16 = 130;
+pub const DEFAULT_CAPABILITY_VERSION: u16 = 130;
 
 /// Result of a Rust peer run.
 #[derive(Clone, Debug, Default)]
@@ -55,7 +55,7 @@ pub async fn run_rust_peer(config: &HarnessConfig) -> Result<PeerReport, String>
     let addr = config.addr();
 
     // 1. Fetch the server machine key.
-    let server_public = fetch_server_key(addr).await?;
+    let server_public = fetch_server_key(addr, config.capability_version).await?;
     report
         .notes
         .push(format!("fetched server machine key {server_public}"));
@@ -63,7 +63,13 @@ pub async fn run_rust_peer(config: &HarnessConfig) -> Result<PeerReport, String>
     // 2. Open the TS2021 upgrade and complete the Noise handshake.
     let client_static = StaticSecret::random();
     let node_key = NodeKey::from_bytes(PublicKey::from(&client_static).to_bytes());
-    let mut noise = open_ts2021(addr, &client_static, server_public).await?;
+    let mut noise = open_ts2021(
+        addr,
+        &client_static,
+        server_public,
+        config.capability_version,
+    )
+    .await?;
     report
         .notes
         .push("completed TS2021 Noise handshake".to_string());
@@ -84,7 +90,7 @@ pub async fn run_rust_peer(config: &HarnessConfig) -> Result<PeerReport, String>
 
     // 5. Register with the pre-auth key.
     let register = RegisterRequest {
-        version: CAPABILITY_VERSION as u32,
+        version: config.capability_version as u32,
         node_key,
         auth: Some(RegisterAuth {
             auth_key: config.auth_key.clone(),
@@ -108,7 +114,7 @@ pub async fn run_rust_peer(config: &HarnessConfig) -> Result<PeerReport, String>
     // 6. Request a non-streaming full map.
     let disco_key = DiscoKey::from_bytes([0x33; 32]);
     let map = MapRequest {
-        version: CAPABILITY_VERSION as u32,
+        version: config.capability_version as u32,
         node_key,
         disco_key,
         stream: false,
@@ -182,16 +188,20 @@ pub async fn run_rust_peer(config: &HarnessConfig) -> Result<PeerReport, String>
     Ok(report)
 }
 
-/// Fetch the server machine key from `GET /key`.
-async fn fetch_server_key(addr: std::net::SocketAddr) -> Result<MachineKey, String> {
+/// Fetch the server machine key from `GET /key`, advertising `capability_version`.
+async fn fetch_server_key(
+    addr: std::net::SocketAddr,
+    capability_version: u16,
+) -> Result<MachineKey, String> {
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
     let request = format!(
-        "GET /key?v={CAPABILITY_VERSION} HTTP/1.1\r\n\
+        "GET /key?v={} HTTP/1.1\r\n\
          Host: {addr}\r\n\
          Connection: close\r\n\
-         \r\n"
+         \r\n",
+        capability_version,
     );
     stream
         .write_all(request.as_bytes())
@@ -222,17 +232,18 @@ async fn open_ts2021(
     addr: std::net::SocketAddr,
     client_static: &StaticSecret,
     server_public: MachineKey,
+    capability_version: u16,
 ) -> Result<NoiseStream<tokio::net::TcpStream>, String> {
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
 
-    let prologue = format!("Tailscale Control Protocol v{CAPABILITY_VERSION}");
+    let prologue = format!("Tailscale Control Protocol v{capability_version}");
     let (initiator, init_bytes) = NoiseInitiator::initialize(
         client_static.clone(),
         PublicKey::from(server_public.to_bytes()),
         prologue.as_bytes(),
-        CAPABILITY_VERSION,
+        capability_version,
     );
     let init_b64 = BASE64.encode(init_bytes);
     let request = format!(

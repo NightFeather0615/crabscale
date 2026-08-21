@@ -264,6 +264,9 @@ pub enum MapOutcome {
         /// The peer snapshots delivered in the complete first frame, so the
         /// first delta only carries changes since then.
         initial_peers: SessionPeers,
+        /// The client's advertised capability version, used to gate every
+        /// later delta for this session.
+        client_version: u32,
     },
 }
 
@@ -1417,12 +1420,13 @@ impl ControlPlane {
         // observe as a last-seen/peer-seen delta.
         node.last_seen = Some(time::now_rfc3339());
 
-        // Streaming requests (version >= 68) are read-only for Hostinfo and
-        // Endpoints: they must not clear or clobber the state a client already
-        // reported through a non-streaming update. The `version >= 68` clause
-        // is redundant today because handle_map rejects versions below
-        // MIN_SUPPORTED_CAPVER, but it documents the spec rule.
-        let read_only = streaming && request.version >= 68;
+        // Streaming requests are read-only for Hostinfo and Endpoints once
+        // the client reaches capver 68: they must not clear or clobber the
+        // state a client already reported through a non-streaming update.
+        // The `streaming_read_only` clause is redundant today because
+        // handle_map rejects versions below MIN_SUPPORTED_CAPVER, but it
+        // documents the spec rule (Spec-Compatibility table row 68).
+        let read_only = streaming && crabscale_proto::capver::streaming_read_only(request.version);
         if !read_only {
             if let Some(hostinfo) = &request.hostinfo {
                 node.hostinfo = Some(hostinfo.clone());
@@ -1477,6 +1481,7 @@ impl ControlPlane {
                 session_id,
                 node_id: node.id,
                 initial_peers,
+                client_version: request.version,
             })
         } else {
             Ok(MapOutcome::FullFrame(frame))
@@ -1502,8 +1507,9 @@ impl ControlPlane {
     pub fn build_initial_map(
         &self,
         node: &DomainNode,
-        _request: &MapRequest,
+        request: &MapRequest,
     ) -> Result<MapResponse, ControlError> {
+        let version = request.version;
         let compile_nodes = self.compile_nodes()?;
         let compiled = crabscale_policy::compile_policy(&self.config.policy, &compile_nodes);
         let self_routes = self.effective_approved_routes(node)?;
@@ -1527,6 +1533,11 @@ impl ControlPlane {
         // PrimaryRoutes (the self address values are never part of it).
         let mut proto_node = node.to_proto();
         proto_node.primary_routes = Self::non_address_routes(&self_routes, &node.addresses);
+        // Apply the AllowedIPs wire gate to the self node: at capver >= 112
+        // an `AllowedIPs` identical to `Addresses` is emitted as `null` (the
+        // shared "same as Addresses" shorthand), shrinking the frame.
+        proto_node.allowed_ips =
+            Self::allowed_ips_for(version, &node.addresses, proto_node.allowed_ips.as_deref());
 
         if let Some(self_compile) = compile_nodes.iter().find(|n| n.id == node.id as u64) {
             if !self.config.policy.node_attrs.is_empty() {
@@ -1544,8 +1555,19 @@ impl ControlPlane {
             .get(&(node.id as u64))
             .cloned()
             .unwrap_or_default();
+        // At capver >= 81 prefer the incremental `PacketFilters` map; older
+        // clients receive the legacy singular `PacketFilter` fallback
+        // (Spec-Compatibility table row 81). Below-minimum versions are
+        // rejected before this branch, but the gate is still enforced so the
+        // behavior is centralized in one documented decision.
         let mut packet_filters = BTreeMap::new();
-        packet_filters.insert("base".to_string(), base);
+        packet_filters.insert("base".to_string(), base.clone());
+        let (packet_filter, packet_filters) =
+            if crabscale_proto::capver::prefers_incremental_packet_filters(version) {
+                (None, Some(packet_filters))
+            } else {
+                (Some(base), None)
+            };
 
         let visible = compiled
             .peer_visibility
@@ -1578,8 +1600,9 @@ impl ControlPlane {
                 user_ids.insert(uid);
             }
             // Build the peer with its live online/last-seen state and the
-            // effective routed AllowedIPs, matching the shape used by deltas.
-            let peer = self.peer_node(&stored)?;
+            // effective routed AllowedIPs, matching the shape used by deltas
+            // and gated on the requesting client's capability version.
+            let peer = self.peer_node(&stored, version)?;
             peers.push(peer);
         }
         // Spec-NetMap section 4: keep peer arrays sorted by node ID.
@@ -1607,13 +1630,40 @@ impl ControlPlane {
             derp_map: Some(self.derp_state.map()),
             domain: self.config.tailnet_domain.clone(),
             peers: Some(peers),
-            packet_filters: Some(packet_filters),
+            packet_filter,
+            packet_filters,
             user_profiles,
             ssh_policy,
             control_time: CONTROL_TIME.to_string(),
             dns: self.build_dns_config()?,
             ..Default::default()
         })
+    }
+
+    /// Apply the `AllowedIPs` wire gate for the given client capability
+    /// version.
+    ///
+    /// At capver >= 112 a value identical to the node's `Addresses` is
+    /// omitted (`AllowedIPs: null` means "same as Addresses"); older clients
+    /// always receive an explicit list. The effective value is the passed
+    /// `allowed` when present (routed subnets extend it) or the node's own
+    /// addresses when absent.
+    fn allowed_ips_for(
+        version: u32,
+        addresses: &[String],
+        allowed: Option<&[String]>,
+    ) -> Option<Vec<String>> {
+        let effective = match allowed {
+            Some(allowed) => allowed.to_vec(),
+            None => addresses.to_vec(),
+        };
+        if crabscale_proto::capver::allowed_ips_null_means_addresses(version)
+            && effective == addresses
+        {
+            None
+        } else {
+            Some(effective)
+        }
     }
 
     /// Snapshot the registered nodes in the shape the policy compiler needs.
@@ -2462,6 +2512,128 @@ mod tests {
         assert!(stored.endpoint_types.is_empty());
         assert_eq!(stored.home_derp, 1);
         assert_eq!(stored.hostinfo.as_ref().unwrap().hostname, "node1");
+    }
+
+    #[test]
+    fn handle_map_rejects_below_minimum_version() {
+        let plane = test_plane();
+        plane.register(test_machine_key(), test_register_request());
+        let request = MapRequest {
+            version: MIN_SUPPORTED_CAPVER - 1,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: false,
+            ..Default::default()
+        };
+        assert!(matches!(
+            plane.handle_map(test_machine_key(), request),
+            Err(ControlError::UnsupportedVersion(v)) if v == MIN_SUPPORTED_CAPVER - 1
+        ));
+    }
+
+    #[test]
+    fn initial_map_prefers_packet_filters_at_and_above_81() {
+        let plane = test_plane();
+        plane.register(test_machine_key(), test_register_request());
+        let node = plane
+            .store
+            .get_node_by_node_key(&test_node_key())
+            .unwrap()
+            .expect("node must exist");
+        let base_map = |version| {
+            let request = MapRequest {
+                version,
+                node_key: test_node_key(),
+                disco_key: DiscoKey::from_bytes([0x44; 32]),
+                ..Default::default()
+            };
+            plane.build_initial_map(&node, &request).unwrap()
+        };
+
+        let modern = base_map(crabscale_proto::capver::PACKET_FILTERS_CAPVER);
+        assert!(
+            modern.packet_filters.is_some(),
+            ">=81 prefers the incremental PacketFilters map"
+        );
+        assert!(
+            modern.packet_filter.is_none(),
+            ">=81 must not use the singular PacketFilter fallback"
+        );
+
+        let legacy = base_map(crabscale_proto::capver::PACKET_FILTERS_CAPVER - 1);
+        assert!(
+            legacy.packet_filter.is_some(),
+            "<81 uses the legacy singular PacketFilter field"
+        );
+        assert!(
+            legacy.packet_filters.is_none(),
+            "<81 must not use the incremental PacketFilters map"
+        );
+    }
+
+    #[test]
+    fn initial_map_omits_allowed_ips_when_same_as_addresses_at_112() {
+        let plane = test_plane();
+        plane.register(test_machine_key(), test_register_request());
+        let node = plane
+            .store
+            .get_node_by_node_key(&test_node_key())
+            .unwrap()
+            .expect("node must exist");
+        assert!(!node.addresses.is_empty());
+
+        let modern = MapRequest {
+            version: crabscale_proto::capver::ALLOWED_IPS_NULL_CAPVER,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x44; 32]),
+            ..Default::default()
+        };
+        let response = plane.build_initial_map(&node, &modern).unwrap();
+        assert_eq!(
+            response.node.as_ref().unwrap().allowed_ips,
+            None,
+            ">=112 omits AllowedIPs when it equals Addresses"
+        );
+
+        let legacy = MapRequest {
+            version: crabscale_proto::capver::ALLOWED_IPS_NULL_CAPVER - 1,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x44; 32]),
+            ..Default::default()
+        };
+        let response = plane.build_initial_map(&node, &legacy).unwrap();
+        assert_eq!(
+            response.node.as_ref().unwrap().allowed_ips.as_deref(),
+            Some(node.addresses.as_slice()),
+            "<112 always carries an explicit AllowedIPs list"
+        );
+    }
+
+    #[test]
+    fn initial_map_home_derp_serializes_as_integer() {
+        let plane = test_plane();
+        plane.register(test_machine_key(), test_register_request());
+        let node = plane
+            .store
+            .get_node_by_node_key(&test_node_key())
+            .unwrap()
+            .expect("node must exist");
+        let request = MapRequest {
+            version: MIN_SUPPORTED_CAPVER,
+            node_key: test_node_key(),
+            disco_key: DiscoKey::from_bytes([0x44; 32]),
+            ..Default::default()
+        };
+        let response = plane.build_initial_map(&node, &request).unwrap();
+        let frame = plane.encode_frame(&response, false).unwrap();
+        let (payload, consumed) = crabscale_proto::decode_map_response_frame(&frame).unwrap();
+        assert_eq!(consumed, frame.len());
+        let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert!(
+            json["Node"]["HomeDERP"].is_number(),
+            "HomeDERP must be an integer for supported clients: {}",
+            json["Node"]["HomeDERP"]
+        );
     }
 
     #[test]
@@ -3578,16 +3750,26 @@ mod tests {
         serde_json::from_slice(payload).unwrap()
     }
 
-    /// The `AllowedIPs` of `peer_id` in a decoded MapResponse, as strings.
+    /// The effective `AllowedIPs` of `peer_id` in a decoded MapResponse, as
+    /// strings.
+    ///
+    /// At capver >= 112 an absent `AllowedIPs` (`null`) means "same as
+    /// `Addresses`", so the helper falls back to the peer's `Addresses`
+    /// (Spec-Compatibility table row 112).
     fn peer_allowed_ips(plane_map: &serde_json::Value, peer_id: u64) -> Vec<String> {
-        plane_map["Peers"]
+        let peer = plane_map["Peers"]
             .as_array()
             .expect("Peers must be an array")
             .iter()
             .find(|p| p["ID"] == serde_json::json!(peer_id))
-            .unwrap_or_else(|| panic!("peer {peer_id} not in map"))["AllowedIPs"]
-            .as_array()
-            .expect("AllowedIPs must be an array")
+            .unwrap_or_else(|| panic!("peer {peer_id} not in map"));
+        let values = match peer.get("AllowedIPs") {
+            Some(serde_json::Value::Array(values)) => values,
+            _ => peer["Addresses"]
+                .as_array()
+                .expect("peer Addresses must be an array"),
+        };
+        values
             .iter()
             .map(|v| {
                 v.as_str()
@@ -4103,7 +4285,7 @@ mod tests {
         let batch = rx.try_recv().expect("a batch after the endpoint change");
 
         let delta = plane
-            .build_delta(node_id, &batch, &mut last_sent)
+            .build_delta(node_id, &batch, &mut last_sent, 130)
             .unwrap()
             .expect("a delta frame");
         assert!(
@@ -4147,7 +4329,7 @@ mod tests {
         let batch = rx.try_recv().expect("a batch after the logout");
 
         let delta = plane
-            .build_delta(node_id, &batch, &mut last_sent)
+            .build_delta(node_id, &batch, &mut last_sent, 130)
             .unwrap()
             .expect("a delta frame");
         assert_eq!(delta.peers_removed.as_deref(), Some(&[2u64][..]));
@@ -4177,7 +4359,7 @@ mod tests {
         let batch = rx.try_recv().expect("a batch after the online transition");
 
         let delta = plane
-            .build_delta(node_id, &batch, &mut last_sent)
+            .build_delta(node_id, &batch, &mut last_sent, 130)
             .unwrap()
             .expect("a delta frame");
         assert_eq!(
@@ -4191,7 +4373,9 @@ mod tests {
     fn empty_batch_produces_no_delta_frame() {
         let (plane, node_id, mut last_sent) = open_stream_with_peer();
         let empty = ChangeBatch::default();
-        let delta = plane.build_delta(node_id, &empty, &mut last_sent).unwrap();
+        let delta = plane
+            .build_delta(node_id, &empty, &mut last_sent, 130)
+            .unwrap();
         assert!(delta.is_none(), "no changes means no delta frame");
     }
 

@@ -471,4 +471,20 @@ mod tests {
             serde_json::json!([{ "First": 0, "Last": 65535 }])
         );
     }
+
+    #[test]
+    fn absent_display_messages_is_acceptable() {
+        // Structured display messages may be emitted once the client reaches
+        // capver 117, but absence is explicitly acceptable
+        // (Spec-Compatibility table row 117). The default response carries
+        // no such field and must round-trip cleanly.
+        let response = MapResponse::default();
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(
+            json.get("DisplayMessages").is_none(),
+            "absence of DisplayMessages must be a valid wire state"
+        );
+        let reparsed: MapResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(reparsed, response);
+    }
 }

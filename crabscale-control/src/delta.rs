@@ -100,6 +100,7 @@ impl ControlPlane {
         session_node_id: i64,
         batch: &ChangeBatch,
         last_sent: &mut SessionPeers,
+        client_version: u32,
     ) -> Result<Option<MapResponse>, ControlError> {
         let mut response = MapResponse::default();
 
@@ -128,7 +129,7 @@ impl ControlPlane {
             .map_err(|e| ControlError::Store(e.to_string()))?
             .ok_or(ControlError::NotFound)?;
 
-        let deltas = self.compute_peer_delta(&self_node, last_sent)?;
+        let deltas = self.compute_peer_delta(&self_node, last_sent, client_version)?;
 
         if batch.has_policy() {
             // A policy change can rewrite peer visibility, routed
@@ -139,7 +140,7 @@ impl ControlPlane {
             response.peers = Some(deltas.current);
             response.packet_filters = Some(self.base_packet_filters(&self_node)?);
             response.ssh_policy = self.ssh_policy_for(&self_node)?;
-            response.node = self.self_node_proto(&self_node)?;
+            response.node = self.self_node_proto(&self_node, client_version)?;
             return Ok(Some(response));
         }
 
@@ -181,7 +182,11 @@ impl ControlPlane {
     /// including its live online/last-seen state and its effective routed
     /// `AllowedIPs`/`PrimaryRoutes` (which the raw stored node does not
     /// carry).
-    pub(crate) fn peer_node(&self, stored: &DomainNode) -> Result<WireNode, ControlError> {
+    pub(crate) fn peer_node(
+        &self,
+        stored: &DomainNode,
+        client_version: u32,
+    ) -> Result<WireNode, ControlError> {
         let mut node = stored.to_proto();
         node.online = Some(self.is_node_online(stored.id));
         let routes = self.effective_approved_routes(stored)?;
@@ -193,6 +198,14 @@ impl ControlPlane {
             node.allowed_ips = Some(allowed);
             node.primary_routes = Self::non_address_routes(&routes, &stored.addresses);
         }
+        // Apply the AllowedIPs wire gate so the delta's peer snapshot agrees
+        // with the initial map for the same client version (capver >= 112
+        // omits `AllowedIPs` when it equals `Addresses`).
+        node.allowed_ips = Self::allowed_ips_for(
+            client_version,
+            &stored.addresses,
+            node.allowed_ips.as_deref(),
+        );
         Ok(node)
     }
 
@@ -202,6 +215,7 @@ impl ControlPlane {
         &self,
         self_node: &DomainNode,
         last_sent: &mut SessionPeers,
+        client_version: u32,
     ) -> Result<PeerDeltas, ControlError> {
         let compile_nodes = self.compile_nodes()?;
         let compiled = crabscale_policy::compile_policy(&self.config.policy, &compile_nodes);
@@ -230,7 +244,10 @@ impl ControlPlane {
             }
             next.insert(
                 stored.id as u64,
-                (self.peer_node(&stored)?, stored.key_expiry.clone()),
+                (
+                    self.peer_node(&stored, client_version)?,
+                    stored.key_expiry.clone(),
+                ),
             );
         }
 
@@ -311,11 +328,20 @@ impl ControlPlane {
 
     /// The self node's wire representation including the policy-derived
     /// `CapMap` and `PrimaryRoutes`, used when a policy change alters them.
-    fn self_node_proto(&self, self_node: &DomainNode) -> Result<Option<WireNode>, ControlError> {
+    fn self_node_proto(
+        &self,
+        self_node: &DomainNode,
+        client_version: u32,
+    ) -> Result<Option<WireNode>, ControlError> {
         let mut proto_node = self_node.to_proto();
         proto_node.primary_routes = Self::non_address_routes(
             &self.effective_approved_routes(self_node)?,
             &self_node.addresses,
+        );
+        proto_node.allowed_ips = Self::allowed_ips_for(
+            client_version,
+            &self_node.addresses,
+            proto_node.allowed_ips.as_deref(),
         );
         if !self.config.policy.node_attrs.is_empty() {
             let compile_nodes = self.compile_nodes()?;
