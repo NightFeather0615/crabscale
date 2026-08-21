@@ -124,6 +124,9 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2023-0071 (rsa via jsonwebtoken) has no patched release;
+          # tracked in deny.toml / audit.toml and SECURITY.md.
+          ignore: RUSTSEC-2023-0071
 
   deny:
     name: Dependencies deny (cargo deny)
