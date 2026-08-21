@@ -250,6 +250,49 @@ impl ControlRouter {
         Response::from_parts(parts, body.into_inner().unwrap_or_default())
     }
 
+    /// Handle an outer `GET /health` liveness check (M4-04, #27).
+    ///
+    /// Always returns `200` with `{"status":"ok"}` while the server is up.
+    /// It is deliberately independent of transient store or DNS state so
+    /// orchestrators can use it as a liveness probe.
+    pub fn handle_health(&self) -> Response<Bytes> {
+        let body = serde_json::json!({ "status": "ok" });
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Bytes::from(body.to_string()))
+            .expect("static response is valid")
+    }
+
+    /// Handle an outer `GET /version` request (M4-04, #27).
+    ///
+    /// Reports the server binary version and the advertised protocol
+    /// (capability) version so operators can pin compatibility.
+    pub fn handle_version(&self) -> Response<Bytes> {
+        let body = serde_json::json!({
+            "name": "crabscale-server",
+            "version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": self.control.protocol_version(),
+        });
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Bytes::from(body.to_string()))
+            .expect("static response is valid")
+    }
+
+    /// Handle an outer `GET /metrics` request (M4-04, #27).
+    ///
+    /// Renders every registered Prometheus text-format metric family,
+    /// including families that have not fired yet (they appear as `0`).
+    pub fn handle_metrics(&self) -> Response<Bytes> {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            .body(Bytes::from(crabscale_metrics::render_prometheus()))
+            .expect("static response is valid")
+    }
+
     /// Handle an outer `GET /register/{id}` approval page.
     ///
     /// When OIDC is configured, this endpoint begins the provider flow and

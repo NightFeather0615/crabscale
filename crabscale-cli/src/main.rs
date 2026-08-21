@@ -14,19 +14,27 @@
 //! crabscale ssh approve --auth-id <id>
 //! crabscale ssh reject --auth-id <id>
 //! crabscale ssh list
+//! crabscale backup --store <db> --output <file>   # zstd backup, no plaintext secrets
+//! crabscale restore --store <db> --input <file>
 //! ```
 
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 
 use clap::{Parser, Subcommand};
-use crabscale_control::{ControlConfig, ControlError, ControlPlane};
+use crabscale_control::{ControlConfig, ControlError, ControlPlane, SqliteStore};
 use crabscale_proto::NodeKey;
 
 /// Admin command-line client for crabscale.
 #[derive(Parser)]
-#[command(name = "crabscale", about = "crabscale admin CLI")]
+#[command(
+    name = "crabscale",
+    about = "crabscale admin CLI",
+    version = env!("CARGO_PKG_VERSION")
+)]
 struct Cli {
     /// Path to the SQLite database file used by the control server.
     #[arg(long, global = true)]
@@ -52,6 +60,19 @@ enum Command {
     Ssh {
         #[command(subcommand)]
         command: SshCommand,
+    },
+    /// Write a zstd-compressed backup of the store, excluding plaintext
+    /// secrets (M4-04, #27).
+    Backup {
+        /// Destination backup file.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Restore a store from a backup file produced by `backup` (M4-04, #27).
+    Restore {
+        /// Source backup file.
+        #[arg(long)]
+        input: PathBuf,
     },
 }
 
@@ -213,8 +234,91 @@ fn run_ssh_command(plane: &ControlPlane, command: SshCommand) -> Result<String, 
     }
 }
 
+/// Write a backup of the store at `cli.store` to `output`.
+///
+/// The store must be a SQLite file (`--store` is required); the backup
+/// excludes plaintext secrets by construction (see `crabscale_control::backup`).
+fn run_backup(cli: &Cli, output: &PathBuf) -> ExitCode {
+    let Some(path) = &cli.store else {
+        eprintln!("error: backup requires --store <path> (a SQLite database file)");
+        return ExitCode::FAILURE;
+    };
+    let store = match SqliteStore::open(path) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("error: failed to open store {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let file = match File::create(output) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("error: failed to create backup {}: {e}", output.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    match store.backup_to(BufWriter::new(file)) {
+        Ok(()) => {
+            println!("backup written to {} (format v1)", output.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: backup failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Restore the store at `cli.store` from backup file `input`.
+///
+/// The target database file may be new (it is created/migrated on open). All
+/// allowed tables are replaced by the backup contents inside one transaction.
+fn run_restore(cli: &Cli, input: &PathBuf) -> ExitCode {
+    let Some(path) = &cli.store else {
+        eprintln!("error: restore requires --store <path> (a SQLite database file)");
+        return ExitCode::FAILURE;
+    };
+    let store = match SqliteStore::open(path) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("error: failed to open store {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let file = match File::open(input) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("error: failed to open backup {}: {e}", input.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    match store.restore_from(BufReader::new(file)) {
+        Ok(()) => {
+            println!("restored {} into {}", input.display(), path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: restore failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Backup/restore operate directly on the SQLite file and never hold a
+    // ControlPlane, so handle them before constructing one.
+    match &cli.command {
+        Command::Backup { output } => {
+            return run_backup(&cli, output);
+        }
+        Command::Restore { input } => {
+            return run_restore(&cli, input);
+        }
+        _ => {}
+    }
+
     let plane = match &cli.store {
         Some(path) => match ControlPlane::open_sqlite(ControlConfig::default(), path) {
             Ok(plane) => plane,
@@ -230,6 +334,7 @@ fn main() -> ExitCode {
         Command::Auth { command } => run_auth_command(&plane, command),
         Command::Route { command } => run_route_command(&plane, command),
         Command::Ssh { command } => run_ssh_command(&plane, command),
+        Command::Backup { .. } | Command::Restore { .. } => unreachable!("handled above"),
     };
 
     match result {
@@ -569,5 +674,117 @@ mod tests {
         let plane = test_plane();
         let message = run_ssh_command(&plane, SshCommand::List).unwrap();
         assert!(message.contains("no SSH auth records"));
+    }
+
+    #[test]
+    fn parses_backup_and_restore_commands() {
+        let cli = Cli::try_parse_from([
+            "crabscale",
+            "--store",
+            "data.db",
+            "backup",
+            "--output",
+            "backup.csb",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Backup { output } => {
+                assert_eq!(output, PathBuf::from("backup.csb"));
+            }
+            _ => panic!("expected backup"),
+        }
+        assert_eq!(cli.store.as_deref(), Some(std::path::Path::new("data.db")));
+
+        let cli = Cli::try_parse_from([
+            "crabscale",
+            "--store",
+            "data.db",
+            "restore",
+            "--input",
+            "b.csb",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Restore { input } => {
+                assert_eq!(input, PathBuf::from("b.csb"));
+            }
+            _ => panic!("expected restore"),
+        }
+    }
+
+    #[test]
+    fn backup_restore_cli_round_trip_allows_relogin() {
+        // This exercises the exact SQLite operations the `backup`/`restore`
+        // CLI commands invoke (SqliteStore::backup_to / restore_from) and
+        // proves the restored database allows an existing node to log in
+        // again (M4-04 acceptance).
+        let db = db_path();
+        let backup = backup_path();
+        let restored = restored_path();
+
+        // Seed a store with an authorized node through the control plane.
+        let plane = ControlPlane::open_sqlite(ControlConfig::default(), &db).unwrap();
+        let request = RegisterRequest {
+            version: 130,
+            node_key: NodeKey::from_bytes([0x22; 32]),
+            auth: Some(RegisterAuth {
+                auth_key: "hskey-auth-test-secret".to_string(),
+            }),
+            hostinfo: Some(Hostinfo {
+                hostname: "node1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            plane
+                .register(MachineKey::from_bytes([0x11; 32]), request)
+                .machine_authorized
+        );
+
+        // Backup, then restore into a fresh store.
+        let source = SqliteStore::open(&db).unwrap();
+        let file = File::create(&backup).unwrap();
+        source.backup_to(BufWriter::new(file)).unwrap();
+
+        let target = SqliteStore::open(&restored).unwrap();
+        let file = File::open(&backup).unwrap();
+        target.restore_from(BufReader::new(file)).unwrap();
+
+        // The restored store still authorizes the same node (relogin).
+        let restored_plane =
+            ControlPlane::open_sqlite(ControlConfig::default(), &restored).unwrap();
+        let node = restored_plane
+            .node_by_key(&NodeKey::from_bytes([0x22; 32]))
+            .unwrap()
+            .expect("restored node exists");
+        assert!(node.machine_authorized);
+        assert_eq!(node.machine_key, MachineKey::from_bytes([0x11; 32]));
+
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(&restored);
+    }
+
+    fn unique_id() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn db_path() -> PathBuf {
+        std::env::temp_dir().join(format!("crabscale-cli-{}.db", unique_id()))
+    }
+
+    fn backup_path() -> PathBuf {
+        std::env::temp_dir().join(format!("crabscale-cli-{}.csb", unique_id()))
+    }
+
+    fn restored_path() -> PathBuf {
+        std::env::temp_dir().join(format!("crabscale-cli-restored-{}.db", unique_id()))
     }
 }

@@ -218,6 +218,7 @@ impl ControlPlane {
         client_version: u32,
     ) -> Result<PeerDeltas, ControlError> {
         let compile_nodes = self.compile_nodes()?;
+        crabscale_metrics::registry().policy_compiles_total.inc();
         let compiled = crabscale_policy::compile_policy(&self.config.policy, &compile_nodes);
         let visible = compiled
             .peer_visibility
@@ -302,6 +303,7 @@ impl ControlPlane {
         self_node: &DomainNode,
     ) -> Result<BTreeMap<String, Vec<FilterRule>>, ControlError> {
         let compile_nodes = self.compile_nodes()?;
+        crabscale_metrics::registry().policy_compiles_total.inc();
         let compiled = crabscale_policy::compile_policy(&self.config.policy, &compile_nodes);
         let base = compiled
             .node_filters
@@ -316,6 +318,7 @@ impl ControlPlane {
         self_node: &DomainNode,
     ) -> Result<Option<crabscale_proto::SshPolicy>, ControlError> {
         let compile_nodes = self.compile_nodes()?;
+        crabscale_metrics::registry().policy_compiles_total.inc();
         let ssh_compiled =
             crabscale_policy::compile_ssh_policy(&self.config.policy, &compile_nodes);
         Ok(crabscale_policy::build_wire_ssh_policy(

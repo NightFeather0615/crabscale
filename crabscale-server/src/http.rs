@@ -285,6 +285,24 @@ async fn handle_request(
         return Ok(response.map(Full::new));
     }
 
+    // `GET /health`, `GET /version`, and `GET /metrics` are the M4-04
+    // operational endpoints. Any non-GET method is rejected with 405.
+    if path == "/health" || path == "/version" || path == "/metrics" {
+        if method != http::Method::GET {
+            return Ok(plain_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
+        }
+        let response = match path.as_str() {
+            "/health" => router.handle_health(),
+            "/version" => router.handle_version(),
+            "/metrics" => router.handle_metrics(),
+            _ => unreachable!("guarded by the path check above"),
+        };
+        return Ok(response.map(Full::new));
+    }
+
     // `POST /ts2021` is rate-limited per client IP (M4-02). The limiter is
     // consulted before the upgrade request is parsed so a limited peer cannot
     // even feed the handshake parser. M4-03 uses the proxy-resolved client IP.

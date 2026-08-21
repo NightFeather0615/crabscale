@@ -20,7 +20,11 @@ use url::Url;
 
 /// crabscale control server.
 #[derive(Parser, Clone)]
-#[command(name = "crabscale-server", about = "crabscale control server")]
+#[command(
+    name = "crabscale-server",
+    about = "crabscale control server",
+    version = env!("CARGO_PKG_VERSION")
+)]
 struct Args {
     /// Path to a TOML config file. CLI flags and `CRABSCALE_*` env vars
     /// override it.

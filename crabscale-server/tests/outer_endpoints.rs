@@ -252,3 +252,55 @@ where
         }
     }
 }
+
+#[tokio::test]
+async fn health_version_and_metrics_serve_over_http() {
+    let (head, body) =
+        send_raw("GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "health head: {head}");
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], serde_json::json!("ok"));
+
+    let (head, body) =
+        send_raw("GET /version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "version head: {head}");
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["name"], serde_json::json!("crabscale-server"));
+    assert!(json["version"].is_string());
+    assert!(json["protocol_version"].is_number());
+
+    let (head, body) =
+        send_raw("GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "metrics head: {head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: text/plain"),
+        "metrics content-type: {head}"
+    );
+    let text = String::from_utf8_lossy(&body);
+    for family in [
+        "crabscale_sessions_opened_total",
+        "crabscale_sessions_closed_total",
+        "crabscale_sessions_active",
+        "crabscale_registrations_total",
+        "crabscale_policy_compiles_total",
+        "crabscale_derp_packets_total",
+        "crabscale_derp_packets_dropped_total",
+    ] {
+        assert!(
+            text.contains(&format!("# TYPE {family}")),
+            "missing {family}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn operational_endpoints_reject_non_get() {
+    for path in ["/health", "/version", "/metrics"] {
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let (head, _body) = send_raw(&req).await;
+        assert!(head.starts_with("HTTP/1.1 405"), "{path} head: {head}");
+    }
+}

@@ -6,6 +6,7 @@ members = [
     "crabscale-control",
     "crabscale-policy",
     "crabscale-derp",
+    "crabscale-metrics",
     "crabscale-server",
     "crabscale-cli",
     "crabscale-harness",

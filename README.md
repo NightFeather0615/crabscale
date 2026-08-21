@@ -58,6 +58,101 @@ and `/oidc/callback` validates the CSRF state and nonce, exchanges the code,
 verifies the ID token, upserts the user profile, and approves the pending
 registration through the same auth cache the `crabscale auth` CLI uses.
 
+## Quick start
+
+Run a local control server with a pre-auth key and a durable SQLite store:
+
+```sh
+cargo run --release -p crabscale-server --   --store ./data/crabscale.db   --key-file ./data/crabscale.key   --auth-key hskey-auth-my-secret   --server-url http://localhost:8080   --listen 127.0.0.1:8080
+```
+
+Point a Tailscale-compatible client at the server, register a node with the
+pre-auth key, and follow the interactive approval flow with the admin CLI:
+
+```sh
+# Register interactively, then approve from the approval URL's auth id:
+crabscale --store ./data/crabscale.db auth approve --auth-id <id> --user owner@example.com
+
+# List and approve advertised subnet/exit routes:
+crabscale --store ./data/crabscale.db route list --node nodekey:<key>
+```
+
+The full configuration reference (TOML file, `CRABSCALE_*` environment
+overrides, TLS, trusted proxies, containers) is in the
+[Deployment](#deployment-tls-reverse-proxy-containers) section and the wiki
+[Deployment](https://github.com/NightFeather0615/crabscale/wiki/Deployment)
+page. The exact list of supported and unsupported behaviors for v0.1 is in the
+[v0.1 gap analysis](docs/v0.1-gap.md) and the wiki
+[Gap-Analysis](https://github.com/NightFeather0615/crabscale/wiki/Gap-Analysis)
+page.
+
+## Operations (M4-04)
+
+### Backup and restore
+
+The `crabscale` CLI snapshots the SQLite store and restores it, excluding
+plaintext secrets by construction:
+
+```sh
+# Write a zstd-compressed backup of the store's allowed (non-secret) tables.
+crabscale --store /var/lib/crabscale/data/crabscale.db   backup --output /backups/crabscale-2026-08-20.csb
+
+# Restore into a fresh or empty database file. Existing nodes can log in again
+# after a restore.
+crabscale --store /var/lib/crabscale/data/restored.db   restore --input /backups/crabscale-2026-08-20.csb
+```
+
+Backups contain an explicit allowlist of domain tables (users, logins, nodes,
+pre-auth keys with their salted hashes, policies, sessions, pending
+registrations, SSH approvals) and never serialize plaintext secret material.
+The format is versioned (`crabscale-backup/v1`) and restore rejects unknown
+tables or format versions. See the wiki
+[Operations](https://github.com/NightFeather0615/crabscale/wiki/Operations)
+page for the full contract.
+
+### Health, version, and metrics
+
+The server exposes three operational HTTP endpoints (over the same listener as
+`/key`):
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Liveness probe; returns `200 {"status":"ok"}`. |
+| `GET /version` | `{"name":"crabscale-server","version":"0.1.0","protocol_version":130}`. |
+| `GET /metrics` | Prometheus text exposition of operational metrics. |
+
+```sh
+curl -s http://127.0.0.1:8080/health
+curl -s http://127.0.0.1:8080/version
+curl -s http://127.0.0.1:8080/metrics
+```
+
+Metrics are rendered in the Prometheus text format with `text/plain;
+version=0.0.4` content type. Every family appears even before it has fired
+(with a `0` sample):
+
+- `crabscale_sessions_active` (gauge), `crabscale_sessions_opened_total`,
+  `crabscale_sessions_closed_total`
+- `crabscale_registrations_total`
+- `crabscale_policy_compiles_total`
+- `crabscale_derp_packets_total`, `crabscale_derp_packets_dropped_total`
+
+Point a Prometheus scraper at `GET /metrics`, or trigger a plain
+`curl http://127.0.0.1:8080/metrics` and confirm the families above are
+present (this is the documented local test of the endpoint).
+
+## Compatibility and unsupported features
+
+- Capability/protocol compatibility is governed by `MIN_SUPPORTED_CAPVER`
+  (113) and the [capability matrix](https://github.com/NightFeather0615/crabscale/wiki/Spec-Compatibility);
+  CI runs `scripts/capability-matrix.sh`.
+- The scale the server is validated against is in
+  [Supported scale](https://github.com/NightFeather0615/crabscale/wiki/Supported-Scale); anything beyond is
+  unsupported for v0.1.
+- Unsupported / out-of-scope v0.1 features (multi-tenant, DERP mesh, structured
+  JSON logs, a production load guarantee) are itemized in the
+  [v0.1 gap analysis](docs/v0.1-gap.md).
+
 ## Deployment (TLS, reverse proxy, containers)
 
 M4-03 (#26) makes `crabscale-server` deployable behind standard

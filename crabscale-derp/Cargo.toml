@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+crabscale-metrics = { path = "../crabscale-metrics" }
 base64 = "0.22"
 bytes = "1"
 crypto_box = { version = "0.9", features = ["std", "getrandom"] }

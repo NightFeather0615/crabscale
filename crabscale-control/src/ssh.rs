@@ -210,6 +210,7 @@ impl ControlPlane {
         local_user: &str,
     ) -> Result<SshAction, ControlError> {
         let compile_nodes = self.compile_nodes()?;
+        crabscale_metrics::registry().policy_compiles_total.inc();
         let ssh_policy = crabscale_policy::compile_ssh_policy(&self.config.policy, &compile_nodes);
         let rule = crabscale_policy::first_matching_ssh_rule(
             &ssh_policy,
