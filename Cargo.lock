@@ -324,6 +324,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabscale-fuzz"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crabscale-derp",
+ "crabscale-proto",
+ "crabscale-transport",
+ "serde_json",
+]
+
+[[package]]
 name = "crabscale-harness"
 version = "0.1.0"
 dependencies = [

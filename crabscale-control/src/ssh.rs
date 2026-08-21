@@ -23,6 +23,10 @@ use crate::{ControlError, ControlPlane, time};
 /// Default time-to-live for a pending SSH approval before it expires.
 pub const DEFAULT_SSH_AUTH_TTL_SECONDS: i64 = 15 * 60;
 
+/// Default maximum number of pending SSH auth records kept before the
+/// oldest are pruned (M4-02: bound the SSH cache with TTL and a cap).
+pub const DEFAULT_SSH_AUTH_LIMIT: usize = 1024;
+
 /// Default maximum time a followup request holds while waiting for a verdict
 /// before the client is told to re-fetch.
 pub const DEFAULT_SSH_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -228,6 +232,8 @@ impl ControlPlane {
                 )? {
                     return Ok(accept_action());
                 }
+                // Keep the durable SSH auth cache bounded (M4-02).
+                self.prune_ssh_auths(DEFAULT_SSH_AUTH_LIMIT)?;
                 let auth_id = crate::generate_secret();
                 let entry = SshAuth {
                     auth_id: auth_id.clone(),
@@ -401,6 +407,38 @@ impl ControlPlane {
             .save_ssh_auth(&entry)
             .map_err(|e| ControlError::Store(e.to_string()))?;
         Ok(true)
+    }
+
+    /// Bound the SSH auth cache: delete expired records, then delete the
+    /// oldest pending records until at most `limit` remain (M4-02).
+    fn prune_ssh_auths(&self, limit: usize) -> Result<(), ControlError> {
+        let now = time::now_rfc3339();
+        let entries = self
+            .store
+            .list_ssh_auths()
+            .map_err(|e| ControlError::Store(e.to_string()))?;
+        let mut remaining = Vec::new();
+        for entry in entries {
+            if time::is_past(&entry.expires_at, &now) {
+                self.store
+                    .delete_ssh_auth(&entry.auth_id)
+                    .map_err(|e| ControlError::Store(e.to_string()))?;
+            } else {
+                remaining.push(entry);
+            }
+        }
+        if remaining.len() > limit {
+            // RFC 3339 timestamps sort chronologically, so the oldest
+            // records are at the front after sorting.
+            remaining.sort_by_key(|e| e.created_at.clone());
+            let overflow = remaining.len() - limit;
+            for entry in remaining.into_iter().take(overflow) {
+                self.store
+                    .delete_ssh_auth(&entry.auth_id)
+                    .map_err(|e| ControlError::Store(e.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     /// Fetch an SSH auth record from the durable store (the source of truth).
@@ -734,5 +772,65 @@ mod tests {
             .unwrap();
         assert!(action.accept);
         assert!(action.hold_and_delegate.is_empty());
+    }
+
+    #[test]
+    fn ssh_auth_cache_is_bounded_by_prune() {
+        let plane = test_plane();
+        // Insert 20 pending auth records directly into the durable store.
+        for i in 0..20u32 {
+            let entry = SshAuth {
+                auth_id: format!("auth-{i}"),
+                src_node_id: 1,
+                dst_node_id: 2,
+                ssh_user: "root".to_string(),
+                local_user: "root".to_string(),
+                machine_key: MachineKey::from_bytes([0x11; 32]),
+                created_at: format!("2026-08-20T00:{:02}:00Z", i % 60),
+                expires_at: "2926-01-01T00:00:00Z".to_string(),
+                verdict: SshVerdict::Pending,
+            };
+            plane.store.save_ssh_auth(&entry).unwrap();
+        }
+
+        plane.prune_ssh_auths(5).unwrap();
+        let remaining = plane.list_ssh_auths().unwrap();
+        assert_eq!(
+            remaining.len(),
+            5,
+            "prune must cap the SSH auth cache to the configured limit"
+        );
+        // The five oldest (created first) are deleted.
+        for kept in remaining {
+            assert!(
+                kept.auth_id.starts_with("auth-1"),
+                "only the newest records survive: {} vs {}",
+                kept.auth_id,
+                "first records are pruned",
+            );
+        }
+    }
+
+    #[test]
+    fn prune_removes_expired_ssh_auths() {
+        let plane = test_plane();
+        let expired = SshAuth {
+            auth_id: "expired-1".to_string(),
+            src_node_id: 1,
+            dst_node_id: 2,
+            ssh_user: "root".to_string(),
+            local_user: "root".to_string(),
+            machine_key: MachineKey::from_bytes([0x11; 32]),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            expires_at: "2000-01-01T00:00:00Z".to_string(),
+            verdict: SshVerdict::Pending,
+        };
+        plane.store.save_ssh_auth(&expired).unwrap();
+        plane.prune_ssh_auths(5).unwrap();
+        assert_eq!(
+            plane.list_ssh_auths().unwrap().len(),
+            0,
+            "expired auth records are deleted by the prune"
+        );
     }
 }

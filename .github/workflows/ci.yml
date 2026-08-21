@@ -107,3 +107,34 @@ jobs:
         with:
           name: capability-matrix-report
           path: capability-matrix.md
+
+  audit:
+    name: Dependencies audit (cargo audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: Dependencies deny (cargo deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  fuzz-smoke:
+    name: Fuzz smoke (M4-02)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Run M4-02 fuzz smoke
+        run: ./scripts/fuzz-smoke.sh

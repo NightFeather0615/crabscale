@@ -604,3 +604,102 @@ async fn dns_reload_pushes_delta_to_live_map_session() {
     drop(server_task);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn register_rate_limit_returns_429_with_retry_after() {
+    let server = NoiseResponder::random();
+    let machine_key = MachineKey::from_bytes(server.public_key().to_bytes());
+    let router =
+        ControlRouter::new(machine_key).with_rate_limits(crabscale_server::RateLimitConfig {
+            register_per_min: 60,
+            register_burst: 1,
+            ..Default::default()
+        });
+    let (mut client, server_task) = connect_client(&server, router).await;
+
+    let reg = serde_json::json!({
+        "Version": 130,
+        "NodeKey": NodeKey::from_bytes([0x55; 32]).to_string(),
+        "Auth": { "AuthKey": "hskey-auth-test-secret" },
+        "Hostinfo": { "Hostname": "node1" }
+    });
+    let body_bytes = serde_json::to_vec(&reg).unwrap();
+
+    // The first register consumes the single token for this machine key.
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/machine/register")
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream
+        .send_data(body_bytes.clone().into(), true)
+        .unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 200);
+
+    // A second register on the same machine key is rate limited BEFORE the
+    // body is parsed: 429 with a numeric Retry-After.
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/machine/register")
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream.send_data(body_bytes.into(), true).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 429);
+    let retry: u64 = response
+        .headers()
+        .get("retry-after")
+        .expect("Retry-After header")
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("Retry-After is a number");
+    assert!(retry >= 1, "Retry-After must be at least one second");
+
+    drop(server_task);
+}
+
+#[tokio::test]
+async fn invalid_register_does_not_echo_auth_secret() {
+    let server = NoiseResponder::random();
+    let machine_key = MachineKey::from_bytes(server.public_key().to_bytes());
+    let router = ControlRouter::new(machine_key);
+    let (mut client, server_task) = connect_client(&server, router).await;
+
+    let guessed = "hskey-auth-attacker-not-a-real-key-secret-value";
+    let reg = serde_json::json!({
+        "Version": 130,
+        "NodeKey": NodeKey::from_bytes([0x66; 32]).to_string(),
+        "Auth": { "AuthKey": guessed },
+        "Hostinfo": { "Hostname": "node1" }
+    });
+    let body_bytes = serde_json::to_vec(&reg).unwrap();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/machine/register")
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream.send_data(body_bytes.into(), true).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "a bad key starts an interactive flow"
+    );
+    let mut body = response.into_body();
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    let text = String::from_utf8_lossy(&buf);
+    assert!(
+        !text.contains(guessed),
+        "error body must not echo the auth secret"
+    );
+
+    drop(server_task);
+}

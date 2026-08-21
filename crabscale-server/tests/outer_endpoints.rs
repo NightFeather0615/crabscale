@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use crabscale_control::{ControlConfig, ControlPlane};
 use crabscale_proto::{Hostinfo, MachineKey, NodeKey, RegisterAuth, RegisterRequest};
-use crabscale_server::{BootstrapDns, ControlRouter, ServerKey, serve_on_addr};
+use crabscale_server::{BootstrapDns, ControlRouter, RateLimitConfig, ServerKey, serve_on_addr};
 use crabscale_transport::NoiseResponder;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -148,6 +148,60 @@ async fn bootstrap_dns_unconfigured_returns_404() {
         send_raw("GET /bootstrap-dns HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .await;
     assert!(head.starts_with("HTTP/1.1 404"), "head: {head}");
+}
+
+#[tokio::test]
+async fn ts2021_rate_limit_returns_429_with_retry_after() {
+    let router = ControlRouter::new(test_key()).with_rate_limits(RateLimitConfig {
+        ts2021_per_min: 60,
+        ts2021_burst: 1,
+        ..Default::default()
+    });
+    let key = server_key();
+    let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (addr, handle) = serve_on_addr(bind, router, key).await.unwrap();
+
+    // The first request from a client IP consumes its single token. The
+    // limiter runs before the upgrade request is parsed, so a malformed
+    // request is a 400, not a 429.
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"POST /ts2021 HTTP/1.1
+Host: localhost
+Connection: close
+
+",
+        )
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+    let (head, _body) = read_http_response(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 400"), "first head: {head}");
+
+    // A second request from the same IP is rate limited with 429 and a
+    // numeric Retry-After header.
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"POST /ts2021 HTTP/1.1
+Host: localhost
+Connection: close
+
+",
+        )
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+    let (head, _body) = read_http_response(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 429"), "limited head: {head}");
+    let lower = head.to_ascii_lowercase();
+    assert!(
+        lower.contains("retry-after:"),
+        "Retry-After header must be present: {head}"
+    );
+
+    handle.shutdown();
 }
 
 async fn write_post(stream: &mut tokio::net::TcpStream, path: &str, body: &str) {

@@ -45,7 +45,10 @@ pub use preauth::{
     AUTH_KEY_PREFIX, format_auth_key, generate_secret, hash_secret, parse_auth_key, verify_secret,
 };
 pub use session::{DEFAULT_RECONNECT_GRACE_SECONDS, SessionEvent, SessionRegistry};
-pub use ssh::{DEFAULT_SSH_AUTH_TTL_SECONDS, DEFAULT_SSH_WAIT_TIMEOUT, SshAuth, SshVerdict};
+pub use ssh::{
+    DEFAULT_SSH_AUTH_LIMIT, DEFAULT_SSH_AUTH_TTL_SECONDS, DEFAULT_SSH_WAIT_TIMEOUT, SshAuth,
+    SshVerdict,
+};
 pub use store::{SqliteStore, Store, StoreError};
 
 /// Default IPv4 tailnet prefix.

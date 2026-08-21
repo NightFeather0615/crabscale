@@ -24,10 +24,10 @@ pub use error::TransportError;
 pub use http2::{MAX_INNER_BODY_LEN, read_body_limited, serve_http2};
 pub use loopback::loopback_handshake;
 pub use messages::{
-    AEAD_TAG_LEN, INIT_MESSAGE_LEN, InitMessage, MAX_EARLY_PAYLOAD_LEN, MAX_RECORD_FRAME_SIZE,
-    MAX_RECORD_PLAINTEXT, MSG_TYPE_ERROR, MSG_TYPE_INIT, MSG_TYPE_RECORD, MSG_TYPE_RESPONSE,
-    RECORD_HEADER_LEN, RESPONSE_MESSAGE_LEN, ResponseMessage, parse_init_message,
-    parse_response_message, write_response_message,
+    AEAD_TAG_LEN, HANDSHAKE_TIMEOUT, INIT_MESSAGE_LEN, InitMessage, MAX_EARLY_PAYLOAD_LEN,
+    MAX_RECORD_FRAME_SIZE, MAX_RECORD_PLAINTEXT, MSG_TYPE_ERROR, MSG_TYPE_INIT, MSG_TYPE_RECORD,
+    MSG_TYPE_RESPONSE, RECORD_HEADER_LEN, RESPONSE_MESSAGE_LEN, ResponseMessage,
+    parse_init_message, parse_response_message, write_response_message,
 };
 pub use noise::{NoiseInitiator, NoiseResponder, PROTOCOL_NAME, ResponderOutput, Role, Session};
 pub use record::{RecordCipher, RecordDecoder};

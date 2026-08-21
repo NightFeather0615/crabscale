@@ -10,8 +10,9 @@ use clap::Parser;
 use crabscale_control::{ControlConfig, ControlPlane, DnsSettings};
 use crabscale_proto::{DerpMap, DerpNode, DerpRegion};
 use crabscale_server::{
-    BootstrapDns, ControlRouter, DEFAULT_KEY_FILE, OidcClient, OidcConfig,
-    load_or_create_machine_key, serve_on_addr, serve_stun,
+    BootstrapDns, ControlRouter, DEFAULT_KEY_FILE, DEFAULT_MAX_RATE_KEYS, DEFAULT_REGISTER_BURST,
+    DEFAULT_REGISTER_RATE_PER_MIN, DEFAULT_TS2021_BURST, DEFAULT_TS2021_RATE_PER_MIN, OidcClient,
+    OidcConfig, RateLimitConfig, load_or_create_machine_key, serve_on_addr, serve_stun,
 };
 
 /// Default address the outer HTTP server listens on.
@@ -115,6 +116,22 @@ struct Args {
     /// Address the STUN UDP listener binds to (combined with `--stun-port`).
     #[arg(long, default_value = "0.0.0.0")]
     stun_bind: std::net::IpAddr,
+
+    /// Maximum `/ts2021` upgrade requests per minute per client IP; 0 disables.
+    #[arg(long, default_value_t = DEFAULT_TS2021_RATE_PER_MIN)]
+    ts2021_rate_per_min: u64,
+
+    /// Token-bucket burst (capacity) for `/ts2021` upgrades per client IP.
+    #[arg(long, default_value_t = DEFAULT_TS2021_BURST)]
+    ts2021_burst: u32,
+
+    /// Maximum `/machine/register` requests per minute per machine key; 0 disables.
+    #[arg(long, default_value_t = DEFAULT_REGISTER_RATE_PER_MIN)]
+    register_rate_per_min: u64,
+
+    /// Token-bucket burst (capacity) for `/machine/register` per machine key.
+    #[arg(long, default_value_t = DEFAULT_REGISTER_BURST)]
+    register_burst: u32,
 
     /// Comma-separated hostnames to resolve and publish at `/bootstrap-dns`.
     #[arg(long)]
@@ -281,6 +298,15 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         router = router.with_bootstrap_dns(dns);
     }
 
+    // Rate limit `/ts2021` (per client IP) and `/machine/register` (per
+    // Noise machine key) with the configured token buckets (M4-02).
+    router = router.with_rate_limits(RateLimitConfig {
+        ts2021_per_min: args.ts2021_rate_per_min,
+        ts2021_burst: args.ts2021_burst,
+        register_per_min: args.register_rate_per_min,
+        register_burst: args.register_burst,
+        max_entries: DEFAULT_MAX_RATE_KEYS,
+    });
     router.spawn_reaper();
 
     let (addr, handle) = serve_on_addr(args.listen, router, server_key.clone()).await?;
@@ -429,6 +455,33 @@ mod tests {
             Args::try_parse_from(["crabscale-server", "--bootstrap-dns-names", "a.com,b.com"])
                 .unwrap();
         assert_eq!(args.bootstrap_dns_names.as_deref(), Some("a.com,b.com"));
+    }
+
+    #[test]
+    fn parses_rate_limit_options() {
+        let args = Args::try_parse_from([
+            "crabscale-server",
+            "--ts2021-rate-per-min",
+            "120",
+            "--ts2021-burst",
+            "20",
+            "--register-rate-per-min",
+            "10",
+            "--register-burst",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(args.ts2021_rate_per_min, 120);
+        assert_eq!(args.ts2021_burst, 20);
+        assert_eq!(args.register_rate_per_min, 10);
+        assert_eq!(args.register_burst, 2);
+
+        // Defaults come from the shared constants.
+        let args = Args::try_parse_from(["crabscale-server"]).unwrap();
+        assert_eq!(args.ts2021_rate_per_min, DEFAULT_TS2021_RATE_PER_MIN);
+        assert_eq!(args.ts2021_burst, DEFAULT_TS2021_BURST);
+        assert_eq!(args.register_rate_per_min, DEFAULT_REGISTER_RATE_PER_MIN);
+        assert_eq!(args.register_burst, DEFAULT_REGISTER_BURST);
     }
 
     #[test]

@@ -7,6 +7,11 @@ use crate::error::TransportError;
 /// Length of the client-to-server init message.
 pub const INIT_MESSAGE_LEN: usize = 101;
 
+/// Maximum time allowed to complete the TS2021 Noise handshake
+/// (Spec-Transport section 3). The server bounds the upgrade/response
+/// exchange with this timeout and closes the connection on expiry.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Length of the server-to-client response message.
 pub const RESPONSE_MESSAGE_LEN: usize = 51;
 
