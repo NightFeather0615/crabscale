@@ -1,0 +1,16 @@
+# Caddy reverse proxy for crabscale-server (M4-03, #26).
+#
+# Preserves the /ts2021 and /derp HTTP upgrades by forwarding connection
+# headers untouched, sets X-Forwarded-For for trusted-proxy client IP
+# resolution, and terminates TLS for /key.
+#
+# Replace control.example.com with your domain and move the endpoint where
+# the proxy meets the container (the Compose service exposes 8080 internally).
+
+control.example.com {
+    # Forward the Upgrade/Connection headers that /ts2021 and /derp need.
+    reverse_proxy crabscale:8080 {
+        # Caddy appends client IP as X-Forwarded-For automatically.
+        header_up X-Forwarded-Proto https
+    }
+}

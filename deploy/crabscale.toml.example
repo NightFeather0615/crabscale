@@ -1,0 +1,84 @@
+# crabscale-server configuration example (M4-03, #26).
+#
+# Copy this file to `crabscale.toml` and pass it with `--config crabscale.toml`,
+# or mount it at /var/lib/crabscale/crabscale.toml in the container.
+#
+# Precedence: CLI flags > CRABSCALE_* environment variables > this file > defaults.
+# Environment names are the dotted field names upper-cased with CRABSCALE_
+# (e.g. `key_file` -> `CRABSCALE_KEY_FILE`, `trusted_proxies` ->
+# `CRABSCALE_TRUSTED_PROXIES`). Lists take comma-separated values, booleans
+# `true`/`false`.
+
+# --- listener ---
+# Address the outer HTTP(S) server binds to.
+listen = "0.0.0.0:8080"
+
+# Optional plain-HTTP listener that 301-redirects to HTTPS.
+# listen_http = "0.0.0.0:80"
+
+# Run the HTTP->HTTPS redirect listener when TLS is enabled (default true).
+# http_redirect = true
+
+# --- state ---
+# Machine key file (persisted; mount this path as a volume for restart
+# persistence). It is created with 0600 permissions on first boot.
+key_file = "/var/lib/crabscale/data/crabscale.key"
+
+# SQLite database; omit for an in-memory (ephemeral) store.
+store = "/var/lib/crabscale/data/crabscale.db"
+
+# --- identity ---
+auth_key = "hskey-auth-change-me"
+tailnet_domain = "tailnet.example"
+server_url = "https://control.example.com"
+
+# --- TLS (rustls; M4-03) ---
+# mode: "off" | "files" | "acme"
+[tls]
+mode = "off"
+# mode = "files"
+# cert_file = "/var/lib/crabscale/data/cert.pem"
+# key_file  = "/var/lib/crabscale/data/key.pem"
+# mode = "acme"
+# acme_domains = ["control.example.com"]
+# acme_contact = ["admin@example.com"]
+# acme_cache_dir = "/var/lib/crabscale/data/acme"
+# acme_directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+
+# --- reverse proxy ---
+# CIDRs whose X-Forwarded-For / X-Real-IP values are trusted for client-IP
+# resolution and /ts2021 rate limiting. Leave empty when the server is exposed
+# directly (nothing is trusted).
+trusted_proxies = ["127.0.0.1/32", "10.0.0.0/8", "172.16.0.0/12"]
+
+# --- DNS (MagicDNS) ---
+magic_dns = true
+dns_search_domains = ["corp.example"]
+dns_split = ["corp.example.=10.0.0.53"]
+# dns_extra_records = "/var/lib/crabscale/data/records.json"
+
+# --- embedded DERP relay ---
+derp_region_id = 1
+derp_region_code = "crab"
+derp_region_name = "Crabscale"
+derp_node_name = "crab-1"
+derp_hostname = "derp.example.com"
+derp_port = 443
+stun_port = 3478
+stun_bind = "0.0.0.0"
+
+# --- OIDC (interactive registration) ---
+# oidc_issuer = "https://issuer.example"
+# oidc_client_id = "client-1"
+# oidc_client_secret = "secret-1"
+# oidc_redirect_uri = "https://control.example.com/oidc/callback"
+oidc_scope = "openid profile email"
+
+# --- rate limits (M4-02) ---
+ts2021_rate_per_min = 60
+ts2021_burst = 10
+register_rate_per_min = 30
+register_burst = 5
+
+# --- misc ---
+bootstrap_dns_names = "derp.example.com"

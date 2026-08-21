@@ -1,0 +1,13 @@
+# Build context pruning for `docker build` (M4-03, #26).
+.git
+target
+**/*.rs.bk
+**/crabscale.key
+**/*.db
+**/*.db-journal
+deploy/crabscale.toml
+# Vendor spec repositories kept next to the workspace for reference only.
+headscale
+tailscale
+tailscale-rs
+crabscale.wiki
