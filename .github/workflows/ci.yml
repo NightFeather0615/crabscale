@@ -10,13 +10,15 @@ env:
 
 # Cargo caching uses Swatinem/rust-cache@v2, which keys on the runner OS,
 # Cargo.lock, and the active Rust toolchain. A toolchain or dependency bump
-# therefore produces a new cache key instead of reusing stale artifacts.
+# therefore produces a new cache key instead of reusing stale artifacts. The
+# cache also covers ~/.cargo/bin so cargo-installed tools such as cargo-audit
+# and cargo-deny are reused across runs of the audit/deny jobs.
 jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -29,7 +31,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -42,7 +44,7 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -53,7 +55,7 @@ jobs:
     name: Smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -64,14 +66,14 @@ jobs:
     name: Performance smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
       - name: Run M3-04 performance smoke
         run: ./scripts/perf-smoke.sh --report perf-smoke-report.md
       - name: Upload performance smoke report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: perf-smoke-report
           path: perf-smoke-report.md
@@ -80,14 +82,14 @@ jobs:
     name: Client compatibility harness
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
       - name: Run M1-07 end-to-end harness
         run: ./scripts/harness.sh --report harness-report.md
       - name: Upload harness report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: harness-report
           path: harness-report.md
@@ -96,14 +98,14 @@ jobs:
     name: Capability version matrix
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
       - name: Run M4-01 capability version matrix
         run: ./scripts/capability-matrix.sh --report capability-matrix.md
       - name: Upload capability matrix report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: capability-matrix-report
           path: capability-matrix.md
@@ -115,7 +117,9 @@ jobs:
       contents: read
       checks: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - name: Cache Cargo registry, build artifacts, and cargo-audit
+        uses: Swatinem/rust-cache@v2
       - name: Run cargo audit
         uses: rustsec/audit-check@v2
         with:
@@ -125,17 +129,21 @@ jobs:
     name: Dependencies deny (cargo deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Run cargo deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@v5
+      - name: Cache Cargo registry, build artifacts, and cargo-deny
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
         with:
-          command: check advisories bans sources
+          tool: cargo-deny
+      - name: Run cargo deny
+        run: cargo deny --all-features check advisories bans sources
 
   fuzz-smoke:
     name: Fuzz smoke (M4-02)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
