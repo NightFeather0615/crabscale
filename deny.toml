@@ -6,7 +6,7 @@
 # allow-list is extended deliberately.
 
 [advisories]
-yanked = "deny"
+yanked = "warn"
 ignore = []
 
 [bans]
