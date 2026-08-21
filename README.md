@@ -22,6 +22,7 @@ This repository is a Cargo workspace. It contains the following crates:
 | `crabscale-derp` | library | DERP frames, relay state, STUN |
 | `crabscale-server` | binary | Server wiring, config, TLS, HTTP routers |
 | `crabscale-cli` | binary | Admin commands |
+| `crabscale-fuzz` | binary | Fuzz smoke targets for JSON, Noise, and DERP parsers |
 
 ## DNS configuration
 
@@ -56,6 +57,32 @@ startup. Once enabled, the `/register/{id}` page redirects to the provider,
 and `/oidc/callback` validates the CSRF state and nonce, exchanges the code,
 verifies the ID token, upserts the user profile, and approves the pending
 registration through the same auth cache the `crabscale auth` CLI uses.
+
+## Security hardening
+
+Public-deployment attack surface is reduced by (see the wiki
+[Security](https://github.com/NightFeather0615/crabscale/wiki/Security) page
+and `SECURITY.md`):
+
+- All documented wire size limits are enforced at the byte layer before JSON
+  parsing; the TS2021 Noise handshake is bounded by a 10-second timeout.
+- `POST /ts2021` (per client IP) and `POST /machine/register` (per Noise
+  machine key) are rate limited with `429` + `Retry-After`; configure with
+  `--ts2021-rate-per-min`, `--ts2021-burst`, `--register-rate-per-min`, and
+  `--register-burst`.
+- Registration and SSH approval caches are bounded (TTL + cap), and secrets
+  are never logged or echoed in error bodies.
+- `cargo audit`, `cargo deny`, and the `fuzz-smoke` CI jobs gate dependency
+  and parser robustness:
+
+```sh
+# Dependency audits (install cargo-audit / cargo-deny first)
+cargo audit
+cargo deny check
+
+# Fuzz smoke over corpus + random seeds
+./scripts/fuzz-smoke.sh
+```
 
 ## Development
 

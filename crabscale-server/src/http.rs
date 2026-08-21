@@ -9,13 +9,17 @@
 //! The server uses `tokio::net` (and therefore `mio`) plus `hyper` for HTTP/1.1
 //! parsing instead of a hand-rolled parser. See the wiki `Architecture` page
 //! for the decision and the limitations that no longer apply.
+//!
+//! Since M4-02 (security hardening), `POST /ts2021` is rate-limited per client
+//! IP with HTTP `429` and `Retry-After`, and the Noise handshake is bounded by
+//! the documented 10-second handshake timeout.
 
 use std::io;
 use std::net::SocketAddr;
 
 use bytes::Bytes;
 use crabscale_transport::{
-    HANDSHAKE_HEADER, NoiseStream, UPGRADE_HEADER_VALUE, parse_init_message,
+    HANDSHAKE_HEADER, HANDSHAKE_TIMEOUT, NoiseStream, UPGRADE_HEADER_VALUE, parse_init_message,
     validate_native_upgrade,
 };
 use http::{HeaderValue, Request, Response, StatusCode};
@@ -28,7 +32,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::key::ServerKey;
-use crate::router::{ControlRouter, VERIFY_MAX_BODY_LEN, serve_control};
+use crate::router::{ControlRouter, VERIFY_MAX_BODY_LEN, serve_control_as};
 
 /// A handle to a running outer control server, used to request shutdown.
 #[derive(Clone)]
@@ -75,11 +79,11 @@ pub async fn serve(
                 return Ok(());
             }
             res = listener.accept() => {
-                let (stream, _) = res?;
+                let (stream, peer_addr) = res?;
                 let router = router.clone();
                 let server_key = server_key.clone();
                 tokio::spawn(async move {
-                    let _ = handle_connection(stream, router, server_key).await;
+                    let _ = handle_connection(stream, peer_addr, router, server_key).await;
                 });
             }
         }
@@ -88,10 +92,12 @@ pub async fn serve(
 
 async fn handle_connection(
     stream: TcpStream,
+    peer_addr: SocketAddr,
     router: ControlRouter,
     server_key: ServerKey,
 ) -> io::Result<()> {
-    let service = service_fn(move |req| handle_request(req, router.clone(), server_key.clone()));
+    let service =
+        service_fn(move |req| handle_request(req, peer_addr, router.clone(), server_key.clone()));
     http1::Builder::new()
         .serve_connection(TokioIo::new(stream), service)
         .with_upgrades()
@@ -101,6 +107,7 @@ async fn handle_connection(
 
 async fn handle_request(
     req: Request<Incoming>,
+    peer_addr: SocketAddr,
     router: ControlRouter,
     server_key: ServerKey,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -113,7 +120,13 @@ async fn handle_request(
         return Ok(response.map(Full::new));
     }
 
+    // `POST /ts2021` is rate-limited per client IP (M4-02). The limiter is
+    // consulted before the upgrade request is parsed so a limited peer cannot
+    // even feed the handshake parser.
     if method == http::Method::POST && path == "/ts2021" {
+        if let Some(retry_after) = router.check_ts2021_rate(peer_addr.ip()) {
+            return Ok(rate_limited_response(retry_after));
+        }
         return Ok(handle_ts2021(req, router, server_key).await);
     }
 
@@ -246,31 +259,55 @@ async fn handle_ts2021(
     );
 
     tokio::spawn(async move {
-        match hyper::upgrade::on(req).await {
-            Ok(upgraded) => {
-                let mut upgraded = TokioIo::new(upgraded);
-                if let Err(e) = upgraded.write_all(&output.response).await {
-                    eprintln!("failed to write Noise response: {e}");
-                    return;
-                }
-                if let Err(e) = upgraded.flush().await {
-                    eprintln!("failed to flush Noise response: {e}");
-                    return;
-                }
-                let noise_stream = NoiseStream::new(
-                    upgraded,
-                    output.session.initiator_to_responder,
-                    output.session.responder_to_initiator,
-                );
-                let _ = serve_control(noise_stream, router).await;
+        // Bound ONLY the handshake (the 101 upgrade wait plus the Noise
+        // response write) by the documented TS2021 handshake timeout. The
+        // inner control session (`serve_control_as`) runs after the timeout
+        // future completes, so streaming map sessions are never capped by
+        // the handshake timeout (Spec-Transport section 3).
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, ts2021_handshake(req, output)).await {
+            Ok(Ok((noise_stream, peer_machine_key))) => {
+                let _ = serve_control_as(noise_stream, router, peer_machine_key).await;
             }
-            Err(e) => {
-                eprintln!("upgrade failed: {e}");
+            Ok(Err(e)) => {
+                eprintln!("ts2021 handshake failed: {e}");
+            }
+            Err(_) => {
+                eprintln!("ts2021 handshake timed out");
             }
         }
     });
 
     res
+}
+
+/// Perform the TS2021 handshake: wait for the HTTP upgrade and write the
+/// 51-byte Noise response.
+///
+/// The machine key attached to inner requests is the client's Noise machine
+/// key recovered from the handshake (`peer_static_public`), so per-client
+/// authorization and registration rate limiting key on the authenticated
+/// identity rather than the server's own key.
+async fn ts2021_handshake(
+    req: Request<Incoming>,
+    output: crabscale_transport::ResponderOutput,
+) -> std::io::Result<(
+    NoiseStream<TokioIo<hyper::upgrade::Upgraded>>,
+    crabscale_proto::MachineKey,
+)> {
+    let upgraded = hyper::upgrade::on(req)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut upgraded = TokioIo::new(upgraded);
+    upgraded.write_all(&output.response).await?;
+    upgraded.flush().await?;
+    let peer_machine_key =
+        crabscale_proto::MachineKey::from_bytes(output.peer_static_public.to_bytes());
+    let noise_stream = NoiseStream::new(
+        upgraded,
+        output.session.initiator_to_responder,
+        output.session.responder_to_initiator,
+    );
+    Ok((noise_stream, peer_machine_key))
 }
 
 /// Extract a query parameter from a URI query like `v=130`.
@@ -293,6 +330,17 @@ fn plain_response(status: StatusCode, text: &'static str) -> Response<Full<Bytes
         .expect("static response is valid")
 }
 
+/// A `429 Too Many Requests` response with a delta-seconds `Retry-After`
+/// header, used by the `/ts2021` rate limiter (M4-02).
+fn rate_limited_response(retry_after: u64) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header("Content-Type", "text/plain")
+        .header("Retry-After", retry_after.to_string())
+        .body(Full::new(Bytes::from_static(b"rate limit exceeded")))
+        .expect("static response is valid")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +358,23 @@ mod tests {
         assert_eq!(register_auth_id("/register/"), None);
         assert_eq!(register_auth_id("/register"), None);
         assert_eq!(register_auth_id("/key"), None);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_response_sets_status_and_retry_after() {
+        use http_body_util::BodyExt as _;
+        let response = rate_limited_response(7);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "7"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"rate limit exceeded");
     }
 }

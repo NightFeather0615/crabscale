@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use crabscale_control::{ControlConfig, ControlPlane};
 use crabscale_proto::{DiscoKey, Hostinfo, MachineKey, NodeKey, RegisterAuth, RegisterRequest};
-use crabscale_server::{ControlRouter, serve_control};
+use crabscale_server::{ControlRouter, serve_control_as};
 use crabscale_transport::{
     EARLY_PAYLOAD_MAGIC, NoiseResponder, NoiseStream, decode_early_payload, loopback_handshake,
 };
@@ -40,7 +40,7 @@ async fn whoami_over_noise_returns_machine_key() {
             .unwrap();
 
     let server_task = tokio::spawn(async move {
-        let _ = serve_control(server_stream, router).await;
+        let _ = serve_control_as(server_stream, router, machine_key).await;
     });
 
     read_early_payload(&mut client_stream).await;
@@ -82,7 +82,7 @@ async fn stub_route_returns_501() {
             .unwrap();
 
     let server_task = tokio::spawn(async move {
-        let _ = serve_control(server_stream, router).await;
+        let _ = serve_control_as(server_stream, router, machine_key).await;
     });
 
     read_early_payload(&mut client_stream).await;
@@ -115,7 +115,7 @@ async fn register_and_map_over_noise() {
             .unwrap();
 
     let server_task = tokio::spawn(async move {
-        let _ = serve_control(server_stream, router).await;
+        let _ = serve_control_as(server_stream, router, machine_key).await;
     });
 
     read_early_payload(&mut client_stream).await;
@@ -214,7 +214,7 @@ async fn interactive_register_approve_followup_authorizes() {
             .unwrap();
 
     let server_task = tokio::spawn(async move {
-        let _ = serve_control(server_stream, router).await;
+        let _ = serve_control_as(server_stream, router, machine_key).await;
     });
 
     read_early_payload(&mut client_stream).await;
@@ -296,12 +296,13 @@ async fn connect_client(
     server: &NoiseResponder,
     router: ControlRouter,
 ) -> (client::SendRequest<Bytes>, tokio::task::JoinHandle<()>) {
+    let machine_key = router.machine_key();
     let (mut client_stream, server_stream) =
         loopback_handshake(server, StaticSecret::random(), 113)
             .await
             .unwrap();
     let server_task = tokio::spawn(async move {
-        let _ = serve_control(server_stream, router).await;
+        let _ = serve_control_as(server_stream, router, machine_key).await;
     });
 
     read_early_payload(&mut client_stream).await;
@@ -482,7 +483,7 @@ async fn dns_reload_pushes_delta_to_live_map_session() {
             .unwrap();
 
     let server_task = tokio::spawn(async move {
-        let _ = serve_control(server_stream, router).await;
+        let _ = serve_control_as(server_stream, router, machine_key).await;
     });
 
     read_early_payload(&mut client_stream).await;
@@ -603,4 +604,210 @@ async fn dns_reload_pushes_delta_to_live_map_session() {
 
     drop(server_task);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn register_rate_limit_returns_429_with_retry_after() {
+    let server = NoiseResponder::random();
+    let machine_key = MachineKey::from_bytes(server.public_key().to_bytes());
+    let router =
+        ControlRouter::new(machine_key).with_rate_limits(crabscale_server::RateLimitConfig {
+            register_per_min: 60,
+            register_burst: 1,
+            ..Default::default()
+        });
+    let (mut client, server_task) = connect_client(&server, router).await;
+
+    let reg = serde_json::json!({
+        "Version": 130,
+        "NodeKey": NodeKey::from_bytes([0x55; 32]).to_string(),
+        "Auth": { "AuthKey": "hskey-auth-test-secret" },
+        "Hostinfo": { "Hostname": "node1" }
+    });
+    let body_bytes = serde_json::to_vec(&reg).unwrap();
+
+    // The first register consumes the single token for this machine key.
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/machine/register")
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream
+        .send_data(body_bytes.clone().into(), true)
+        .unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 200);
+
+    // A second register on the same machine key is rate limited BEFORE the
+    // body is parsed: 429 with a numeric Retry-After.
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/machine/register")
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream.send_data(body_bytes.into(), true).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 429);
+    let retry: u64 = response
+        .headers()
+        .get("retry-after")
+        .expect("Retry-After header")
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("Retry-After is a number");
+    assert!(retry >= 1, "Retry-After must be at least one second");
+
+    drop(server_task);
+}
+
+#[tokio::test]
+async fn invalid_register_does_not_echo_auth_secret() {
+    let server = NoiseResponder::random();
+    let machine_key = MachineKey::from_bytes(server.public_key().to_bytes());
+    let router = ControlRouter::new(machine_key);
+    let (mut client, server_task) = connect_client(&server, router).await;
+
+    let guessed = "hskey-auth-attacker-not-a-real-key-secret-value";
+    let reg = serde_json::json!({
+        "Version": 130,
+        "NodeKey": NodeKey::from_bytes([0x66; 32]).to_string(),
+        "Auth": { "AuthKey": guessed },
+        "Hostinfo": { "Hostname": "node1" }
+    });
+    let body_bytes = serde_json::to_vec(&reg).unwrap();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/machine/register")
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream.send_data(body_bytes.into(), true).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "a bad key starts an interactive flow"
+    );
+    let mut body = response.into_body();
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    let text = String::from_utf8_lossy(&buf);
+    assert!(
+        !text.contains(guessed),
+        "error body must not echo the auth secret"
+    );
+
+    drop(server_task);
+}
+
+/// Build an h2 client over a fresh Noise connection to `server`, serving the
+/// inner router with an explicit per-client `machine_key` (mirrors production
+/// `serve_control_as`, where the key is the client's Noise machine key).
+async fn connect_client_as(
+    server: &NoiseResponder,
+    router: ControlRouter,
+    machine_key: MachineKey,
+) -> (client::SendRequest<Bytes>, tokio::task::JoinHandle<()>) {
+    let (mut client_stream, server_stream) =
+        loopback_handshake(server, StaticSecret::random(), 113)
+            .await
+            .unwrap();
+    let server_task = tokio::spawn(async move {
+        let _ = serve_control_as(server_stream, router, machine_key).await;
+    });
+
+    read_early_payload(&mut client_stream).await;
+
+    let (client, conn) = client::handshake(client_stream).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    (client, server_task)
+}
+
+/// POST `body` to `path`, returning the HTTP status and raw response body.
+async fn post_json_raw_status(
+    client: &mut client::SendRequest<Bytes>,
+    path: &str,
+    body: &serde_json::Value,
+) -> (http::StatusCode, Vec<u8>) {
+    let body_bytes = serde_json::to_vec(body).unwrap();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .body(())
+        .unwrap();
+    let (response, mut send_stream) = client.send_request(request, false).unwrap();
+    send_stream.send_data(body_bytes.into(), true).unwrap();
+    let response = response.await.unwrap();
+    let status = response.status();
+    let mut body = response.into_body();
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    (status, buf)
+}
+
+#[tokio::test]
+async fn client_cannot_access_another_clients_node() {
+    let server = NoiseResponder::random();
+    let server_machine = MachineKey::from_bytes(server.public_key().to_bytes());
+    let router = ControlRouter::new(server_machine);
+    let machine_a = MachineKey::from_bytes([0xaa; 32]);
+    let machine_b = MachineKey::from_bytes([0xbb; 32]);
+    let (mut client_a, task_a) = connect_client_as(&server, router.clone(), machine_a).await;
+    let (mut client_b, task_b) = connect_client_as(&server, router.clone(), machine_b).await;
+
+    let node_a = NodeKey::from_bytes([0x21; 32]);
+    let node_b = NodeKey::from_bytes([0x22; 32]);
+
+    // Client A registers node A; client B registers node B.
+    let reg_a = serde_json::json!({
+        "Version": 130,
+        "NodeKey": node_a.to_string(),
+        "Auth": { "AuthKey": "hskey-auth-test-secret" },
+        "Hostinfo": { "Hostname": "a" }
+    });
+    let (status, raw) = post_json_raw_status(&mut client_a, "/machine/register", &reg_a).await;
+    assert_eq!(status, http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(json["MachineAuthorized"], serde_json::json!(true));
+
+    let reg_b = serde_json::json!({
+        "Version": 130,
+        "NodeKey": node_b.to_string(),
+        "Auth": { "AuthKey": "hskey-auth-test-secret" },
+        "Hostinfo": { "Hostname": "b" }
+    });
+    let (status, raw) = post_json_raw_status(&mut client_b, "/machine/register", &reg_b).await;
+    assert_eq!(status, http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(json["MachineAuthorized"], serde_json::json!(true));
+
+    // Client A must not be able to map node B (machine key mismatch -> 404).
+    let map_b = serde_json::json!({
+        "Version": 130,
+        "NodeKey": node_b.to_string(),
+        "DiscoKey": DiscoKey::from_bytes([0x33; 32]).to_string(),
+        "Stream": false
+    });
+    let (status, _raw) = post_json_raw_status(&mut client_a, "/machine/map", &map_b).await;
+    assert_eq!(status, http::StatusCode::NOT_FOUND);
+
+    // Client A must not be able to log out node B either.
+    let logout = serde_json::json!({
+        "Version": 130,
+        "NodeKey": node_b.to_string()
+    });
+    let (status, _raw) = post_json_raw_status(&mut client_a, "/machine/logout", &logout).await;
+    assert_eq!(status, http::StatusCode::NOT_FOUND);
+
+    drop(task_a);
+    drop(task_b);
 }

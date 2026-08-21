@@ -24,7 +24,7 @@ pub mod websocket;
 pub use client::{Client, connect_halves};
 pub use codec::{CodecError, DerpCodec, Frame};
 pub use frame::{
-    FRAME_HEADER_LEN, FrameError, FrameHeader, FrameType, MAGIC, MAX_FRAME_BODY_LEN,
+    FRAME_HEADER_LEN, FrameDecoder, FrameError, FrameHeader, FrameType, MAGIC, MAX_FRAME_BODY_LEN,
     MAX_PACKET_PAYLOAD_LEN, PROTOCOL_VERSION, decode_frame, encode_frame,
 };
 pub use frames::{

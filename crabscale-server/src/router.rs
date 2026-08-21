@@ -5,6 +5,7 @@
 //! endpoints are served inside the HTTP/2-over-Noise connection and carry the
 //! Noise machine key recovered from the handshake.
 
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ use crate::bootstrap_dns::BootstrapDns;
 use crate::oidc::{
     DEFAULT_OIDC_FLOW_LIMIT, DEFAULT_OIDC_FLOW_TTL_SECONDS, OidcClient, OidcFlowStore, now_unix,
 };
+use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use bytes::Bytes;
 use crabscale_control::{ControlConfig, ControlError, ControlPlane, MapOutcome, SessionPeers};
 use crabscale_proto::{
@@ -66,6 +68,10 @@ pub struct ControlRouter {
     oidc_flows: Arc<Mutex<OidcFlowStore>>,
     /// Optional `/bootstrap-dns` snapshot served over the outer HTTP server.
     bootstrap_dns: Option<Arc<BootstrapDns>>,
+    /// `/ts2021` upgrade rate limiter, keyed by client IP (M4-02).
+    ts2021_limiter: RateLimiter,
+    /// `/machine/register` rate limiter, keyed by Noise machine key (M4-02).
+    register_limiter: RateLimiter,
 }
 
 impl ControlRouter {
@@ -86,6 +92,16 @@ impl ControlRouter {
                 DEFAULT_OIDC_FLOW_TTL_SECONDS,
             ))),
             bootstrap_dns: None,
+            ts2021_limiter: RateLimiter::new(
+                RateLimitConfig::default().ts2021_per_min,
+                RateLimitConfig::default().ts2021_burst,
+                RateLimitConfig::default().max_entries,
+            ),
+            register_limiter: RateLimiter::new(
+                RateLimitConfig::default().register_per_min,
+                RateLimitConfig::default().register_burst,
+                RateLimitConfig::default().max_entries,
+            ),
         }
     }
 
@@ -113,6 +129,31 @@ impl ControlRouter {
     pub fn with_bootstrap_dns(mut self, bootstrap_dns: BootstrapDns) -> Self {
         self.bootstrap_dns = Some(Arc::new(bootstrap_dns));
         self
+    }
+
+    /// Override the `/ts2021` and `/machine/register` rate limits (M4-02).
+    pub fn with_rate_limits(mut self, cfg: RateLimitConfig) -> Self {
+        self.ts2021_limiter =
+            RateLimiter::new(cfg.ts2021_per_min, cfg.ts2021_burst, cfg.max_entries);
+        self.register_limiter =
+            RateLimiter::new(cfg.register_per_min, cfg.register_burst, cfg.max_entries);
+        self
+    }
+
+    /// Check the `/ts2021` rate limit for `ip`.
+    ///
+    /// Returns the `Retry-After` seconds when the request must be rejected
+    /// with HTTP 429, or `None` when it may proceed.
+    pub fn check_ts2021_rate(&self, ip: IpAddr) -> Option<u64> {
+        self.ts2021_limiter.check(&ip.to_string())
+    }
+
+    /// Check the `/machine/register` rate limit for `machine_key`.
+    ///
+    /// Returns the `Retry-After` seconds when the request must be rejected
+    /// with HTTP 429, or `None` when it may proceed.
+    pub fn check_register_rate(&self, machine_key: &MachineKey) -> Option<u64> {
+        self.register_limiter.check(&machine_key.to_string())
     }
 
     /// The machine key this router advertises and attaches to inner requests.
@@ -476,6 +517,13 @@ impl ControlRouter {
         machine_key: MachineKey,
         body: &[u8],
     ) {
+        // Rate limit registration per Noise machine key (M4-02). The check
+        // runs before the body is parsed so a limited client cannot even feed
+        // the JSON parser.
+        if let Some(retry_after) = self.check_register_rate(&machine_key) {
+            send_rate_limited(respond, retry_after);
+            return;
+        }
         let request: RegisterRequest = match serde_json::from_slice(body) {
             Ok(r) => r,
             Err(_) => {
@@ -686,16 +734,22 @@ fn map_error_status(err: &ControlError) -> StatusCode {
     }
 }
 
-/// Serve the inner HTTP/2-over-Noise control router on a Noise stream.
-pub async fn serve_control<T>(
+/// Serve the inner HTTP/2-over-Noise control router on a Noise stream,
+/// attaching `machine_key` (the client's Noise machine key, recovered from
+/// the handshake) to every request.
+///
+/// Callers must supply the client's actual Noise machine key; attaching the
+/// router's own key (the server's) would let every client share one identity
+/// and break per-client authorization and register rate limiting.
+pub async fn serve_control_as<T>(
     stream: NoiseStream<T>,
     router: ControlRouter,
+    machine_key: MachineKey,
 ) -> Result<(), TransportError>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     router.spawn_reaper();
-    let machine_key = router.machine_key();
     let challenge = random_challenge();
     serve_http2(
         stream,
@@ -765,6 +819,21 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+/// Send an HTTP 429 response with a `Retry-After` delta-seconds header
+/// (M4-02 rate limiting).
+fn send_rate_limited(respond: &mut SendResponse<Bytes>, retry_after: u64) {
+    let response = Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header("Content-Type", "text/plain")
+        .header("Retry-After", retry_after.to_string())
+        .body(())
+        .expect("static response is valid");
+    let Ok(mut send) = respond.send_response(response, false) else {
+        return;
+    };
+    let _ = send.send_data(Bytes::from_static(b"rate limit exceeded"), true);
 }
 
 fn send_plain(respond: &mut SendResponse<Bytes>, status: StatusCode, text: &'static [u8]) {
