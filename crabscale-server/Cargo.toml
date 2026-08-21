@@ -26,4 +26,5 @@ ureq = "3"
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 
 [dev-dependencies]
+base64 = "0.22"
 crabscale-policy = { path = "../crabscale-policy" }

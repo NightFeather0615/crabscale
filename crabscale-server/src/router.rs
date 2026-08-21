@@ -734,25 +734,13 @@ fn map_error_status(err: &ControlError) -> StatusCode {
     }
 }
 
-/// Serve the inner HTTP/2-over-Noise control router on a Noise stream.
-///
-/// This convenience overload attaches the router's own advertised machine key
-/// to every request. Real handshakes should use [`serve_control_as`] so the
-/// machine key recovered from the Noise handshake (the client's key) is used
-/// for authorization and rate limiting.
-pub async fn serve_control<T>(
-    stream: NoiseStream<T>,
-    router: ControlRouter,
-) -> Result<(), TransportError>
-where
-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let machine_key = router.machine_key();
-    serve_control_as(stream, router, machine_key).await
-}
-
 /// Serve the inner HTTP/2-over-Noise control router on a Noise stream,
-/// attaching `machine_key` (the client's Noise machine key) to every request.
+/// attaching `machine_key` (the client's Noise machine key, recovered from
+/// the handshake) to every request.
+///
+/// Callers must supply the client's actual Noise machine key; attaching the
+/// router's own key (the server's) would let every client share one identity
+/// and break per-client authorization and register rate limiting.
 pub async fn serve_control_as<T>(
     stream: NoiseStream<T>,
     router: ControlRouter,

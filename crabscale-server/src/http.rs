@@ -259,56 +259,55 @@ async fn handle_ts2021(
     );
 
     tokio::spawn(async move {
-        // Bound the whole handshake (the 101 response plus the Noise response
-        // write) by the documented TS2021 handshake timeout so a peer that
-        // stops reading cannot pin a task forever (Spec-Transport section 3).
-        if tokio::time::timeout(HANDSHAKE_TIMEOUT, complete_upgrade(req, output, router))
-            .await
-            .is_err()
-        {
-            eprintln!("ts2021 handshake timed out");
+        // Bound ONLY the handshake (the 101 upgrade wait plus the Noise
+        // response write) by the documented TS2021 handshake timeout. The
+        // inner control session (`serve_control_as`) runs after the timeout
+        // future completes, so streaming map sessions are never capped by
+        // the handshake timeout (Spec-Transport section 3).
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, ts2021_handshake(req, output)).await {
+            Ok(Ok((noise_stream, peer_machine_key))) => {
+                let _ = serve_control_as(noise_stream, router, peer_machine_key).await;
+            }
+            Ok(Err(e)) => {
+                eprintln!("ts2021 handshake failed: {e}");
+            }
+            Err(_) => {
+                eprintln!("ts2021 handshake timed out");
+            }
         }
     });
 
     res
 }
 
-/// Complete a TS2021 upgrade: wait for the HTTP upgrade, write the Noise
-/// response, and serve the inner control router.
+/// Perform the TS2021 handshake: wait for the HTTP upgrade and write the
+/// 51-byte Noise response.
 ///
 /// The machine key attached to inner requests is the client's Noise machine
 /// key recovered from the handshake (`peer_static_public`), so per-client
 /// authorization and registration rate limiting key on the authenticated
 /// identity rather than the server's own key.
-async fn complete_upgrade(
+async fn ts2021_handshake(
     req: Request<Incoming>,
     output: crabscale_transport::ResponderOutput,
-    router: ControlRouter,
-) {
-    match hyper::upgrade::on(req).await {
-        Ok(upgraded) => {
-            let mut upgraded = TokioIo::new(upgraded);
-            if let Err(e) = upgraded.write_all(&output.response).await {
-                eprintln!("failed to write Noise response: {e}");
-                return;
-            }
-            if let Err(e) = upgraded.flush().await {
-                eprintln!("failed to flush Noise response: {e}");
-                return;
-            }
-            let peer_machine_key =
-                crabscale_proto::MachineKey::from_bytes(output.peer_static_public.to_bytes());
-            let noise_stream = NoiseStream::new(
-                upgraded,
-                output.session.initiator_to_responder,
-                output.session.responder_to_initiator,
-            );
-            let _ = serve_control_as(noise_stream, router, peer_machine_key).await;
-        }
-        Err(e) => {
-            eprintln!("upgrade failed: {e}");
-        }
-    }
+) -> std::io::Result<(
+    NoiseStream<TokioIo<hyper::upgrade::Upgraded>>,
+    crabscale_proto::MachineKey,
+)> {
+    let upgraded = hyper::upgrade::on(req)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut upgraded = TokioIo::new(upgraded);
+    upgraded.write_all(&output.response).await?;
+    upgraded.flush().await?;
+    let peer_machine_key =
+        crabscale_proto::MachineKey::from_bytes(output.peer_static_public.to_bytes());
+    let noise_stream = NoiseStream::new(
+        upgraded,
+        output.session.initiator_to_responder,
+        output.session.responder_to_initiator,
+    );
+    Ok((noise_stream, peer_machine_key))
 }
 
 /// Extract a query parameter from a URI query like `v=130`.

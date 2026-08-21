@@ -23,5 +23,5 @@ pub use rate_limit::{
     DEFAULT_MAX_RATE_KEYS, DEFAULT_REGISTER_BURST, DEFAULT_REGISTER_RATE_PER_MIN,
     DEFAULT_TS2021_BURST, DEFAULT_TS2021_RATE_PER_MIN, RateLimitConfig, RateLimiter,
 };
-pub use router::{ControlRouter, serve_control, serve_control_as};
+pub use router::{ControlRouter, serve_control_as};
 pub use stun::{StunServerHandle, serve_stun};
