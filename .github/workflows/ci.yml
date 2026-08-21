@@ -111,6 +111,9 @@ jobs:
   audit:
     name: Dependencies audit (cargo audit)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - name: Run cargo audit
@@ -126,7 +129,7 @@ jobs:
       - name: Run cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check
+          command: check advisories bans sources
 
   fuzz-smoke:
     name: Fuzz smoke (M4-02)

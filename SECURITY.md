@@ -69,9 +69,18 @@ Public-deployment attack surface reduction implemented by M4-02:
 - **Bounded caches**: the interactive-registration cache and the SSH
   approval cache are bounded (TTL + cap).
 - **Dependency auditing**: `cargo audit` (advisories) and `cargo deny`
-  (bans/license/source policy) run in CI.
+  (bans/source policy) run in CI.
 - **Fuzzing**: smoke fuzz targets for JSON wire types, Noise frames, and
   DERP frames run in CI over the checked-in corpus and random seeds.
+
+### Known advisory
+
+- `RUSTSEC-2023-0071` — `rsa` (via `jsonwebtoken` for OIDC RS256
+  verification) has no patched upstream release; there is no safe upgrade
+  available. It is recorded in both `deny.toml` and `audit.toml` so CI stays
+  green while the upstream fix is tracked
+  (https://github.com/RustCrypto/RSA/issues/626). Revisit when a
+  constant-time `rsa` release lands.
 
 ## Questions
 

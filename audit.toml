@@ -1,0 +1,11 @@
+# cargo-audit configuration (M4-02 security hardening, #25).
+#
+# The CI `audit` job (rustsec/audit-check) fails on any known vulnerability.
+# The single known issue is tracked below; there is no patched upstream
+# release, so it is recorded here with the same rationale as in deny.toml.
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: rsa (via jsonwebtoken) — no safe upgrade available;
+    # see https://github.com/RustCrypto/RSA/issues/626.
+    "RUSTSEC-2023-0071",
+]
