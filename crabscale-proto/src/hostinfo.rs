@@ -170,3 +170,29 @@ pub struct NetInfo {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub link_type: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hardware_attestation_fields_are_ignored_by_default() {
+        // At capver 130 the server may read hardware attestation fields and
+        // may ignore them (Spec-Compatibility table row 130). Unknown fields
+        // must never fail deserialization, and only modeled fields are
+        // re-emitted.
+        let json = serde_json::json!({
+            "Hostname": "node1",
+            "HardwareAttestationCert": "abc123",
+            "AttestedDevice": true,
+            "AttestationVersion": 5,
+        });
+        let parsed: Hostinfo = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.hostname, "node1");
+        let out = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(out.get("HardwareAttestationCert"), None);
+        assert_eq!(out.get("AttestedDevice"), None);
+        assert_eq!(out.get("AttestationVersion"), None);
+        assert_eq!(out["Hostname"], serde_json::json!("node1"));
+    }
+}

@@ -17,6 +17,8 @@
 /// crates so the supported client floor is defined in exactly one place.
 pub const MIN_SUPPORTED_CAPVER: u32 = 113;
 
+pub mod capver;
+
 mod derp;
 mod dns;
 mod early;

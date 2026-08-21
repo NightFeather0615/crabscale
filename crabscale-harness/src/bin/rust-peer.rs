@@ -22,6 +22,9 @@ struct Args {
     /// Hostname reported to the server.
     #[arg(long, default_value = "rust-peer")]
     hostname: String,
+    /// Capability version to advertise (Spec-Compatibility §3).
+    #[arg(long, default_value_t = crabscale_harness::client::DEFAULT_CAPABILITY_VERSION)]
+    capability_version: u16,
 }
 
 #[tokio::main]
@@ -32,13 +35,15 @@ async fn main() -> ExitCode {
         auth_key: args.auth_key,
         tailnet: "tailnet.example".to_string(),
         rust_peer_hostname: args.hostname,
+        capability_version: args.capability_version,
         tailscale_binary: None,
         report_path: None,
     };
     match run_rust_peer(&config).await {
         Ok(report) => {
             println!(
-                "registered={} ips={} peers={} logged_out={}",
+                "capability_version={} registered={} ips={} peers={} logged_out={}",
+                args.capability_version,
                 report.registered,
                 report.assigned_ips.join(","),
                 report.saw_peers,

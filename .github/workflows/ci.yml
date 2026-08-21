@@ -91,3 +91,19 @@ jobs:
         with:
           name: harness-report
           path: harness-report.md
+
+  capability-matrix:
+    name: Capability version matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Run M4-01 capability version matrix
+        run: ./scripts/capability-matrix.sh --report capability-matrix.md
+      - name: Upload capability matrix report
+        uses: actions/upload-artifact@v4
+        with:
+          name: capability-matrix-report
+          path: capability-matrix.md

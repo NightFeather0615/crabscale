@@ -42,6 +42,9 @@ struct StreamSession {
     session_id: i64,
     node_id: i64,
     last_sent: SessionPeers,
+    /// The client's advertised capability version; every delta frame sent on
+    /// this session is gated on it.
+    client_version: u32,
 }
 
 /// Default keepalive interval for streaming map sessions.
@@ -547,6 +550,7 @@ impl ControlRouter {
                 session_id,
                 node_id,
                 initial_peers,
+                client_version,
             }) => {
                 self.send_stream(
                     respond,
@@ -557,33 +561,22 @@ impl ControlRouter {
                         session_id,
                         node_id,
                         last_sent: initial_peers,
+                        client_version,
                     },
                 )
                 .await;
             }
-            Err(ControlError::NotFound) => {
-                send_plain(respond, StatusCode::NOT_FOUND, b"node not found");
-            }
-            Err(ControlError::UnsupportedVersion(_)) => {
-                send_plain(
-                    respond,
-                    StatusCode::BAD_REQUEST,
-                    b"unsupported capability version",
-                );
-            }
-            Err(ControlError::InvalidEndpointTypes) => {
-                send_plain(
-                    respond,
-                    StatusCode::BAD_REQUEST,
-                    b"endpoint_types length does not match endpoints length",
-                );
-            }
-            Err(_) => {
-                send_plain(
-                    respond,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    b"internal error",
-                );
+            Err(err) => {
+                let status = map_error_status(&err);
+                let body: &[u8] = match &err {
+                    ControlError::NotFound => b"node not found",
+                    ControlError::UnsupportedVersion(_) => b"unsupported capability version",
+                    ControlError::InvalidEndpointTypes => {
+                        b"endpoint_types length does not match endpoints length"
+                    }
+                    _ => b"internal error",
+                };
+                send_plain(respond, status, body);
             }
         }
     }
@@ -596,6 +589,7 @@ impl ControlRouter {
             session_id,
             node_id,
             mut last_sent,
+            client_version,
         } = session;
         let response = Response::builder()
             .status(StatusCode::OK)
@@ -648,7 +642,7 @@ impl ControlRouter {
                                 continue;
                             }
                             let response = match self.control.build_delta(
-                                node_id, &batch, &mut last_sent,
+                                node_id, &batch, &mut last_sent, client_version,
                             ) {
                                 Ok(Some(response)) => response,
                                 // Nothing for this session (e.g. an unrelated
@@ -675,6 +669,20 @@ impl ControlRouter {
             }
         }
         self.control.close_session(session_id);
+    }
+}
+
+/// Map a [`ControlError`] from `/machine/map` handling to an HTTP status
+/// code. A below-minimum capability version is rejected with `400`
+/// (Spec-Control-API `POST /machine/map`), as is an invalid
+/// `endpoints`/`endpoint_types` pairing; unknown nodes are `404`, and any
+/// other error is an internal server error.
+fn map_error_status(err: &ControlError) -> StatusCode {
+    match err {
+        ControlError::NotFound => StatusCode::NOT_FOUND,
+        ControlError::UnsupportedVersion(_) => StatusCode::BAD_REQUEST,
+        ControlError::InvalidEndpointTypes => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -905,6 +913,29 @@ mod tests {
         assert_eq!(
             router.handle_key(Some("abc")).status(),
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn map_error_status_maps_unsupported_version_to_400() {
+        // Acceptance: a below-minimum client receives `400` at
+        // `/machine/map`. The Noise handshake already rejects capver < 113,
+        // so this asserts the control-route mapping as defense in depth.
+        assert_eq!(
+            map_error_status(&ControlError::UnsupportedVersion(112)),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            map_error_status(&ControlError::InvalidEndpointTypes),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            map_error_status(&ControlError::NotFound),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            map_error_status(&ControlError::Json),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 

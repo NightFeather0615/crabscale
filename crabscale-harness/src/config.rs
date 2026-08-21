@@ -16,6 +16,9 @@ pub struct HarnessConfig {
     pub tailnet: String,
     /// Hostname used by the Rust test peer.
     pub rust_peer_hostname: String,
+    /// Capability version the Rust peer advertises (Spec-Compatibility §3).
+    /// Defaults to the latest stable serialized by the peer.
+    pub capability_version: u16,
     /// Optional path to the Tailscale client binary.
     pub tailscale_binary: Option<String>,
     /// Optional path to write the Markdown report.
@@ -30,6 +33,7 @@ impl HarnessConfig {
             auth_key: crabscale_control::ControlConfig::default().auth_key,
             tailnet: DEFAULT_TAILNET.to_string(),
             rust_peer_hostname: "rust-peer".to_string(),
+            capability_version: crate::client::DEFAULT_CAPABILITY_VERSION,
             tailscale_binary: None,
             report_path: None,
         }

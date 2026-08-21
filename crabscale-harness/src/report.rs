@@ -13,6 +13,8 @@ pub struct HarnessReport {
     pub tailnet: String,
     /// The pre-auth key used.
     pub auth_key: String,
+    /// Capability version the Rust peer advertised (Spec-Compatibility §3).
+    pub capability_version: u16,
     /// Results from the Rust client peer.
     pub rust_peer: Option<PeerReport>,
     /// Results from the Tailscale client, when run.
@@ -44,6 +46,7 @@ pub fn render_report(report: &HarnessReport) -> String {
     let _ = writeln!(out, "- Control URL: `{}`", report.control_url);
     let _ = writeln!(out, "- Tailnet: `{}`", report.tailnet);
     let _ = writeln!(out, "- Pre-auth key: `{}`", report.auth_key);
+    let _ = writeln!(out, "- Capability version: `{}`", report.capability_version);
     let _ = writeln!(out);
 
     let _ = writeln!(out, "## Rust client test peer");
