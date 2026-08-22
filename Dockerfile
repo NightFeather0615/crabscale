@@ -25,6 +25,7 @@ COPY crabscale-transport/Cargo.toml crabscale-transport/
 COPY crabscale-control/Cargo.toml crabscale-control/
 COPY crabscale-policy/Cargo.toml crabscale-policy/
 COPY crabscale-derp/Cargo.toml crabscale-derp/
+COPY crabscale-metrics/Cargo.toml crabscale-metrics/
 COPY crabscale-server/Cargo.toml crabscale-server/
 COPY crabscale-cli/Cargo.toml crabscale-cli/
 COPY crabscale-harness/Cargo.toml crabscale-harness/

@@ -356,6 +356,9 @@ impl Relay {
     /// `NotHere` (0x01). Packet payloads larger than 64 KiB are dropped.
     async fn route_send_packet(&self, from: ClientId, dest: NodeKey, packet: &[u8]) {
         if packet.len() > MAX_PACKET_PAYLOAD_LEN {
+            crabscale_metrics::registry()
+                .derp_packets_dropped_total
+                .inc();
             return;
         }
         let reg = self.registry.lock().await;
@@ -366,6 +369,9 @@ impl Relay {
 
         let some_targets = reg.by_key.get(&dest).is_some_and(|set| !set.is_empty());
         if !some_targets {
+            crabscale_metrics::registry()
+                .derp_packets_dropped_total
+                .inc();
             let gone = Frame::new(
                 FrameType::PeerGone,
                 Bytes::from(
@@ -387,10 +393,20 @@ impl Relay {
         recv_body.extend_from_slice(packet);
         let recv = Frame::new(FrameType::RecvPacket, Bytes::from(recv_body));
 
+        let mut delivered = false;
         for target in targets {
             if let Some(entry) = reg.conns.get(target) {
-                let _ = entry.out.try_send(recv.clone());
+                if entry.out.try_send(recv.clone()).is_ok() {
+                    delivered = true;
+                }
             }
+        }
+        if delivered {
+            crabscale_metrics::registry().derp_packets_total.inc();
+        } else {
+            crabscale_metrics::registry()
+                .derp_packets_dropped_total
+                .inc();
         }
     }
 
@@ -452,6 +468,34 @@ mod tests {
         let (src, packet) = a.recv_packet().await.unwrap();
         assert_eq!(src, key_b);
         assert_eq!(&packet[..], b"hello from the moon");
+    }
+
+    #[tokio::test]
+    async fn relayed_packets_increment_derp_metric() {
+        // M4-04 (#27): packet routing must be observable. The global counter
+        // is monotonic, so comparing deltas is safe even when other tests in
+        // the same process relay packets concurrently.
+        let before = crabscale_metrics::registry().derp_packets_total.get();
+        let relay = Arc::new(Relay::random());
+        let secret_a = SecretKey::random();
+        let secret_b = SecretKey::random();
+        let mut a = connect_client(&relay, secret_a).await;
+        let mut b = connect_client(&relay, secret_b).await;
+        let key_a = a.node_key();
+        let key_b = b.node_key();
+
+        a.send_packet(key_b, b"one").await.unwrap();
+        let (_src, packet) = b.recv_packet().await.unwrap();
+        assert_eq!(&packet[..], b"one");
+        b.send_packet(key_a, b"two").await.unwrap();
+        let (_src, packet) = a.recv_packet().await.unwrap();
+        assert_eq!(&packet[..], b"two");
+
+        let after = crabscale_metrics::registry().derp_packets_total.get();
+        assert!(
+            after >= before + 2,
+            "expected at least 2 relayed packets, got {after}"
+        );
     }
 
     #[tokio::test]

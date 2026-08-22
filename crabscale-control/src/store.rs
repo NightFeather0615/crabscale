@@ -133,7 +133,7 @@ pub trait Store: Send + Sync {
 
 /// A [`Store`] backed by SQLite.
 pub struct SqliteStore {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
 }
 
 impl SqliteStore {
@@ -155,6 +155,33 @@ impl SqliteStore {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Serialize the store's allowed, non-secret tables to `writer` as a
+    /// zstd-compressed backup (M4-04, #27).
+    ///
+    /// The backup format is defined in [`crate::backup`]; it contains only an
+    /// explicit allowlist of tables/columns and never plaintext secrets.
+    pub fn backup_to<W: std::io::Write>(
+        &self,
+        writer: W,
+    ) -> Result<(), crate::backup::BackupError> {
+        let mut conn = self.conn.lock().unwrap();
+        crate::backup::write_backup(&mut conn, writer)
+    }
+
+    /// Replace the store's allowed tables with the contents of a backup read
+    /// from `reader` (M4-04, #27).
+    ///
+    /// Runs inside a single transaction; the caller is responsible for
+    /// pointing at a fresh or disposable database file because every allowed
+    /// table is cleared first.
+    pub fn restore_from<R: std::io::Read>(
+        &self,
+        reader: R,
+    ) -> Result<(), crate::backup::BackupError> {
+        let mut conn = self.conn.lock().unwrap();
+        crate::backup::restore_backup(&mut conn, reader)
     }
 }
 

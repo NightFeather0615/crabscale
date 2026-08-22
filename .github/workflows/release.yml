@@ -1,0 +1,50 @@
+name: Release
+
+# M4-04 (#27): publish v0.1 release artifacts. A release artifact must build
+# from a clean checkout; this workflow builds the two release binaries on a
+# tag push and attaches them to a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build release binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build crabscale-server (release)
+        run: cargo build --release -p crabscale-server
+
+      - name: Build crabscale-cli (release)
+        run: cargo build --release -p crabscale-cli
+
+      - name: Smoke-check the binaries
+        run: |
+          ./target/release/crabscale-server --version
+          ./target/release/crabscale --version
+
+      - name: Stage release artifacts
+        run: |
+          mkdir -p dist
+          cp target/release/crabscale-server dist/crabscale-server
+          cp target/release/crabscale dist/crabscale
+          cp CHANGELOG.md dist/CHANGELOG.md
+
+      - name: Run workspace test suite from clean artifacts
+        run: cargo test --workspace
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*

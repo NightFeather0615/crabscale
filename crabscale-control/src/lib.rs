@@ -7,6 +7,7 @@
 //! trait, assigns tailnet IPs with a random allocator, and builds the first
 //! complete MapResponse frame.
 
+pub mod backup;
 mod delta;
 mod derp;
 mod dns;
@@ -31,6 +32,7 @@ use crabscale_proto::{
     RegisterRequest, RegisterResponse, UserProfile, encode_map_response_frame,
 };
 
+pub use backup::{BACKUP_FORMAT, BACKUP_TABLES, BackupError};
 pub use delta::SessionPeers;
 pub use dns::{DnsError, DnsSettings};
 pub use events::{
@@ -363,6 +365,8 @@ impl ControlPlane {
     /// Returns a session id that the caller must pass to [`Self::close_session`]
     /// when the streaming map connection ends.
     pub fn open_session(&self, node_id: i64, ephemeral: bool) -> i64 {
+        crabscale_metrics::registry().sessions_opened_total.inc();
+        crabscale_metrics::registry().sessions_active.add(1);
         let now = time::now_unix();
         let mut sessions = self.sessions.lock().unwrap();
         let (session_id, events) = sessions.open(node_id, ephemeral, now);
@@ -382,7 +386,10 @@ impl ControlPlane {
     pub fn close_session(&self, session_id: i64) {
         let now = time::now_unix();
         let mut sessions = self.sessions.lock().unwrap();
-        sessions.close(session_id, now);
+        if sessions.close(session_id, now) {
+            crabscale_metrics::registry().sessions_closed_total.inc();
+            crabscale_metrics::registry().sessions_active.add(-1);
+        }
     }
 
     /// Atomically claim the single background reaper slot.
@@ -450,6 +457,9 @@ impl ControlPlane {
     /// registration state is returned without consuming the auth key. This
     /// makes client restarts re-register without error.
     pub fn register(&self, machine_key: MachineKey, request: RegisterRequest) -> RegisterResponse {
+        // Record the registration request before any early-return path
+        // (observability, M4-04).
+        crabscale_metrics::registry().registrations_total.inc();
         let result = (|| -> Result<RegisterResponse, ControlError> {
             self.ensure_default_user()?;
             self.ensure_bootstrap_key()?;
@@ -1514,6 +1524,7 @@ impl ControlPlane {
     ) -> Result<MapResponse, ControlError> {
         let version = request.version;
         let compile_nodes = self.compile_nodes()?;
+        crabscale_metrics::registry().policy_compiles_total.inc();
         let compiled = crabscale_policy::compile_policy(&self.config.policy, &compile_nodes);
         let self_routes = self.effective_approved_routes(node)?;
 
@@ -1521,6 +1532,7 @@ impl ControlPlane {
         // rules are compiled and reduced to this node, then converted into
         // the wire SSHPolicy carried in the map.
         let ssh_policy = {
+            crabscale_metrics::registry().policy_compiles_total.inc();
             let ssh_compiled =
                 crabscale_policy::compile_ssh_policy(&self.config.policy, &compile_nodes);
             crabscale_policy::build_wire_ssh_policy(
@@ -4666,6 +4678,60 @@ mod tests {
         assert!(
             first_zstd_len < crabscale_proto::MAX_MAP_RESPONSE_PAYLOAD_LEN,
             "zstd 200-node frame ({first_zstd_len}B) must fit the frame payload limit"
+        );
+    }
+
+    #[test]
+    fn operational_metrics_fire_on_register_session_and_map() {
+        // M4-04 (#27): the Prometheus counters for registrations, sessions and
+        // policy compiles must move as the control plane is used. Comparisons
+        // use deltas because the process-global registry is shared.
+        let metrics = crabscale_metrics::registry();
+        let reg_before = metrics.registrations_total.get();
+        let opened_before = metrics.sessions_opened_total.get();
+        let closed_before = metrics.sessions_closed_total.get();
+        let policy_before = metrics.policy_compiles_total.get();
+
+        let plane = test_plane();
+        plane.register(test_machine_key(), test_register_request());
+        assert!(
+            metrics.registrations_total.get() > reg_before,
+            "registration must increment the registrations counter"
+        );
+
+        // Map with a live streaming session: opening it is counted and
+        // building the initial map compiles the policy.
+        let stored = plane.store.list_nodes().unwrap();
+        let node = stored.first().cloned().expect("node registered");
+        let request = MapRequest {
+            version: 130,
+            node_key: node.node_key,
+            disco_key: DiscoKey::from_bytes([0x33; 32]),
+            stream: true,
+            ..Default::default()
+        };
+        let MapOutcome::Stream { session_id, .. } =
+            plane.handle_map(node.machine_key, request).unwrap()
+        else {
+            panic!("expected streaming outcome");
+        };
+        assert!(
+            metrics.sessions_opened_total.get() > opened_before,
+            "opening a session must increment opened_total"
+        );
+        assert!(
+            metrics.policy_compiles_total.get() > policy_before,
+            "building the initial map must increment policy compiles"
+        );
+
+        // Closing the session is counted. (The `sessions_active` gauge is only
+        // asserted in `crabscale-metrics` because gauges are shared across all
+        // parallel control/harness tests and are not reliable for exact
+        // equality under concurrency.)
+        plane.close_session(session_id);
+        assert!(
+            metrics.sessions_closed_total.get() > closed_before,
+            "closing a session must increment closed_total"
         );
     }
 }

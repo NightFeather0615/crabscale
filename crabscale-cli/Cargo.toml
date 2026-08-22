@@ -8,3 +8,7 @@ rust-version.workspace = true
 clap = { version = "4", features = ["derive"] }
 crabscale-control = { path = "../crabscale-control" }
 crabscale-proto = { path = "../crabscale-proto" }
+
+[[bin]]
+name = "crabscale"
+path = "src/main.rs"

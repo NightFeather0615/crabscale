@@ -452,6 +452,7 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "chrono",
+ "crabscale-metrics",
  "crabscale-policy",
  "crabscale-proto",
  "hex",
@@ -469,6 +470,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "crabscale-metrics",
  "crypto_box",
  "futures-core",
  "futures-sink",
@@ -511,6 +513,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabscale-metrics"
+version = "0.1.0"
+
+[[package]]
 name = "crabscale-policy"
 version = "0.1.0"
 dependencies = [
@@ -536,6 +542,7 @@ dependencies = [
  "clap",
  "crabscale-control",
  "crabscale-derp",
+ "crabscale-metrics",
  "crabscale-policy",
  "crabscale-proto",
  "crabscale-transport",

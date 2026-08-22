@@ -101,10 +101,12 @@ impl SessionRegistry {
     /// Close a live map session by id.
     ///
     /// Closing the last session schedules an offline transition after the
-    /// reconnect grace period; no offline event is emitted yet.
-    pub fn close(&mut self, session_id: i64, now: i64) {
+    /// reconnect grace period; no offline event is emitted yet. Returns
+    /// `true` when a session was actually removed and `false` when `id` was
+    /// already closed or unknown.
+    pub fn close(&mut self, session_id: i64, now: i64) -> bool {
         let Some(node_id) = self.session_to_node.remove(&session_id) else {
-            return;
+            return false;
         };
         if let Some(entry) = self.nodes.get_mut(&node_id) {
             entry.live = entry.live.saturating_sub(1);
@@ -112,6 +114,7 @@ impl SessionRegistry {
                 entry.offline_at = Some(now + self.grace_seconds);
             }
         }
+        true
     }
 
     /// Advance the registry to `now`, emitting offline transitions and
