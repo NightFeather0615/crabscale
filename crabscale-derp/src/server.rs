@@ -393,12 +393,21 @@ impl Relay {
         recv_body.extend_from_slice(packet);
         let recv = Frame::new(FrameType::RecvPacket, Bytes::from(recv_body));
 
+        let mut delivered = false;
         for target in targets {
             if let Some(entry) = reg.conns.get(target) {
-                let _ = entry.out.try_send(recv.clone());
+                if entry.out.try_send(recv.clone()).is_ok() {
+                    delivered = true;
+                }
             }
         }
-        crabscale_metrics::registry().derp_packets_total.inc();
+        if delivered {
+            crabscale_metrics::registry().derp_packets_total.inc();
+        } else {
+            crabscale_metrics::registry()
+                .derp_packets_dropped_total
+                .inc();
+        }
     }
 
     /// Send a keepalive frame to one connection.

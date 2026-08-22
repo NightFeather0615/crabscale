@@ -15,7 +15,7 @@
 //! crabscale ssh reject --auth-id <id>
 //! crabscale ssh list
 //! crabscale backup --store <db> --output <file>   # zstd backup, no plaintext secrets
-//! crabscale restore --store <db> --input <file>
+//! crabscale restore --store <db> --force --input <file>
 //! ```
 
 use std::fs::File;
@@ -69,10 +69,16 @@ enum Command {
         output: PathBuf,
     },
     /// Restore a store from a backup file produced by `backup` (M4-04, #27).
+    ///
+    /// Restoration replaces the allowed tables of the target SQLite file.
+    /// Pass `--force` to confirm this destructive operation.
     Restore {
         /// Source backup file.
         #[arg(long)]
         input: PathBuf,
+        /// Confirm that the target store's allowed tables may be replaced.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        force: bool,
     },
 }
 
@@ -273,11 +279,17 @@ fn run_backup(cli: &Cli, output: &PathBuf) -> ExitCode {
 ///
 /// The target database file may be new (it is created/migrated on open). All
 /// allowed tables are replaced by the backup contents inside one transaction.
-fn run_restore(cli: &Cli, input: &PathBuf) -> ExitCode {
+fn run_restore(cli: &Cli, input: &PathBuf, force: bool) -> ExitCode {
     let Some(path) = &cli.store else {
         eprintln!("error: restore requires --store <path> (a SQLite database file)");
         return ExitCode::FAILURE;
     };
+    if !force {
+        eprintln!(
+            "error: restore replaces the target store's allowed tables; pass --force to confirm"
+        );
+        return ExitCode::FAILURE;
+    }
     let store = match SqliteStore::open(path) {
         Ok(store) => store,
         Err(e) => {
@@ -313,8 +325,8 @@ fn main() -> ExitCode {
         Command::Backup { output } => {
             return run_backup(&cli, output);
         }
-        Command::Restore { input } => {
-            return run_restore(&cli, input);
+        Command::Restore { input, force } => {
+            return run_restore(&cli, input, *force);
         }
         _ => {}
     }
@@ -702,11 +714,13 @@ mod tests {
             "restore",
             "--input",
             "b.csb",
+            "--force",
         ])
         .unwrap();
         match cli.command {
-            Command::Restore { input } => {
+            Command::Restore { input, force } => {
                 assert_eq!(input, PathBuf::from("b.csb"));
+                assert!(force);
             }
             _ => panic!("expected restore"),
         }

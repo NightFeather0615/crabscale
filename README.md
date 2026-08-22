@@ -20,8 +20,10 @@ This repository is a Cargo workspace. It contains the following crates:
 | `crabscale-control` | library | Registration, map handling, sessions, events |
 | `crabscale-policy` | library | Policy model and packet filter compilation |
 | `crabscale-derp` | library | DERP frames, relay state, STUN |
+| `crabscale-metrics` | library | Process-wide Prometheus counters, gauges, and text renderer |
 | `crabscale-server` | binary | Server wiring, config, TLS, HTTP routers |
 | `crabscale-cli` | binary | Admin commands |
+| `crabscale-harness` | binary | Client compatibility / end-to-end harness |
 | `crabscale-fuzz` | binary | Fuzz smoke targets for JSON, Noise, and DERP parsers |
 
 ## DNS configuration
@@ -99,7 +101,7 @@ crabscale --store /var/lib/crabscale/data/crabscale.db   backup --output /backup
 
 # Restore into a fresh or empty database file. Existing nodes can log in again
 # after a restore.
-crabscale --store /var/lib/crabscale/data/restored.db   restore --input /backups/crabscale-2026-08-20.csb
+crabscale --store /var/lib/crabscale/data/restored.db   restore --force --input /backups/crabscale-2026-08-20.csb
 ```
 
 Backups contain an explicit allowlist of domain tables (users, logins, nodes,
@@ -126,6 +128,11 @@ curl -s http://127.0.0.1:8080/health
 curl -s http://127.0.0.1:8080/version
 curl -s http://127.0.0.1:8080/metrics
 ```
+
+These endpoints are intentionally unauthenticated in v0.1. In production,
+protect them with a reverse-proxy allowlist (or scrape `/metrics` from an
+internal network) so the version string and metric data are not exposed to
+the public internet.
 
 Metrics are rendered in the Prometheus text format with `text/plain;
 version=0.0.4` content type. Every family appears even before it has fired

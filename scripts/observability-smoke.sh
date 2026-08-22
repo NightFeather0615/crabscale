@@ -15,7 +15,6 @@ cargo build --quiet --release -p crabscale-server
 SERVER=./target/release/crabscale-server
 
 DIR="$(mktemp -d)"
-PORT_PORT="$DIR/port"      # not used; port chosen by OS via :0
 LOG="$DIR/server.log"
 trap 'kill ${SERVER_PID:-} 2>/dev/null || true; rm -rf "$DIR"' EXIT
 

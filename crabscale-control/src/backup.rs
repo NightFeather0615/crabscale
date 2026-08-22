@@ -253,7 +253,7 @@ fn export_table(
     while let Some(row) = rows.next()? {
         let mut obj = Map::new();
         for (idx, column) in columns.iter().enumerate() {
-            let value = sqlite_to_json(row.get_ref(idx)?);
+            let value = sqlite_to_json(row.get_ref(idx)?)?;
             obj.insert((*column).to_string(), value);
         }
         out.push(Value::Object(obj));
@@ -298,16 +298,25 @@ fn import_table(
     Ok(())
 }
 
-/// Convert a SQLite cell to a JSON value (blobs are hex-encoded).
-fn sqlite_to_json(value: rusqlite::types::ValueRef<'_>) -> Value {
+/// Convert a SQLite cell to a JSON value.
+///
+/// Only the types the v0.1 allowlist uses (`null`, integer, real, text with
+/// valid UTF-8) are supported. A BLOB is rejected explicitly rather than
+/// hex-encoding it, because `json_to_sqlite` has no way to know a string came
+/// from a BLOB and would restore it as TEXT, silently corrupting the row.
+fn sqlite_to_json(value: rusqlite::types::ValueRef<'_>) -> Result<Value, BackupError> {
     match value {
-        rusqlite::types::ValueRef::Null => Value::Null,
-        rusqlite::types::ValueRef::Integer(i) => Value::Number(i.into()),
-        rusqlite::types::ValueRef::Real(r) => json!(r),
-        rusqlite::types::ValueRef::Text(t) => {
-            Value::String(std::str::from_utf8(t).unwrap_or("").to_string())
-        }
-        rusqlite::types::ValueRef::Blob(b) => Value::String(hex::encode(b)),
+        rusqlite::types::ValueRef::Null => Ok(Value::Null),
+        rusqlite::types::ValueRef::Integer(i) => Ok(Value::Number(i.into())),
+        rusqlite::types::ValueRef::Real(r) => Ok(json!(r)),
+        rusqlite::types::ValueRef::Text(t) => std::str::from_utf8(t)
+            .map(|s| Value::String(s.to_string()))
+            .map_err(|_| {
+                BackupError::UnsupportedValue("text column is not valid UTF-8".to_string())
+            }),
+        rusqlite::types::ValueRef::Blob(_) => Err(BackupError::UnsupportedValue(
+            "blob columns are not supported by the v0.1 backup allowlist".to_string(),
+        )),
     }
 }
 
@@ -321,6 +330,11 @@ fn json_to_sqlite(value: &Value) -> Result<rusqlite::types::Value, String> {
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(rusqlite::types::Value::Integer(i))
+            } else if n.is_u64() {
+                // Avoid silently narrowing a u64 that does not fit i64.
+                Err(format!(
+                    "integer {n} exceeds the i64 range supported by the backup schema"
+                ))
             } else if let Some(f) = n.as_f64() {
                 Ok(rusqlite::types::Value::Real(f))
             } else {

@@ -27,7 +27,7 @@ test -s "$BACKUP"
 
 # Restoring into a fresh database must succeed.
 echo "==> Restore into a fresh database"
-"$CLI" --store "$RESTORED" restore --input "$BACKUP"
+"$CLI" --store "$RESTORED" restore --force --input "$BACKUP"
 
 # The relogin acceptance is covered by the unit test that drives the exact
 # SqliteStore operations the CLI commands invoke.
