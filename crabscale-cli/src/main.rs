@@ -62,13 +62,13 @@ enum Command {
         command: SshCommand,
     },
     /// Write a zstd-compressed backup of the store, excluding plaintext
-    /// secrets (M4-04, #27).
+    /// secrets.
     Backup {
         /// Destination backup file.
         #[arg(long)]
         output: PathBuf,
     },
-    /// Restore a store from a backup file produced by `backup` (M4-04, #27).
+    /// Restore a store from a backup file produced by `backup`.
     ///
     /// Restoration replaces the allowed tables of the target SQLite file.
     /// Pass `--force` to confirm this destructive operation.
@@ -731,7 +731,7 @@ mod tests {
         // This exercises the exact SQLite operations the `backup`/`restore`
         // CLI commands invoke (SqliteStore::backup_to / restore_from) and
         // proves the restored database allows an existing node to log in
-        // again (M4-04 acceptance).
+        // again.
         let db = db_path();
         let backup = backup_path();
         let restored = restored_path();

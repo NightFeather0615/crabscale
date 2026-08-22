@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M1-07 Rust client test peer.
+# Rust client test peer.
 #
 # Runs the Rust client test peer against a running crabscale control server.
 # The server must already be listening; pass its URL with --control-url.

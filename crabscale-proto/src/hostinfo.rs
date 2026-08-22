@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// A summary of the host a Tailscale-compatible client runs on.
 ///
-/// Clients send far more fields than the M0 server consumes. Unknown fields
+/// Clients send far more fields than the server consumes. Unknown fields
 /// are ignored on deserialization, and only the fields modeled here are
 /// emitted when the server serializes a [`Hostinfo`].
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

@@ -2,7 +2,7 @@
 //!
 //! This crate starts a crabscale control server on localhost, runs a Rust
 //! client test peer (and optionally a stable Tailscale client binary), and
-//! emits a Markdown report of the results. It is the M1-07 integration
+//! emits a Markdown report of the results. It is the integration
 //! harness described in the project wiki.
 
 pub mod client;

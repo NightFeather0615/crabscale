@@ -68,9 +68,9 @@ pub struct ControlRouter {
     oidc_flows: Arc<Mutex<OidcFlowStore>>,
     /// Optional `/bootstrap-dns` snapshot served over the outer HTTP server.
     bootstrap_dns: Option<Arc<BootstrapDns>>,
-    /// `/ts2021` upgrade rate limiter, keyed by client IP (M4-02).
+    /// `/ts2021` upgrade rate limiter, keyed by client IP.
     ts2021_limiter: RateLimiter,
-    /// `/machine/register` rate limiter, keyed by Noise machine key (M4-02).
+    /// `/machine/register` rate limiter, keyed by Noise machine key.
     register_limiter: RateLimiter,
 }
 
@@ -131,7 +131,7 @@ impl ControlRouter {
         self
     }
 
-    /// Override the `/ts2021` and `/machine/register` rate limits (M4-02).
+    /// Override the `/ts2021` and `/machine/register` rate limits.
     pub fn with_rate_limits(mut self, cfg: RateLimitConfig) -> Self {
         self.ts2021_limiter =
             RateLimiter::new(cfg.ts2021_per_min, cfg.ts2021_burst, cfg.max_entries);
@@ -250,7 +250,7 @@ impl ControlRouter {
         Response::from_parts(parts, body.into_inner().unwrap_or_default())
     }
 
-    /// Handle an outer `GET /health` liveness check (M4-04, #27).
+    /// Handle an outer `GET /health` liveness check.
     ///
     /// Always returns `200` with `{"status":"ok"}` while the server is up.
     /// It is deliberately independent of transient store or DNS state so
@@ -264,7 +264,7 @@ impl ControlRouter {
             .expect("static response is valid")
     }
 
-    /// Handle an outer `GET /version` request (M4-04, #27).
+    /// Handle an outer `GET /version` request.
     ///
     /// Reports the server binary version and the advertised protocol
     /// (capability) version so operators can pin compatibility.
@@ -281,7 +281,7 @@ impl ControlRouter {
             .expect("static response is valid")
     }
 
-    /// Handle an outer `GET /metrics` request (M4-04, #27).
+    /// Handle an outer `GET /metrics` request.
     ///
     /// Renders every registered Prometheus text-format metric family,
     /// including families that have not fired yet (they appear as `0`).
@@ -560,7 +560,7 @@ impl ControlRouter {
         machine_key: MachineKey,
         body: &[u8],
     ) {
-        // Rate limit registration per Noise machine key (M4-02). The check
+        // Rate limit registration per Noise machine key. The check
         // runs before the body is parsed so a limited client cannot even feed
         // the JSON parser.
         if let Some(retry_after) = self.check_register_rate(&machine_key) {
@@ -865,7 +865,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 /// Send an HTTP 429 response with a `Retry-After` delta-seconds header
-/// (M4-02 rate limiting).
+/// (rate limiting).
 fn send_rate_limited(respond: &mut SendResponse<Bytes>, retry_after: u64) {
     let response = Response::builder()
         .status(StatusCode::TOO_MANY_REQUESTS)

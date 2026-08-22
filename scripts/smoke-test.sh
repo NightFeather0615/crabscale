@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M0-05 smoke test: register a node and receive a valid first MapResponse.
+# Smoke test: register a node and receive a valid first MapResponse.
 #
 # This runs the in-process loopback smoke test over HTTP/2-over-Noise. A real
 # Tailscale client binary can be pointed at the server once the outer HTTP

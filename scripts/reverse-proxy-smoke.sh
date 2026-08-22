@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M4-03 reverse-proxy integration smoke (issue #26, acceptance).
+# Reverse-proxy integration smoke.
 #
 # Runs the trusted-proxy client-IP tests plus the HTTP->HTTPS redirect test:
 #   - /ts2021 rate limiting keys on the X-Forwarded-For client IP when the

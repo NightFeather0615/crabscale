@@ -2,7 +2,7 @@
 //!
 //! When the server is deployed behind a reverse proxy (nginx, Caddy,
 //! edge load balancer), the TCP peer is the proxy itself, not the client.
-//! M4-03 (#26) adds `X-Forwarded-For` (and `X-Real-IP`) support so that the
+//! `X-Forwarded-For` (and `X-Real-IP`) support lets the
 //! `/ts2021` rate limiter and connection logging key on the real client IP
 //! instead of the proxy's IP.
 //!

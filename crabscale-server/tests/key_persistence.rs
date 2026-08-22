@@ -1,4 +1,4 @@
-//! Control key persistence across server restarts (M4-03, #26 acceptance).
+//! Control key persistence across server restarts.
 //!
 //! A `--key-file` path is the single source of truth for the long-term Noise
 //! key. Restarting the server over the same file must advertise the *same*

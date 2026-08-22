@@ -1,6 +1,6 @@
 //! OpenID Connect (OIDC) relying-party support for interactive registration.
 //!
-//! M2-07 turns the browser approval source into an OIDC provider. The browser
+//! OIDC turns the browser approval source into an identity provider. The browser
 //! opens the `AuthURL` from `Spec-Registration` (`/register/{authId}`), which
 //! redirects to the provider when OIDC is configured. The provider sends the
 //! user back to `/oidc/callback`; this module validates the CSRF `state` and

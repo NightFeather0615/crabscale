@@ -1,5 +1,5 @@
 # Example deployment for crabscale-server behind a TLS-terminating reverse
-# proxy (M4-03, #26).
+# proxy.
 #
 # Mode shown here: Caddy terminates HTTPS on 443/80 and forwards to the
 # container's plain HTTP listener on 8080, setting X-Forwarded-For. The server

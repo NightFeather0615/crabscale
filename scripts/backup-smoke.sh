@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M4-04 (#27) backup/restore smoke.
+# Backup/restore smoke.
 #
 # Demonstrates the documented `crabscale backup` / `crabscale restore`
 # commands against real files and proves (via the crabscale-cli unit test)

@@ -1,4 +1,4 @@
-//! TLS termination for the outer HTTP server (M4-03, #26).
+//! TLS termination for the outer HTTP server.
 //!
 //! Three modes are supported:
 //!
@@ -12,7 +12,7 @@
 //! The crypto provider is `ring` (consistent with the rest of the workspace)
 //! and TLS 1.2/1.3 are both enabled.
 //!
-//! The contract for #26 requires that `/key` stays TLS-protected and that the
+//! The contract requires that `/key` stays TLS-protected and that the
 //! `/ts2021` and `/derp` HTTP upgrades pass through the TLS layer unchanged;
 //! wrapping the raw TCP stream in [`tokio_rustls`] before hyper parses it
 //! preserves those upgrades.

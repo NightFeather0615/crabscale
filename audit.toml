@@ -1,4 +1,4 @@
-# cargo-audit configuration (M4-02 security hardening, #25).
+# cargo-audit configuration.
 #
 # The CI `audit` job (rustsec/audit-check) fails on any known vulnerability.
 # The single known issue is tracked below; there is no patched upstream

@@ -88,7 +88,7 @@ page. The exact list of supported and unsupported behaviors for v0.1 is in the
 [Gap-Analysis](https://github.com/NightFeather0615/crabscale/wiki/Gap-Analysis)
 page.
 
-## Operations (M4-04)
+## Operations
 
 ### Backup and restore
 
@@ -162,7 +162,7 @@ present (this is the documented local test of the endpoint).
 
 ## Deployment (TLS, reverse proxy, containers)
 
-M4-03 (#26) makes `crabscale-server` deployable behind standard
+`crabscale-server` is deployable behind standard
 infrastructure. See the wiki [Deployment](https://github.com/NightFeather0615/crabscale/wiki/Deployment)
 page for full details and proxy header requirements.
 

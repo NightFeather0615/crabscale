@@ -1,6 +1,6 @@
 //! Server binary: wiring, config, HTTP serving, and shutdown.
 //!
-//! Milestone M4-03 (#26) adds deployment support: rustls TLS (files or ACME),
+//! Deployment support: rustls TLS (files or ACME),
 //! an HTTP-to-HTTPS redirect listener, trusted reverse-proxy CIDRs for client
 //! IP resolution, and a TOML config file with `CRABSCALE_*` overrides. The
 //! precedence is CLI > environment > config file > defaults.
@@ -442,7 +442,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Rate limit `/ts2021` (per client IP) and `/machine/register` (per
-    // Noise machine key) with the configured token buckets (M4-02).
+    // Noise machine key) with the configured token buckets.
     router = router.with_rate_limits(RateLimitConfig {
         ts2021_per_min: config.ts2021_rate_per_min,
         ts2021_burst: config.ts2021_burst,
@@ -452,14 +452,14 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     });
     router.spawn_reaper();
 
-    // TLS (M4-03): rustls from files or ACME; the plain default stays `off`.
+    // TLS: rustls from files or ACME; the plain default stays `off`.
     let tls = if config.tls.is_off() {
         None
     } else {
         Some(Arc::new(crabscale_server::load_tls_acceptor(&config.tls)?))
     };
 
-    // Trusted reverse proxies (M4-03): only their `X-Forwarded-For` is honored.
+    // Trusted reverse proxies: only their `X-Forwarded-For` is honored.
     let trusted_proxies = if config.trusted_proxies.is_empty() {
         None
     } else {
@@ -476,7 +476,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         serve_on_addr_with_options(config.listen, router, server_key.clone(), options.clone())
             .await?;
 
-    // HTTP->HTTPS redirect listener (M4-03), only meaningful when TLS is on.
+    // HTTP->HTTPS redirect listener, only meaningful when TLS is on.
     let redirect_handle = if let Some(listen_http) = config.listen_http {
         if options.tls.is_some() && config.http_redirect {
             let fallback_host = redirect_fallback_host(&config);

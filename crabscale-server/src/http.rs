@@ -10,7 +10,7 @@
 //! parsing instead of a hand-rolled parser. See the wiki `Architecture` page
 //! for the decision and the limitations that no longer apply.
 //!
-//! ## M4-03 (deployment, #26)
+//! ## Deployment
 //!
 //! - TLS is terminated here (rustls) when configured, so `/key` stays
 //!   TLS-protected and the `/ts2021` and `/derp` HTTP upgrades pass through the
@@ -61,7 +61,7 @@ impl ServerHandle {
     }
 }
 
-/// Extra deployment options for the outer HTTP server (M4-03, #26).
+/// Extra deployment options for the outer HTTP server.
 ///
 /// The plain [`serve_on_addr`] / [`serve`] entry points use the `Default`
 /// (plain HTTP, no trusted proxies) so existing tests and the harness keep
@@ -181,7 +181,7 @@ fn redirect_response(req: Request<()>, fallback_host: String) -> Response<Full<B
     response
 }
 
-/// Bind a plain-HTTP listener that redirects every request to HTTPS (M4-03).
+/// Bind a plain-HTTP listener that redirects every request to HTTPS.
 ///
 /// The `fallback_host` (e.g. `control.example.com`) is used when the request
 /// carries no `Host` header. Upgrade requests are intentionally *not*
@@ -272,7 +272,7 @@ async fn handle_request(
     let path = req.uri().path().to_string();
 
     // Resolve the real client IP once per request: when the peer is a trusted
-    // proxy, `X-Forwarded-For`/`X-Real-IP` are honored (M4-03).
+    // proxy, `X-Forwarded-For`/`X-Real-IP` are honored.
     let client_ip = options
         .trusted_proxies
         .as_deref()
@@ -285,7 +285,7 @@ async fn handle_request(
         return Ok(response.map(Full::new));
     }
 
-    // `GET /health`, `GET /version`, and `GET /metrics` are the M4-04
+    // `GET /health`, `GET /version`, and `GET /metrics` are the
     // operational endpoints. Any non-GET method is rejected with 405.
     if path == "/health" || path == "/version" || path == "/metrics" {
         if method != http::Method::GET {
@@ -303,9 +303,9 @@ async fn handle_request(
         return Ok(response.map(Full::new));
     }
 
-    // `POST /ts2021` is rate-limited per client IP (M4-02). The limiter is
+    // `POST /ts2021` is rate-limited per client IP. The limiter is
     // consulted before the upgrade request is parsed so a limited peer cannot
-    // even feed the handshake parser. M4-03 uses the proxy-resolved client IP.
+    // even feed the handshake parser. The proxy-resolved client IP is used.
     if method == http::Method::POST && path == "/ts2021" {
         if let Some(retry_after) = router.check_ts2021_rate(client_ip) {
             return Ok(rate_limited_response(retry_after));
@@ -514,7 +514,7 @@ fn plain_response(status: StatusCode, text: &'static str) -> Response<Full<Bytes
 }
 
 /// A `429 Too Many Requests` response with a delta-seconds `Retry-After`
-/// header, used by the `/ts2021` rate limiter (M4-02).
+/// header, used by the `/ts2021` rate limiter.
 fn rate_limited_response(retry_after: u64) -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::TOO_MANY_REQUESTS)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M4-04 (#27) observability smoke.
+# Observability smoke.
 #
 # Starts a local crabscale-server, curls /health, /version, and /metrics, and
 # checks that the operational endpoints respond and the documented Prometheus

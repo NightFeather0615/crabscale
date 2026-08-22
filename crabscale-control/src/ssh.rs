@@ -24,7 +24,7 @@ use crate::{ControlError, ControlPlane, time};
 pub const DEFAULT_SSH_AUTH_TTL_SECONDS: i64 = 15 * 60;
 
 /// Default maximum number of pending SSH auth records kept before the
-/// oldest are pruned (M4-02: bound the SSH cache with TTL and a cap).
+/// oldest are pruned (the SSH cache is bounded with a TTL and a cap).
 pub const DEFAULT_SSH_AUTH_LIMIT: usize = 1024;
 
 /// Default maximum time a followup request holds while waiting for a verdict
@@ -233,7 +233,7 @@ impl ControlPlane {
                 )? {
                     return Ok(accept_action());
                 }
-                // Keep the durable SSH auth cache bounded (M4-02).
+                // Keep the durable SSH auth cache bounded.
                 self.prune_ssh_auths(DEFAULT_SSH_AUTH_LIMIT)?;
                 let auth_id = crate::generate_secret();
                 let entry = SshAuth {
@@ -411,7 +411,7 @@ impl ControlPlane {
     }
 
     /// Bound the SSH auth cache: delete expired records, then delete the
-    /// oldest pending records until at most `limit` remain (M4-02).
+    /// oldest pending records until at most `limit` remain.
     fn prune_ssh_auths(&self, limit: usize) -> Result<(), ControlError> {
         let now = time::now_rfc3339();
         let entries = self
