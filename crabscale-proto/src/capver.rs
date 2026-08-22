@@ -8,7 +8,7 @@
 //! Every gate listed in the wiki `Spec-Compatibility` table has exactly one
 //! predicate in this module and at least one test. A new gate is only added
 //! together with its test, keeping the "new gates are added with tests"
-//! acceptance criterion of M4-01 (#24).
+//! acceptance criterion.
 
 /// The minimum capability version accepted by the control plane. Versions
 /// below this are rejected with `400` at `/key` and `/machine/map`.

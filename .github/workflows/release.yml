@@ -1,6 +1,6 @@
 name: Release
 
-# M4-04 (#27): publish v0.1 release artifacts. A release artifact must build
+# Publish release artifacts. A release artifact must build
 # from a clean checkout; this workflow builds the two release binaries on a
 # tag push and attaches them to a GitHub Release.
 on:

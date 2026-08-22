@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M4-02 fuzz smoke: drive the standalone fuzz targets over corpus inputs and
+# Fuzz smoke: drive the standalone fuzz targets over corpus inputs and
 # random seeds, failing on any decoder panic.
 #
 # Each `crabscale-fuzz` target reads arbitrary bytes on stdin and must reject

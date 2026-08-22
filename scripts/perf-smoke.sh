@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M3-04 performance and concurrency smoke test.
+# Performance and concurrency smoke test.
 #
 # Validates the control plane under a small synthetic load with a time
 # budget, then reports map build time, encode time, and peak memory as a
@@ -92,7 +92,7 @@ if [ -s "$TIME_LOG" ]; then
 fi
 
 SUMMARY="$(printf '%s\n' \
-"# Crabscale performance smoke report (M3-04)" \
+"# Crabscale performance smoke report" \
 "" \
 "- Nodes in tailnet: **${NODES:-n/a}**" \
 "- Peers per observer map: **${PEERS:-n/a}**" \

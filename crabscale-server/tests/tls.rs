@@ -1,4 +1,4 @@
-//! Integration tests for TLS termination (M4-03, #26).
+//! Integration tests for TLS termination.
 //!
 //! A self-signed certificate is generated on the fly, loaded through the
 //! `files` TLS mode, and the outer HTTP server is reached over a real rustls

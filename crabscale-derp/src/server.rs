@@ -472,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn relayed_packets_increment_derp_metric() {
-        // M4-04 (#27): packet routing must be observable. The global counter
+        // Packet routing must be observable. The global counter
         // is monotonic, so comparing deltas is safe even when other tests in
         // the same process relay packets concurrently.
         let before = crabscale_metrics::registry().derp_packets_total.get();

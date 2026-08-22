@@ -1,4 +1,4 @@
-# cargo-deny configuration (M4-02 security hardening, #25).
+# cargo-deny configuration.
 #
 # The CI `deny` job runs `cargo deny check advisories bans sources` with this
 # file. The license check is intentionally not gated here: the workspace

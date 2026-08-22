@@ -3,7 +3,7 @@
 Crabscale is a self-hosted control server for Tailscale-compatible clients.
 This document describes how to report a vulnerability to the project and the
 rules the project follows for handling secrets and hardening public-facing
-attack surface (M4-02, issue #25).
+attack surface.
 
 ## Supported versions
 
@@ -55,7 +55,7 @@ These rules are enforced by the codebase (and audited by the `audit` /
 
 ## Hardening measures
 
-Public-deployment attack surface reduction implemented by M4-02:
+Public-deployment attack surface reduction:
 
 - **Byte-level limits**: all documented wire size limits are enforced before
   any allocation or JSON parsing (Noise record frames ≤ 4096 bytes, init

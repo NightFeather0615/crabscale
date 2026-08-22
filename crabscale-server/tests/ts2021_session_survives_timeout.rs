@@ -1,4 +1,4 @@
-//! Regression test for the TS2021 handshake timeout (M4-02, #25).
+//! Regression test for the TS2021 handshake timeout.
 //!
 //! The 10-second `HANDSHAKE_TIMEOUT` must bound only the handshake portion
 //! (the HTTP upgrade wait and the Noise response write), never the inner

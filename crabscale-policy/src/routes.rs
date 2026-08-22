@@ -1,6 +1,6 @@
 //! Subnet-route and exit-node helpers: canonicalization and auto-approval.
 //!
-//! The two concepts here are part of the route slice of the M2 control
+//! The two concepts here are part of the route slice of the control
 //! plane:
 //!
 //! - Clients advertise routes they can route on their behalf through

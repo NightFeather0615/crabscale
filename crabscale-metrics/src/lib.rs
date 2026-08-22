@@ -1,4 +1,4 @@
-//! Process-wide Prometheus metrics for Crabscale (M4-04, #27).
+//! Process-wide Prometheus metrics for Crabscale.
 //!
 //! This crate is the single seam through which the control plane and the DERP
 //! relay record operational counters and gauges, and through which the server

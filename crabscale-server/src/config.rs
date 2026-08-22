@@ -1,6 +1,6 @@
 //! Server configuration: config file + environment overrides + CLI merge.
 //!
-//! M4-03 (#26) makes the server deployable behind standard infrastructure by
+//! The server is deployable behind standard infrastructure by
 //! adding a TOML config file (`--config crabscale.toml`) and an environment
 //! override mechanism. The precedence is:
 //!

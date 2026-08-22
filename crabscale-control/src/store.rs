@@ -158,7 +158,7 @@ impl SqliteStore {
     }
 
     /// Serialize the store's allowed, non-secret tables to `writer` as a
-    /// zstd-compressed backup (M4-04, #27).
+    /// zstd-compressed backup.
     ///
     /// The backup format is defined in [`crate::backup`]; it contains only an
     /// explicit allowlist of tables/columns and never plaintext secrets.
@@ -171,7 +171,7 @@ impl SqliteStore {
     }
 
     /// Replace the store's allowed tables with the contents of a backup read
-    /// from `reader` (M4-04, #27).
+    /// from `reader`.
     ///
     /// Runs inside a single transaction; the caller is responsible for
     /// pointing at a fresh or disposable database file because every allowed
@@ -1195,7 +1195,7 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         )?;
     }
     if version < 6 {
-        // M2-04: routes are stored separately from the client's advertised
+        // Routes are stored separately from the client's advertised
         // routes so an administrator can approve a subset of them (and
         // autoApprovers is recomputed from the policy at map time).
         conn.execute_batch(
@@ -1205,7 +1205,7 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         )?;
     }
     if version < 7 {
-        // M2-06: SSH check-mode auth records. Each record is one (src,dst)
+        // SSH check-mode auth records. Each record is one (src,dst)
         // check-mode approval/pending state keyed by an unguessable auth id,
         // so a separate process (the CLI) can approve or reject it against
         // the same database.
@@ -1226,7 +1226,7 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         )?;
     }
     if version < 8 {
-        // M2-07: OIDC logins are reconciled by (provider, subject). The index
+        // OIDC logins are reconciled by (provider, subject). The index
         // keeps the idempotent upsert in `upsert_oidc_user` cheap and unique.
         conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_logins_provider_subject
@@ -1235,7 +1235,7 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         )?;
     }
     if version < 9 {
-        // M3-03: the control plane records when it last observed a node and
+        // The control plane records when it last observed a node and
         // (administratively) when a node's key expires so incremental map
         // deltas can push `last_seen` and `key_expiry` patches.
         conn.execute_batch(

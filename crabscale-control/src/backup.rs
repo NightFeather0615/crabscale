@@ -1,4 +1,4 @@
-//! Backup and restore for the SQLite store (M4-04, #27).
+//! Backup and restore for the SQLite store.
 //!
 //! A backup is a zstd-compressed JSON document containing only an explicit
 //! allowlist of tables and columns. The allowlist deliberately excludes any

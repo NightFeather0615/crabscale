@@ -62,8 +62,8 @@ pub const DEFAULT_IPV6_PREFIX: Ipv6Addr = Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 
 /// Default IPv6 prefix length.
 pub const DEFAULT_IPV6_PREFIX_LEN: u8 = 48;
 
-/// Static timestamp used for the M0 static MapResponse. A real clock is
-/// layered on in M1 when persistence and sessions are introduced.
+/// Static timestamp used for the initial MapResponse. A real clock is
+/// layered on when persistence and sessions are introduced.
 const CONTROL_TIME: &str = "2026-08-20T00:00:00Z";
 
 /// Configuration for the control plane.
@@ -108,10 +108,10 @@ pub struct ControlConfig {
     /// delivered to clients in the MapResponse `DNS` field.
     pub dns: DnsSettings,
     /// How long node/policy/DNS/DERP changes are coalesced before a single
-    /// delta batch is pushed to live map sessions (M3-03).
+    /// delta batch is pushed to live map sessions.
     pub change_batch_window: std::time::Duration,
     /// Maximum number of distinct coalesced changes in one batch before an
-    /// early flush (M3-03).
+    /// early flush.
     pub change_batch_max: usize,
 }
 
@@ -441,7 +441,7 @@ impl ControlPlane {
     /// This is the counter harness used by the performance/concurrency smoke
     /// tests to prove that every connect is paired with a disconnect: after a
     /// session closes the count must return to zero, so a leaked stream cannot
-    /// hide inside the reconnect grace window (M3-04).
+    /// hide inside the reconnect grace window.
     pub fn live_session_count(&self, node_id: i64) -> usize {
         self.sessions.lock().unwrap().live_sessions(node_id)
     }
@@ -458,7 +458,7 @@ impl ControlPlane {
     /// makes client restarts re-register without error.
     pub fn register(&self, machine_key: MachineKey, request: RegisterRequest) -> RegisterResponse {
         // Record the registration request before any early-return path
-        // (observability, M4-04).
+        // (observability).
         crabscale_metrics::registry().registrations_total.inc();
         let result = (|| -> Result<RegisterResponse, ControlError> {
             self.ensure_default_user()?;
@@ -1932,7 +1932,7 @@ impl ControlPlane {
     /// Publish a single change to the shared change bus.
     ///
     /// The bus coalesces events per node within the configured batch window
-    /// and broadcasts a [`ChangeBatch`] to every live map session (M3-03).
+    /// and broadcasts a [`ChangeBatch`] to every live map session.
     pub fn publish_change(&self, event: ChangeEvent) {
         self.events.publish(event);
     }
@@ -4395,7 +4395,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // M3-04 performance and concurrency smoke tests.
+    // Performance and concurrency smoke tests.
     //
     // These follow the wiki "Performance smoke test": smoke thresholds that
     // catch pathological regressions, not benchmarks for tuning. The
@@ -4683,7 +4683,7 @@ mod tests {
 
     #[test]
     fn operational_metrics_fire_on_register_session_and_map() {
-        // M4-04 (#27): the Prometheus counters for registrations, sessions and
+        // The Prometheus counters for registrations, sessions and
         // policy compiles must move as the control plane is used. Comparisons
         // use deltas because the process-global registry is shared.
         let metrics = crabscale_metrics::registry();

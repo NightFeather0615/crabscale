@@ -1,6 +1,6 @@
 //! Token-bucket rate limiting for the outer and inner control endpoints.
 //!
-//! Security hardening (M4-02, #25) adds two rate limits, each responding
+//! Two rate limits, each responding
 //! with HTTP `429 Too Many Requests` and a `Retry-After` delta-seconds header:
 //!
 //! - `POST /ts2021` is limited per client IP so a single peer cannot consume

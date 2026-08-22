@@ -1,4 +1,4 @@
-//! Integration smoke for M4-03 (#26): the server behind a reverse proxy.
+//! Integration smoke: the server behind a reverse proxy.
 //!
 //! Trusted proxy CIDRs make `/ts2021` rate limiting key on the real client IP
 //! carried in `X-Forwarded-For` instead of on the proxy's IP. These tests

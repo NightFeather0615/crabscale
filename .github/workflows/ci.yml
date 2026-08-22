@@ -59,7 +59,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
-      - name: Run M0-05 smoke test
+      - name: Run control-plane smoke test
         run: ./scripts/smoke-test.sh
 
   perf-smoke:
@@ -70,7 +70,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
-      - name: Run M3-04 performance smoke
+      - name: Run performance smoke
         run: ./scripts/perf-smoke.sh --report perf-smoke-report.md
       - name: Upload performance smoke report
         uses: actions/upload-artifact@v6
@@ -86,7 +86,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
-      - name: Run M1-07 end-to-end harness
+      - name: Run end-to-end client harness
         run: ./scripts/harness.sh --report harness-report.md
       - name: Upload harness report
         uses: actions/upload-artifact@v6
@@ -102,7 +102,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
-      - name: Run M4-01 capability version matrix
+      - name: Run capability version matrix
         run: ./scripts/capability-matrix.sh --report capability-matrix.md
       - name: Upload capability matrix report
         uses: actions/upload-artifact@v6
@@ -143,29 +143,29 @@ jobs:
         run: cargo deny --all-features check advisories bans sources
 
   fuzz-smoke:
-    name: Fuzz smoke (M4-02)
+    name: Fuzz smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
-      - name: Run M4-02 fuzz smoke
+      - name: Run fuzz smoke
         run: ./scripts/fuzz-smoke.sh
 
   reverse-proxy-smoke:
-    name: Reverse-proxy smoke (M4-03)
+    name: Reverse-proxy smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
-      - name: Run M4-03 reverse-proxy smoke
+      - name: Run reverse-proxy smoke
         run: ./scripts/reverse-proxy-smoke.sh
 
   docker-smoke:
-    name: Docker image smoke (M4-03)
+    name: Docker image smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -180,27 +180,27 @@ jobs:
           tags: crabscale:smoke
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Run M4-03 container smoke
+      - name: Run container smoke
         run: CRABSCALE_DOCKER_SKIP_BUILD=1 ./scripts/docker-smoke.sh
 
   backup-smoke:
-    name: Backup/restore smoke (M4-04)
+    name: Backup/restore smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
-      - name: Run M4-04 backup/restore smoke
+      - name: Run backup/restore smoke
         run: ./scripts/backup-smoke.sh
 
   observability-smoke:
-    name: Observability smoke (M4-04)
+    name: Observability smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
-      - name: Run M4-04 observability smoke
+      - name: Run observability smoke
         run: ./scripts/observability-smoke.sh

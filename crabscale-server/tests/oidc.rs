@@ -1,4 +1,4 @@
-//! Integration tests for OIDC registration approval (M2-07).
+//! Integration tests for OIDC registration approval.
 //!
 //! A mock OpenID Connect provider runs in-process on a loopback address and
 //! serves discovery, authorization, and token endpoints. The authorization

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M1-07 end-to-end client compatibility harness.
+# End-to-end client compatibility harness.
 #
 # Starts a crabscale control server on localhost, runs the Rust client test
 # peer, and (when a Tailscale binary is available) exercises a stable Tailscale

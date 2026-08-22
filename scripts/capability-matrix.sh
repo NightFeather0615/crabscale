@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M4-01 capability-version compatibility matrix (#24).
+# Capability-version compatibility matrix.
 #
 # Runs the Rust client test peer at every capability version in the supported
 # matrix from the wiki Spec-Compatibility section 3, and emits a single
@@ -34,7 +34,7 @@ rm -f "$REPORT"
 {
   echo "# crabscale capability-version compatibility matrix"
   echo
-  echo "Server: crabscale control plane, M4-01 (#24)."
+  echo "Server: crabscale control plane."
   echo
   echo "Each row starts a fresh localhost server and runs the Rust client test"
   echo "peer at that capability version. The peer exercises auth-key"

@@ -3,7 +3,7 @@
 //! Every `tests/fixtures/compile/<name>.hujson` policy is compiled against the
 //! node set declared in `<name>.json`, and the resulting global filter,
 //! per-node filters, and peer visibility must match the expected JSON byte for
-//! byte. This is the golden "expected filter JSON" contract from M2-02.
+//! byte. This is the golden "expected filter JSON" contract.
 
 use std::fs;
 use std::path::{Path, PathBuf};

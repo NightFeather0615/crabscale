@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M4-03 container smoke (issue #26, acceptance).
+# Container smoke.
 #
 # Builds the multi-stage image and verifies:
 #   - the image runs with a NON-ROOT user,
