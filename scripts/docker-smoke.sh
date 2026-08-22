@@ -22,8 +22,20 @@ fi
 
 cd "$(dirname "$0")/.."
 
-echo "== building ${IMAGE} =="
-docker build -t "$IMAGE" .
+# In CI the image is normally pre-built by docker/build-push-action with
+# GitHub Actions layer cache. Local runs still build directly.
+if [ "${CRABSCALE_DOCKER_SKIP_BUILD:-0}" != "1" ]; then
+  echo "== building ${IMAGE} =="
+  if [ "${GITHUB_ACTIONS:-false}" = "true" ]; then
+    docker buildx build --load \
+      --cache-from type=gha --cache-to type=gha,mode=max \
+      -t "$IMAGE" .
+  else
+    docker build -t "$IMAGE" .
+  fi
+else
+  echo "== using pre-built ${IMAGE} =="
+fi
 
 echo "== asserting non-root user =="
 RUN_USER="$(docker run --rm --entrypoint id "$IMAGE" -u)"
